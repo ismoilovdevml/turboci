@@ -71,6 +71,7 @@ impl CacheManager {
     }
 
     /// Compute hash of file or directory
+    #[allow(dead_code)]
     pub async fn compute_hash(&self, path: &Path) -> Result<String> {
         use walkdir::WalkDir;
 
@@ -95,6 +96,7 @@ impl CacheManager {
     }
 
     /// Get cached build result
+    #[allow(dead_code)]
     pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let mut conn = (*self.redis_client).clone();
         let result: Option<Vec<u8>> = conn.get(key).await?;
@@ -112,6 +114,7 @@ impl CacheManager {
     }
 
     /// Store build result in cache
+    #[allow(dead_code)]
     pub async fn set(&self, key: &str, value: &[u8], ttl_seconds: usize) -> Result<()> {
         let mut conn = (*self.redis_client).clone();
         let _: () = conn.set_ex(key, value, ttl_seconds as u64).await?;
@@ -125,6 +128,7 @@ impl CacheManager {
     }
 
     /// Check if cache entry exists and is valid
+    #[allow(dead_code)]
     pub async fn exists(&self, key: &str) -> Result<bool> {
         let mut conn = (*self.redis_client).clone();
         let exists: bool = conn.exists(key).await?;

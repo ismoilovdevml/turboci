@@ -196,6 +196,7 @@ impl ParallelRunner {
     }
 
     /// Execute tests in parallel
+    #[allow(dead_code)]
     pub async fn run_tests_parallel(
         &self,
         test_files: Vec<String>,

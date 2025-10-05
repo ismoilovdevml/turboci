@@ -5,6 +5,7 @@ use tracing::{debug, info};
 
 use crate::cache::CacheManager;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BuildOptimizer {
     cache: CacheManager,
@@ -39,12 +40,13 @@ impl BuildOptimizer {
     }
 
     /// Analyze which files have changed
+    #[allow(dead_code)]
     pub async fn analyze_changes(&mut self, workspace: &Path) -> Result<()> {
         info!("🔍 Analyzing changes in workspace...");
 
         // Get git diff for changed files
         let output = tokio::process::Command::new("git")
-            .args(&["diff", "--name-only", "HEAD"])
+            .args(["diff", "--name-only", "HEAD"])
             .current_dir(workspace)
             .output()
             .await?;
@@ -57,7 +59,7 @@ impl BuildOptimizer {
 
         // Also check for untracked files
         let output = tokio::process::Command::new("git")
-            .args(&["ls-files", "--others", "--exclude-standard"])
+            .args(["ls-files", "--others", "--exclude-standard"])
             .current_dir(workspace)
             .output()
             .await?;
@@ -73,6 +75,7 @@ impl BuildOptimizer {
     }
 
     /// Create incremental build plan
+    #[allow(dead_code)]
     pub async fn create_build_plan(&self, targets: Vec<String>) -> Result<BuildPlan> {
         info!("📋 Creating incremental build plan...");
 
@@ -117,6 +120,7 @@ impl BuildOptimizer {
     }
 
     /// Check if a target needs to be rebuilt
+    #[allow(dead_code)]
     async fn needs_rebuild(&self, target: &Path) -> Result<bool> {
         // Check if any files in the target directory have changed
         for changed_file in &self.changed_files {
@@ -144,12 +148,14 @@ impl BuildOptimizer {
     }
 
     /// Generate cache key for a build target
+    #[allow(dead_code)]
     async fn generate_cache_key(&self, name: &str, path: &Path) -> Result<String> {
         let hash = self.cache.compute_hash(path).await?;
         Ok(format!("build:{}:{}", name, hash))
     }
 
     /// Get optimization statistics
+    #[allow(dead_code)]
     pub fn get_optimization_stats(&self, plan: &BuildPlan) -> String {
         let savings_percent = if plan.total_targets > 0 {
             (plan.cached_targets as f64 / plan.total_targets as f64) * 100.0

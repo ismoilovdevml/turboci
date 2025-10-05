@@ -70,6 +70,7 @@ impl Config {
     }
 
     /// Save configuration to YAML file
+    #[allow(dead_code)]
     pub fn save(&self, path: &str) -> Result<()> {
         let yaml = serde_yaml::to_string(self).context("Failed to serialize config to YAML")?;
 
@@ -79,6 +80,7 @@ impl Config {
     }
 
     /// Create example configuration
+    #[allow(dead_code)]
     pub fn example() -> Self {
         Self {
             name: "My TurboCI Pipeline".to_string(),
@@ -125,9 +127,6 @@ impl Config {
         }
     }
 }
-
-// Add serde_yaml to dependencies
-use serde_yaml;
 
 #[cfg(test)]
 mod tests {
