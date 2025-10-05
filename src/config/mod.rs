@@ -57,6 +57,7 @@ pub struct Step {
     pub run: String,
 }
 
+#[allow(dead_code)]
 impl Config {
     /// Load configuration from YAML file
     pub fn load(path: &str) -> Result<Self> {

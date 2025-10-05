@@ -12,6 +12,7 @@ pub struct BuildOptimizer {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BuildPlan {
     pub targets: Vec<BuildTarget>,
     pub total_targets: usize,
@@ -20,6 +21,7 @@ pub struct BuildPlan {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BuildTarget {
     pub name: String,
     pub path: PathBuf,
@@ -28,6 +30,7 @@ pub struct BuildTarget {
     pub cache_key: String,
 }
 
+#[allow(dead_code)]
 impl BuildOptimizer {
     pub fn new(cache: CacheManager) -> Self {
         Self {

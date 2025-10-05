@@ -12,6 +12,7 @@ use crate::config::{Config, Job, Step};
 use crate::optimizer::BuildOptimizer;
 
 pub struct ParallelRunner {
+    #[allow(dead_code)]
     optimizer: BuildOptimizer,
     max_parallel_jobs: usize,
 }
@@ -24,6 +25,7 @@ pub struct ExecutionResult {
     pub output: String,
 }
 
+#[allow(dead_code)]
 impl ParallelRunner {
     pub fn new(optimizer: BuildOptimizer) -> Self {
         let max_parallel_jobs = num_cpus::cpus();

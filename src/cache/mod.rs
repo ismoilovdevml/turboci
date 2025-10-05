@@ -8,6 +8,7 @@ use tracing::{debug, info};
 pub mod content_hash;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct CacheEntry {
     pub key: String,
     pub hash: String,
@@ -17,6 +18,7 @@ pub struct CacheEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct CacheMetadata {
     pub build_type: String,
     pub dependencies: Vec<String>,
@@ -45,6 +47,7 @@ pub struct CacheStats {
     pub entries: u64,
 }
 
+#[allow(dead_code)]
 impl CacheManager {
     pub async fn new() -> Result<Self> {
         Self::with_url("redis://127.0.0.1:6379").await

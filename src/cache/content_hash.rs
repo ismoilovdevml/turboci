@@ -10,11 +10,13 @@ use walkdir::WalkDir;
 #[derive(Debug, Clone)]
 pub struct ContentHasher {
     /// Files to include in hash
+    #[allow(dead_code)]
     include_patterns: Vec<String>,
     /// Files to exclude from hash
     exclude_patterns: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl ContentHasher {
     pub fn new() -> Self {
         Self {
@@ -156,6 +158,7 @@ pub struct ContentHash {
     pub file_hashes: BTreeMap<String, String>,
 }
 
+#[allow(dead_code)]
 impl ContentHash {
     /// Check if any files changed compared to another hash
     pub fn changed_files(&self, other: &ContentHash) -> Vec<String> {
