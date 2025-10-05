@@ -220,7 +220,8 @@ async fn main() -> Result<()> {
                         bucket.clone(),
                         runner_config.s3_prefix.clone(),
                         endpoint.clone(),
-                    ).await?
+                    )
+                    .await?
                 } else {
                     S3Storage::new(bucket.clone(), runner_config.s3_prefix.clone()).await?
                 }
@@ -229,16 +230,18 @@ async fn main() -> Result<()> {
             };
 
             let storage = HybridStorage::new(redis, s3, runner_config.storage_threshold);
-            let executor = DockerExecutor::new(
-                runner_config.executor.docker.default_image.clone()
-            )?;
+            let executor =
+                DockerExecutor::new(runner_config.executor.docker.default_image.clone())?;
 
             let daemon = RunnerDaemon::new(runner_config, gitlab, storage, executor);
             let stats = daemon.stats().await?;
 
             println!("\n📊 TurboCI Runner Statistics:");
             println!("  Cache Hit Rate: {:.2}%", stats.cache_hit_rate);
-            println!("  Total Cached Size: {} MB", stats.total_cached_size / 1024 / 1024);
+            println!(
+                "  Total Cached Size: {} MB",
+                stats.total_cached_size / 1024 / 1024
+            );
             println!("  Cached Items: {}", stats.cached_items);
         }
     }

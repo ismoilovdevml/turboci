@@ -59,7 +59,11 @@ impl ParallelRunner {
         if !failed.is_empty() {
             error!("❌ {} job(s) failed:", failed.len());
             for result in failed {
-                error!("  - {} (took {:.2}s)", result.job_name, result.duration.as_secs_f64());
+                error!(
+                    "  - {} (took {:.2}s)",
+                    result.job_name,
+                    result.duration.as_secs_f64()
+                );
                 if !result.output.is_empty() {
                     debug!("    Output: {}", result.output);
                 }
@@ -72,7 +76,11 @@ impl ParallelRunner {
 
         // Show job durations
         for result in &results {
-            info!("  {} - {:.2}s", result.job_name, result.duration.as_secs_f64());
+            info!(
+                "  {} - {:.2}s",
+                result.job_name,
+                result.duration.as_secs_f64()
+            );
         }
 
         Ok(())
