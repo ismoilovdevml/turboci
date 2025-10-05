@@ -23,6 +23,16 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 serde_yaml = "0.9"
 glob = "0.3"
+# Runner daemon dependencies
+bollard = "0.16"  # Docker API
+aws-sdk-s3 = "1.0"  # S3 storage
+aws-config = "1.0"
+toml = "0.8"  # Config parsing
+uuid = { version = "1.6", features = ["v4", "serde"] }
+hyper = { version = "0.14", features = ["server"] }
+tower = "0.4"
+axum = "0.7"  # Metrics API
+prometheus = "0.13"  # Metrics
 
 [dev-dependencies]
 tempfile = "3.8"

@@ -1,0 +1,47 @@
+# TurboCI Runner Configuration Example
+# Copy this file to /etc/turboci-runner/config.toml
+
+# Number of concurrent jobs the runner can execute
+concurrent = 4
+
+# How often to check for new jobs (seconds)
+check_interval = 3
+
+# GitLab runner token (get from GitLab CI/CD settings)
+runner_token = "glrt-YOUR_RUNNER_TOKEN_HERE"
+
+# GitLab instance URL
+gitlab_url = "https://gitlab.com"
+
+# Cache configuration
+cache_enabled = true
+redis_url = "redis://127.0.0.1:6379"
+
+# S3/MinIO configuration (optional, for large artifacts)
+s3_bucket = "turboci-cache"
+s3_endpoint = "http://localhost:9000"  # MinIO endpoint
+s3_prefix = "turboci"
+
+# Storage threshold in bytes (10MB)
+# Files larger than this will be stored in S3
+# Files smaller will be stored in Redis
+storage_threshold = 10485760
+
+[executor]
+executor_type = "docker"
+
+[executor.docker]
+# Default Docker image if job doesn't specify one
+default_image = "alpine:latest"
+
+# Run containers in privileged mode (needed for Docker-in-Docker)
+privileged = false
+
+# Mount volumes
+volumes = [
+    "/cache:/cache:rw",
+    "/var/run/docker.sock:/var/run/docker.sock:ro"
+]
+
+# Docker network mode
+network_mode = "bridge"
