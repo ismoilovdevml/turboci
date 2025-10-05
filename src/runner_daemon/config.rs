@@ -98,8 +98,8 @@ impl RunnerConfig {
 
     /// Save configuration to TOML file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let toml_str = toml::to_string_pretty(self)
-            .context("Failed to serialize config to TOML")?;
+        let toml_str =
+            toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;
 
         fs::write(path.as_ref(), toml_str)
             .with_context(|| format!("Failed to write config file: {:?}", path.as_ref()))?;

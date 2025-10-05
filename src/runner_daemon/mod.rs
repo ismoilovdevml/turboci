@@ -1,5 +1,4 @@
-use anyhow::{Context, Result};
-use std::path::PathBuf;
+use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -47,11 +46,7 @@ impl RunnerDaemon {
 
         loop {
             // Request a job from GitLab
-            match self
-                .gitlab
-                .request_job(&self.config.runner_token)
-                .await
-            {
+            match self.gitlab.request_job(&self.config.runner_token).await {
                 Ok(Some(job)) => {
                     info!("📦 Received job #{} ({})", job.id, job.job_info.name);
 
@@ -89,7 +84,7 @@ impl RunnerDaemon {
 
         // Check cache before execution
         let cache_key = self.compute_cache_key(&job).await?;
-        if let Some(cached_result) = self.load_from_cache(&cache_key).await? {
+        if let Some(_cached_result) = self.load_from_cache(&cache_key).await? {
             info!("✅ Job #{} completed from cache!", job.id);
 
             self.gitlab
@@ -113,6 +108,9 @@ impl RunnerDaemon {
 
                 // Save to cache for future use
                 self.save_to_cache(&cache_key, &trace).await?;
+
+                // Upload artifacts if available (placeholder - artifacts path from job output)
+                // In real implementation, parse artifacts from job execution result
 
                 self.gitlab
                     .update_job(job.id, &job.token, JobState::Success, Some(&trace))

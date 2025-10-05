@@ -1,7 +1,7 @@
 use super::{StorageBackend, StorageStats};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use aws_sdk_s3::{Client, primitives::ByteStream};
+use aws_sdk_s3::{primitives::ByteStream, Client};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -13,7 +13,7 @@ pub struct S3Storage {
 
 impl S3Storage {
     pub async fn new(bucket: String, prefix: String) -> Result<Self> {
-        let config = aws_config::load_from_env().await;
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
 
         Ok(Self {
@@ -28,7 +28,7 @@ impl S3Storage {
         prefix: String,
         endpoint: String,
     ) -> Result<Self> {
-        let config = aws_config::from_env()
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .endpoint_url(endpoint)
             .load()
             .await;

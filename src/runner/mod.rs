@@ -6,18 +6,16 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Job, Step};
 use crate::optimizer::BuildOptimizer;
 
-#[allow(dead_code)]
 pub struct ParallelRunner {
     optimizer: BuildOptimizer,
     max_parallel_jobs: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ExecutionResult {
     pub job_name: String,
@@ -47,6 +45,8 @@ impl ParallelRunner {
         info!("📦 Executing pipeline: {}", config.name);
         info!("Jobs to run: {}", config.jobs.len());
 
+        // Optimization stats will be shown after execution
+
         // Create semaphore for parallel execution limit
         let semaphore = Arc::new(Semaphore::new(self.max_parallel_jobs));
 
@@ -59,13 +59,21 @@ impl ParallelRunner {
         if !failed.is_empty() {
             error!("❌ {} job(s) failed:", failed.len());
             for result in failed {
-                error!("  - {}", result.job_name);
+                error!("  - {} (took {:.2}s)", result.job_name, result.duration.as_secs_f64());
+                if !result.output.is_empty() {
+                    debug!("    Output: {}", result.output);
+                }
             }
             anyhow::bail!("Pipeline failed");
         }
 
         let duration = start.elapsed();
         info!("✅ Pipeline completed in {:.2}s", duration.as_secs_f64());
+
+        // Show job durations
+        for result in &results {
+            info!("  {} - {:.2}s", result.job_name, result.duration.as_secs_f64());
+        }
 
         Ok(())
     }
@@ -196,7 +204,6 @@ impl ParallelRunner {
     }
 
     /// Execute tests in parallel
-    #[allow(dead_code)]
     pub async fn run_tests_parallel(
         &self,
         test_files: Vec<String>,

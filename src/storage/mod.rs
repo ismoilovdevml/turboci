@@ -1,6 +1,5 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use std::path::Path;
 
 pub mod redis_storage;
 pub mod s3_storage;
@@ -63,9 +62,7 @@ impl StorageBackend for HybridStorage {
             // Large files → S3 (cheap)
             // Store metadata in Redis, data in S3
             self.s3.store(key, data).await?;
-            self.redis
-                .store(&format!("meta:{}", key), b"s3")
-                .await
+            self.redis.store(&format!("meta:{}", key), b"s3").await
         }
     }
 

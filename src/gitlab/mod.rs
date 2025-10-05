@@ -2,9 +2,6 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-pub mod api;
-pub mod job;
-
 #[derive(Debug, Clone)]
 pub struct GitLabClient {
     client: Client,
@@ -41,7 +38,10 @@ impl GitLabClient {
             return Ok(None);
         }
 
-        let job: Job = response.json().await.context("Failed to parse job response")?;
+        let job: Job = response
+            .json()
+            .await
+            .context("Failed to parse job response")?;
         Ok(Some(job))
     }
 

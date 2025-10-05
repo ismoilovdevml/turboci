@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
-use bollard::container::{Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
+use bollard::container::{
+    Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
+};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use std::sync::Arc;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::gitlab::Job;
 
@@ -16,8 +18,8 @@ pub struct DockerExecutor {
 
 impl DockerExecutor {
     pub fn new(default_image: String) -> Result<Self> {
-        let docker = Docker::connect_with_local_defaults()
-            .context("Failed to connect to Docker daemon")?;
+        let docker =
+            Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
 
         Ok(Self {
             docker: Arc::new(docker),
@@ -145,8 +147,9 @@ impl DockerExecutor {
 
         let mut output = String::new();
 
-        if let StartExecResults::Attached { mut output: stream, .. } =
-            self.docker.start_exec(&exec.id, None).await?
+        if let StartExecResults::Attached {
+            output: mut stream, ..
+        } = self.docker.start_exec(&exec.id, None).await?
         {
             while let Some(chunk) = stream.next().await {
                 match chunk {

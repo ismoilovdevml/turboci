@@ -7,35 +7,42 @@ description = "Super fast CI/CD runner with distributed caching and parallel exe
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1.35", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-clap = { version = "4.4", features = ["derive"] }
-anyhow = "1.0"
-blake3 = "1.5"
-rayon = "1.8"
-walkdir = "2.4"
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
-reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+blake3 = "1"
+rayon = "1"
+walkdir = "2"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.12", features = ["json"] }
 sha2 = "0.10"
 chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 serde_yaml = "0.9"
 glob = "0.3"
-# Runner daemon dependencies
-bollard = "0.16"  # Docker API
-aws-sdk-s3 = "1.0"  # S3 storage
-aws-config = "1.0"
-toml = "0.8"  # Config parsing
-uuid = { version = "1.6", features = ["v4", "serde"] }
-hyper = { version = "0.14", features = ["server"] }
-tower = "0.4"
-axum = "0.7"  # Metrics API
-prometheus = "0.13"  # Metrics
+regex = "1"
+async-trait = "0.1"
+# Runner daemon dependencies (optional feature)
+bollard = { version = "0.18", optional = true }
+futures-util = { version = "0.3", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
+uuid = { version = "1", features = ["v4", "serde"], optional = true }
+hyper = { version = "1", features = ["server"], optional = true }
+tower = { version = "0.5", optional = true }
+axum = { version = "0.7", optional = true }
+prometheus = { version = "0.13", optional = true }
+
+[features]
+default = []
+runner = ["bollard", "futures-util", "aws-sdk-s3", "aws-config", "toml", "uuid", "hyper", "tower", "axum", "prometheus"]
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = "3"
 
 [[bin]]
 name = "turboci"
