@@ -1,0 +1,54 @@
+name: TurboCI
+description: 'Super fast CI/CD runner with distributed caching'
+author: 'TurboCI Team'
+
+inputs:
+  config-file:
+    description: 'Path to turboci.yml config file'
+    required: false
+    default: 'turboci.yml'
+  redis-url:
+    description: 'Redis URL for distributed cache'
+    required: false
+    default: 'redis://localhost:6379'
+  cache-enabled:
+    description: 'Enable distributed caching'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Redis
+      if: inputs.cache-enabled == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y redis-server
+        sudo systemctl start redis-server
+
+    - name: Install TurboCI
+      shell: bash
+      run: |
+        curl -sSL https://raw.githubusercontent.com/turboci/turboci/main/install.sh | sh
+
+    - name: Initialize Cache
+      if: inputs.cache-enabled == 'true'
+      shell: bash
+      run: |
+        turboci init-cache --redis-url ${{ inputs.redis-url }}
+
+    - name: Run TurboCI Pipeline
+      shell: bash
+      run: |
+        turboci run --config ${{ inputs.config-file }}
+
+    - name: Cache Statistics
+      if: always() && inputs.cache-enabled == 'true'
+      shell: bash
+      run: |
+        turboci cache-stats
+
+branding:
+  icon: 'zap'
+  color: 'blue'

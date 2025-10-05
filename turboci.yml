@@ -1,0 +1,86 @@
+name: TurboCI Example Pipeline
+version: "1.0"
+
+# Cache configuration
+cache:
+  redis_url: "redis://127.0.0.1:6379"
+  ttl_seconds: 86400  # 24 hours
+  enabled: true
+
+# Jobs to execute
+jobs:
+  # Build job - sequential execution
+  - name: build
+    parallel: false
+    steps:
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing dependencies..."
+          npm install
+
+      - name: Build project
+        run: |
+          echo "🔨 Building project..."
+          npm run build
+
+      - name: Build Docker image
+        run: |
+          echo "🐳 Building Docker image..."
+          docker build -t myapp:latest .
+
+  # Test job - parallel execution
+  - name: test
+    parallel: true
+    steps:
+      - name: Unit tests
+        run: |
+          echo "🧪 Running unit tests..."
+          npm run test:unit
+
+      - name: Integration tests
+        run: |
+          echo "🔗 Running integration tests..."
+          npm run test:integration
+
+      - name: E2E tests
+        run: |
+          echo "🌐 Running E2E tests..."
+          npm run test:e2e
+
+  # Quality checks - parallel execution
+  - name: quality
+    parallel: true
+    steps:
+      - name: Linting
+        run: |
+          echo "🔍 Running linter..."
+          npm run lint
+
+      - name: Type checking
+        run: |
+          echo "📝 Type checking..."
+          npm run type-check
+
+      - name: Security audit
+        run: |
+          echo "🔒 Security audit..."
+          npm audit
+
+  # Deploy job - sequential execution
+  - name: deploy
+    parallel: false
+    steps:
+      - name: Deploy to staging
+        run: |
+          echo "🚀 Deploying to staging..."
+          ./deploy.sh staging
+
+      - name: Run smoke tests
+        run: |
+          echo "💨 Running smoke tests..."
+          npm run test:smoke
+
+      - name: Deploy to production
+        run: |
+          echo "🌍 Deploying to production..."
+          ./deploy.sh production
