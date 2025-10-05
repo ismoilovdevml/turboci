@@ -11,11 +11,13 @@ use tracing::{error, info, warn};
 use crate::config::{Config, Job, Step};
 use crate::optimizer::BuildOptimizer;
 
+#[allow(dead_code)]
 pub struct ParallelRunner {
     optimizer: BuildOptimizer,
     max_parallel_jobs: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ExecutionResult {
     pub job_name: String,
@@ -27,7 +29,10 @@ pub struct ExecutionResult {
 impl ParallelRunner {
     pub fn new(optimizer: BuildOptimizer) -> Self {
         let max_parallel_jobs = num_cpus::cpus();
-        info!("🚀 Parallel runner initialized with {} workers", max_parallel_jobs);
+        info!(
+            "🚀 Parallel runner initialized with {} workers",
+            max_parallel_jobs
+        );
 
         Self {
             optimizer,
@@ -127,9 +132,17 @@ impl ParallelRunner {
         let duration = start.elapsed();
 
         if all_success {
-            info!("✅ Job '{}' completed in {:.2}s", job.name, duration.as_secs_f64());
+            info!(
+                "✅ Job '{}' completed in {:.2}s",
+                job.name,
+                duration.as_secs_f64()
+            );
         } else {
-            error!("❌ Job '{}' failed after {:.2}s", job.name, duration.as_secs_f64());
+            error!(
+                "❌ Job '{}' failed after {:.2}s",
+                job.name,
+                duration.as_secs_f64()
+            );
         }
 
         Ok(ExecutionResult {
@@ -183,7 +196,10 @@ impl ParallelRunner {
     }
 
     /// Execute tests in parallel
-    pub async fn run_tests_parallel(&self, test_files: Vec<String>) -> Result<Vec<ExecutionResult>> {
+    pub async fn run_tests_parallel(
+        &self,
+        test_files: Vec<String>,
+    ) -> Result<Vec<ExecutionResult>> {
         info!("🧪 Running {} tests in parallel...", test_files.len());
 
         let results: Vec<ExecutionResult> = test_files

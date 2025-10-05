@@ -71,11 +71,9 @@ impl Config {
 
     /// Save configuration to YAML file
     pub fn save(&self, path: &str) -> Result<()> {
-        let yaml = serde_yaml::to_string(self)
-            .context("Failed to serialize config to YAML")?;
+        let yaml = serde_yaml::to_string(self).context("Failed to serialize config to YAML")?;
 
-        fs::write(path, yaml)
-            .with_context(|| format!("Failed to write config file: {}", path))?;
+        fs::write(path, yaml).with_context(|| format!("Failed to write config file: {}", path))?;
 
         Ok(())
     }
@@ -118,12 +116,10 @@ impl Config {
                 Job {
                     name: "lint".to_string(),
                     parallel: true,
-                    steps: vec![
-                        Step {
-                            name: "Run linter".to_string(),
-                            run: "npm run lint".to_string(),
-                        },
-                    ],
+                    steps: vec![Step {
+                        name: "Run linter".to_string(),
+                        run: "npm run lint".to_string(),
+                    }],
                 },
             ],
         }
