@@ -1,6 +1,6 @@
 # Contributing to TurboCI
 
-TurboCI loyihasiga hissa qo'shganingiz uchun rahmat! 🎉
+Thank you for contributing to TurboCI! 🎉
 
 ## Development Setup
 
@@ -13,17 +13,17 @@ TurboCI loyihasiga hissa qo'shganingiz uchun rahmat! 🎉
 ### Setup
 
 ```bash
-# Repository'ni clone qiling
+# Clone the repository
 git clone https://github.com/turboci/turboci.git
 cd turboci
 
-# Dependencies'ni build qiling
+# Build dependencies
 cargo build
 
-# Test'larni ishga tushiring
+# Run tests
 cargo test
 
-# Redis'ni ishga tushiring (Docker bilan)
+# Start Redis (using Docker)
 docker run -d -p 6379:6379 redis:alpine
 ```
 
@@ -31,24 +31,24 @@ docker run -d -p 6379:6379 redis:alpine
 
 - Rust formatting: `cargo fmt`
 - Linting: `cargo clippy`
-- Har bir function uchun documentation
-- Test coverage minimum 80%
+- Documentation for each function
+- Minimum 80% test coverage
 
 ## Pull Request Process
 
-1. Fork qiling repository'ni
-2. Feature branch yarating (`git checkout -b feature/amazing-feature`)
-3. O'zgarishlarni commit qiling (`git commit -m 'Add amazing feature'`)
-4. Branch'ni push qiling (`git push origin feature/amazing-feature`)
-5. Pull Request oching
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## Testing
 
 ```bash
-# Barcha test'larni ishga tushirish
+# Run all tests
 cargo test
 
-# Integration test'lar
+# Integration tests
 cargo test --test integration
 
 # Specific test
@@ -64,7 +64,7 @@ cargo test test_cache_manager
 
 ## Reporting Bugs
 
-Bug topganingizda, quyidagilar bilan issue oching:
+When you find a bug, open an issue with:
 
 - Bug description
 - Reproduction steps
@@ -73,22 +73,22 @@ Bug topganingizda, quyidagilar bilan issue oching:
 
 ## Feature Requests
 
-Yangi feature taklif qilish uchun:
+To suggest a new feature:
 
-1. Issue oching "Feature Request" template bilan
-2. Use case tushuntiring
-3. Implementation details (agar bor bo'lsa)
+1. Open an issue with "Feature Request" template
+2. Explain the use case
+3. Provide implementation details (if available)
 
 ## Code of Conduct
 
-- Respectful bo'ling
-- Constructive feedback bering
-- Inclusive muhit yarating
+- Be respectful
+- Provide constructive feedback
+- Create an inclusive environment
 
 ## License
 
-MIT License - [LICENSE](LICENSE) file'ga qarang
+MIT License - see [LICENSE](LICENSE) file
 
 ---
 
-Savollar bo'lsa Discord'ga qo'shiling: [discord.gg/turboci](https://discord.gg/turboci)
+Questions? Join our Discord: [discord.gg/turboci](https://discord.gg/turboci)

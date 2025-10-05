@@ -1,25 +1,25 @@
 # ⚡ TurboCI - Super Fast CI/CD Runner
 
-TurboCI - CI/CD jarayonlarini 5-10 barobar tezlashtiruvchi zamonaviy runner. Distributed caching, incremental builds va parallel execution imkoniyatlari bilan.
+A modern CI/CD runner that accelerates your build pipeline by 5-10x with distributed caching, incremental builds, and parallel execution.
 
-## 🚀 Asosiy Xususiyatlar
+## 🚀 Key Features
 
 ### 1. **Distributed Build Cache**
-- Redis orqali tarqatilgan kesh tizimi
-- BLAKE3 hash algoritmi (juda tez)
-- Build natijalarini saqlash va qayta ishlatish
+- Distributed cache system via Redis
+- BLAKE3 hash algorithm (extremely fast)
+- Store and reuse build results
 - Cache hit rate monitoring
 
 ### 2. **Incremental Build Optimizer**
-- Faqat o'zgargan fayllarni build qiladi
-- Git diff tahlili
+- Build only changed files
+- Git diff analysis
 - Dependency tracking
 - Smart cache invalidation
 
 ### 3. **Parallel Test Runner**
-- Barcha CPU core'lardan foydalanish
-- Test'larni parallel ravishda bajarish
-- Rayon library yordamida
+- Utilize all CPU cores
+- Run tests in parallel
+- Powered by Rayon library
 - Real-time progress tracking
 
 ### 4. **GitHub Actions Integration**
@@ -28,30 +28,30 @@ TurboCI - CI/CD jarayonlarini 5-10 barobar tezlashtiruvchi zamonaviy runner. Dis
 - Cache statistics
 - Easy configuration
 
-## 📦 O'rnatish
+## 📦 Installation
 
-### Binary orqali (Tez)
+### Binary (Fast)
 ```bash
 curl -sSL https://turboci.dev/install.sh | sh
 ```
 
-### Cargo orqali
+### Via Cargo
 ```bash
 cargo install turboci
 ```
 
-### Source'dan build qilish
+### Build from Source
 ```bash
 git clone https://github.com/turboci/turboci.git
 cd turboci
 cargo build --release
 ```
 
-## 🎯 Ishlatish
+## 🎯 Usage
 
-### 1. Konfiguratsiya yaratish
+### 1. Create Configuration
 
-`turboci.yml` faylini yarating:
+Create a `turboci.yml` file:
 
 ```yaml
 name: My Fast Pipeline
@@ -88,13 +88,13 @@ jobs:
         run: npm run lint
 ```
 
-### 2. Redis'ni ishga tushirish
+### 2. Start Redis
 
 ```bash
-# Docker bilan
+# Using Docker
 docker run -d -p 6379:6379 redis:alpine
 
-# Yoki local o'rnatish
+# Or install locally
 # macOS
 brew install redis
 brew services start redis
@@ -104,22 +104,22 @@ sudo apt-get install redis-server
 sudo systemctl start redis
 ```
 
-### 3. Pipeline'ni ishga tushirish
+### 3. Run Pipeline
 
 ```bash
-# Cache'ni initialize qilish
+# Initialize cache
 turboci init-cache
 
-# Pipeline'ni ishga tushirish
+# Run pipeline
 turboci run --config turboci.yml
 
-# Cache statistikasini ko'rish
+# View cache statistics
 turboci cache-stats
 ```
 
-## 🔧 GitHub Actions'da Ishlatish
+## 🔧 GitHub Actions Usage
 
-`.github/workflows/turboci.yml` yarating:
+Create `.github/workflows/turboci.yml`:
 
 ```yaml
 name: TurboCI Pipeline
@@ -140,9 +140,9 @@ jobs:
           cache-enabled: 'true'
 ```
 
-## 📊 Performance Taqqoslash
+## 📊 Performance Comparison
 
-### Odatiy GitHub Actions
+### Standard GitHub Actions
 ```
 ✗ Build: 3m 45s
 ✗ Tests: 2m 30s
@@ -151,7 +151,7 @@ jobs:
 Total: 7m 30s
 ```
 
-### TurboCI bilan
+### With TurboCI
 ```
 ✓ Build: 45s (cached: 80%)
 ✓ Tests: 35s (parallel: 8 workers)
@@ -161,7 +161,7 @@ Total: 1m 32s
 ⚡ 5.8x FASTER!
 ```
 
-## 🏗️ Arxitektura
+## 🏗️ Architecture
 
 ```
 ┌─────────────────────────────────────────┐
@@ -186,15 +186,15 @@ Total: 1m 32s
 └─────────────────────────────────────────┘
 ```
 
-## 🔍 Qanday Ishlaydi?
+## 🔍 How It Works
 
 ### 1. **Hash-based Caching**
 ```rust
-// Har bir build target uchun hash hisoblanadi
+// Compute hash for each build target
 let hash = blake3::hash(file_contents);
 let cache_key = format!("build:{}:{}", target, hash);
 
-// Agar cache'da mavjud bo'lsa, qayta build qilinmaydi
+// Skip rebuild if cached
 if cache.exists(&cache_key).await? {
     return Ok(CachedResult);
 }
@@ -202,10 +202,10 @@ if cache.exists(&cache_key).await? {
 
 ### 2. **Incremental Analysis**
 ```rust
-// Git diff orqali o'zgargan fayllar topiladi
+// Find changed files via git diff
 let changed_files = git_diff();
 
-// Faqat ta'sirlangan target'lar rebuild qilinadi
+// Rebuild only affected targets
 for target in targets {
     if target.affected_by(&changed_files) {
         rebuild(target);
@@ -227,23 +227,23 @@ let handles: Vec<_> = jobs
     .collect();
 ```
 
-## 🛠️ Komandalar
+## 🛠️ Commands
 
 ```bash
-# Pipeline'ni ishga tushirish
+# Run pipeline
 turboci run [--config <file>]
 
-# Cache'ni initialize qilish
+# Initialize cache
 turboci init-cache [--redis-url <url>]
 
-# Cache'ni tozalash
+# Clear cache
 turboci clear-cache
 
-# Statistikani ko'rish
+# View statistics
 turboci cache-stats
 ```
 
-## 📈 Cache Statistika Namunasi
+## 📈 Cache Statistics Example
 
 ```
 📊 Cache Statistics:
@@ -256,9 +256,9 @@ turboci cache-stats
 ⚡ Build Optimization: 84.7% cached (847/1000)
 ```
 
-## 🔐 Xavfsizlik
+## 🔐 Security
 
-- Redis authentication qo'llab-quvvatlanadi
+- Redis authentication supported
 - TLS/SSL encryption
 - Cache TTL (Time To Live)
 - Secure hash verification
@@ -266,14 +266,14 @@ turboci cache-stats
 ## 🤝 Contributing
 
 ```bash
-# Repository'ni clone qilish
+# Clone repository
 git clone https://github.com/turboci/turboci.git
 cd turboci
 
-# Dependencies'ni o'rnatish
+# Install dependencies
 cargo build
 
-# Test'larni ishga tushirish
+# Run tests
 cargo test
 
 # Linting
@@ -281,7 +281,7 @@ cargo clippy
 cargo fmt
 ```
 
-## 📝 Loyiha Strukturasi
+## 📝 Project Structure
 
 ```
 turboci/
@@ -304,25 +304,25 @@ turboci/
 └── turboci.yml              # Example config
 ```
 
-## 🎯 Use Case'lar
+## 🎯 Use Cases
 
-### 1. Large Monorepo
-- O'nlab microservice'larni parallel build qilish
-- Shared cache orqali tezlik
+### 1. Large Monorepos
+- Build dozens of microservices in parallel
+- Speed up with shared cache
 
 ### 2. Test-Heavy Projects
-- Minglab test'larni parallel bajarish
-- 10x tezroq test execution
+- Run thousands of tests in parallel
+- 10x faster test execution
 
 ### 3. Multi-Platform Builds
-- Turli platformalar uchun parallel build
+- Parallel builds for different platforms
 - Cross-compilation optimization
 
 ### 4. Team Collaboration
-- Team member'lari o'rtasida cache sharing
+- Share cache between team members
 - Distributed Redis cluster
 
-## 🌟 Afzalliklar
+## 🌟 Advantages
 
 | Feature | GitHub Actions | TurboCI |
 |---------|---------------|---------|
@@ -345,6 +345,6 @@ MIT License - see [LICENSE](LICENSE) file
 
 ---
 
-**⚡ TurboCI bilan CI/CD'ingizni tezlashtiring!**
+**⚡ Supercharge your CI/CD with TurboCI!**
 
 Made with ❤️ by TurboCI Team
