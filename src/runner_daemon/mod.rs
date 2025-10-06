@@ -140,7 +140,9 @@ impl RunnerDaemon {
         let mut scrubber = (*self.scrubber).clone();
         for var in &job.variables {
             if var.masked {
-                scrubber.add_secret(var.value.clone());
+                if let Some(ref value) = var.value {
+                    scrubber.add_secret(value.clone());
+                }
             }
         }
 
@@ -248,7 +250,9 @@ impl RunnerDaemon {
         for var in &job.variables {
             if !var.masked {
                 // Don't include secrets in cache key
-                hasher.update(format!("{}={}", var.key, var.value).as_bytes());
+                if let Some(ref value) = var.value {
+                    hasher.update(format!("{}={}", var.key, value).as_bytes());
+                }
             }
         }
 

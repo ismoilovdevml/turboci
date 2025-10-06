@@ -391,7 +391,8 @@ pub struct RunnerVariables {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Variable {
     pub key: String,
-    pub value: String,
+    #[serde(default)]
+    pub value: Option<String>,
     #[serde(default)]
     pub public: bool,
     #[serde(default)]
