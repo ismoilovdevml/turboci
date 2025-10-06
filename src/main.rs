@@ -129,8 +129,10 @@ async fn main() -> Result<()> {
 
             // Initialize storage
             let redis = RedisStorage::new(&runner_config.redis_url, 3600).await?;
-            let s3 = if let Some(bucket) = &runner_config.s3_bucket {
-                if let Some(endpoint) = &runner_config.s3_endpoint {
+
+            let storage = if let Some(bucket) = &runner_config.s3_bucket {
+                // S3 is configured - use hybrid storage
+                let s3 = if let Some(endpoint) = &runner_config.s3_endpoint {
                     S3Storage::new_with_endpoint(
                         bucket.clone(),
                         runner_config.s3_prefix.clone(),
@@ -139,12 +141,13 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     S3Storage::new(bucket.clone(), runner_config.s3_prefix.clone()).await?
-                }
+                };
+                HybridStorage::new(redis, s3, runner_config.storage_threshold)
             } else {
-                return Err(anyhow::anyhow!("S3 bucket not configured"));
+                // S3 not configured - use Redis-only storage (faster!)
+                info!("⚡ Using Redis-only storage (no S3) for maximum speed!");
+                HybridStorage::redis_only(redis)
             };
-
-            let storage = HybridStorage::new(redis, s3, runner_config.storage_threshold);
 
             // Initialize executor
             let executor =
@@ -214,8 +217,10 @@ async fn main() -> Result<()> {
             );
 
             let redis = RedisStorage::new(&runner_config.redis_url, 3600).await?;
-            let s3 = if let Some(bucket) = &runner_config.s3_bucket {
-                if let Some(endpoint) = &runner_config.s3_endpoint {
+
+            let storage = if let Some(bucket) = &runner_config.s3_bucket {
+                // S3 is configured - use hybrid storage
+                let s3 = if let Some(endpoint) = &runner_config.s3_endpoint {
                     S3Storage::new_with_endpoint(
                         bucket.clone(),
                         runner_config.s3_prefix.clone(),
@@ -224,12 +229,13 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     S3Storage::new(bucket.clone(), runner_config.s3_prefix.clone()).await?
-                }
+                };
+                HybridStorage::new(redis, s3, runner_config.storage_threshold)
             } else {
-                return Err(anyhow::anyhow!("S3 bucket not configured"));
+                // S3 not configured - use Redis-only storage
+                HybridStorage::redis_only(redis)
             };
 
-            let storage = HybridStorage::new(redis, s3, runner_config.storage_threshold);
             let executor =
                 DockerExecutor::new(runner_config.executor.docker.default_image.clone())?;
 

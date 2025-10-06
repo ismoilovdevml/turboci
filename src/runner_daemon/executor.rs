@@ -6,9 +6,26 @@ use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::sync::Arc;
+use tokio::process::Command;
 use tracing::{debug, info};
 
 use crate::gitlab::Job;
+
+/// Executor type enum
+#[derive(Debug, Clone)]
+pub enum ExecutorType {
+    Docker(DockerExecutor),
+    Shell(ShellExecutor),
+}
+
+impl ExecutorType {
+    pub async fn execute(&self, job: &Job) -> Result<String> {
+        match self {
+            ExecutorType::Docker(executor) => executor.execute(job).await,
+            ExecutorType::Shell(executor) => executor.execute(job).await,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DockerExecutor {
@@ -181,5 +198,108 @@ impl DockerExecutor {
 
         info!("🗑️  Cleaned up container: {}", container_id);
         Ok(())
+    }
+}
+
+/// Shell Executor - Runs jobs directly on host (FAST!)
+#[derive(Clone, Debug)]
+pub struct ShellExecutor {
+    work_dir: String,
+}
+
+impl ShellExecutor {
+    pub fn new(work_dir: Option<String>) -> Self {
+        Self {
+            work_dir: work_dir.unwrap_or_else(|| "/tmp/turboci".to_string()),
+        }
+    }
+
+    /// Execute a GitLab job using shell (super fast!)
+    pub async fn execute(&self, job: &Job) -> Result<String> {
+        info!("⚡ Using Shell executor (direct execution)");
+
+        let job_dir = format!("{}/job-{}", self.work_dir, job.id);
+
+        // Create work directory
+        tokio::fs::create_dir_all(&job_dir).await?;
+
+        let mut output = String::new();
+
+        // Clone repository
+        output.push_str(&self.clone_repository(job, &job_dir).await?);
+
+        // Execute job steps
+        for step in &job.steps {
+            info!("  ⚡ Step: {}", step.name);
+
+            for script_line in &step.script {
+                let step_output = self.exec_command(script_line, &job_dir).await?;
+                output.push_str(&step_output);
+                output.push('\n');
+            }
+        }
+
+        // Cleanup (optional - keep for debugging)
+        // tokio::fs::remove_dir_all(&job_dir).await?;
+
+        Ok(output)
+    }
+
+    /// Clone Git repository
+    async fn clone_repository(&self, job: &Job, job_dir: &str) -> Result<String> {
+        info!("📥 Cloning repository...");
+
+        let clone_output = Command::new("git")
+            .arg("clone")
+            .arg("--depth")
+            .arg("1")
+            .arg("--branch")
+            .arg(&job.git_info.ref_name)
+            .arg(&job.git_info.repo_url)
+            .arg(format!("{}/project", job_dir))
+            .output()
+            .await
+            .context("Failed to clone repository")?;
+
+        let output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&clone_output.stdout),
+            String::from_utf8_lossy(&clone_output.stderr)
+        );
+
+        if !clone_output.status.success() {
+            return Err(anyhow::anyhow!("Git clone failed: {}", output));
+        }
+
+        Ok(output)
+    }
+
+    /// Execute command via shell
+    async fn exec_command(&self, command: &str, job_dir: &str) -> Result<String> {
+        debug!("⚡ Executing: {}", command);
+
+        let project_dir = format!("{}/project", job_dir);
+
+        let exec_output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&project_dir)
+            .output()
+            .await
+            .context("Failed to execute command")?;
+
+        let output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&exec_output.stdout),
+            String::from_utf8_lossy(&exec_output.stderr)
+        );
+
+        print!("{}", output);
+
+        if !exec_output.status.success() {
+            return Err(anyhow::anyhow!("Command failed: {}", command));
+        }
+
+        Ok(output)
     }
 }

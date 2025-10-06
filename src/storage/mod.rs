@@ -36,7 +36,7 @@ pub struct StorageStats {
 /// Multi-tier storage: Redis (hot) + S3 (cold)
 pub struct HybridStorage {
     redis: redis_storage::RedisStorage,
-    s3: s3_storage::S3Storage,
+    s3: Option<s3_storage::S3Storage>,
     size_threshold: usize, // > threshold → S3
 }
 
@@ -48,8 +48,17 @@ impl HybridStorage {
     ) -> Self {
         Self {
             redis,
-            s3,
+            s3: Some(s3),
             size_threshold,
+        }
+    }
+
+    /// Create Redis-only storage (no S3)
+    pub fn redis_only(redis: redis_storage::RedisStorage) -> Self {
+        Self {
+            redis,
+            s3: None,
+            size_threshold: usize::MAX, // Never use S3
         }
     }
 }
@@ -57,14 +66,19 @@ impl HybridStorage {
 #[async_trait]
 impl StorageBackend for HybridStorage {
     async fn store(&self, key: &str, data: &[u8]) -> Result<()> {
-        if data.len() < self.size_threshold {
-            // Small files → Redis (fast)
+        if data.len() < self.size_threshold || self.s3.is_none() {
+            // Small files or S3 not configured → Redis (fast)
             self.redis.store(key, data).await
         } else {
             // Large files → S3 (cheap)
             // Store metadata in Redis, data in S3
-            self.s3.store(key, data).await?;
-            self.redis.store(&format!("meta:{}", key), b"s3").await
+            if let Some(s3) = &self.s3 {
+                s3.store(key, data).await?;
+                self.redis.store(&format!("meta:{}", key), b"s3").await
+            } else {
+                // Fallback to Redis if S3 not available
+                self.redis.store(key, data).await
+            }
         }
     }
 
@@ -74,10 +88,12 @@ impl StorageBackend for HybridStorage {
             return Ok(Some(data));
         }
 
-        // Check if it's in S3
-        if let Some(meta) = self.redis.retrieve(&format!("meta:{}", key)).await? {
-            if meta == b"s3" {
-                return self.s3.retrieve(key).await;
+        // Check if it's in S3 (if S3 is configured)
+        if let Some(s3) = &self.s3 {
+            if let Some(meta) = self.redis.retrieve(&format!("meta:{}", key)).await? {
+                if meta == b"s3" {
+                    return s3.retrieve(key).await;
+                }
             }
         }
 
@@ -89,8 +105,10 @@ impl StorageBackend for HybridStorage {
             return Ok(true);
         }
 
-        if self.redis.exists(&format!("meta:{}", key)).await? {
-            return self.s3.exists(key).await;
+        if let Some(s3) = &self.s3 {
+            if self.redis.exists(&format!("meta:{}", key)).await? {
+                return s3.exists(key).await;
+            }
         }
 
         Ok(false)
@@ -99,9 +117,11 @@ impl StorageBackend for HybridStorage {
     async fn delete(&self, key: &str) -> Result<()> {
         self.redis.delete(key).await?;
 
-        if self.redis.exists(&format!("meta:{}", key)).await? {
-            self.redis.delete(&format!("meta:{}", key)).await?;
-            self.s3.delete(key).await?;
+        if let Some(s3) = &self.s3 {
+            if self.redis.exists(&format!("meta:{}", key)).await? {
+                self.redis.delete(&format!("meta:{}", key)).await?;
+                s3.delete(key).await?;
+            }
         }
 
         Ok(())
@@ -109,13 +129,17 @@ impl StorageBackend for HybridStorage {
 
     async fn stats(&self) -> Result<StorageStats> {
         let redis_stats = self.redis.stats().await?;
-        let s3_stats = self.s3.stats().await?;
 
-        Ok(StorageStats {
-            total_size: redis_stats.total_size + s3_stats.total_size,
-            item_count: redis_stats.item_count + s3_stats.item_count,
-            hit_count: redis_stats.hit_count + s3_stats.hit_count,
-            miss_count: redis_stats.miss_count + s3_stats.miss_count,
-        })
+        if let Some(s3) = &self.s3 {
+            let s3_stats = s3.stats().await?;
+            Ok(StorageStats {
+                total_size: redis_stats.total_size + s3_stats.total_size,
+                item_count: redis_stats.item_count + s3_stats.item_count,
+                hit_count: redis_stats.hit_count + s3_stats.hit_count,
+                miss_count: redis_stats.miss_count + s3_stats.miss_count,
+            })
+        } else {
+            Ok(redis_stats)
+        }
     }
 }
