@@ -105,14 +105,14 @@ jobs:
 
       - name: Move artifacts to root
         run: |
-          find artifacts -name "*.tar.gz" -exec mv {} . \;
-          ls -lh *.tar.gz
+          find artifacts -name "turboci-*" -type f -exec mv {} . \;
+          ls -lh turboci-*
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            *.tar.gz
+            turboci-*
           body: |
             ## ⚡ TurboCI ${{ github.ref_name }}
 
