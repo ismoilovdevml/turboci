@@ -106,12 +106,16 @@ jobs:
       - name: Move artifacts to root
         run: |
           find artifacts -name "turboci-*" -type f -exec mv {} . \;
+          # Create a copy of Linux binary as 'turboci' for backward compatibility
+          cp turboci-x86_64-unknown-linux-musl turboci
           ls -lh turboci-*
+          ls -lh turboci
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
+            turboci
             turboci-*
           body: |
             ## ⚡ TurboCI ${{ github.ref_name }}
