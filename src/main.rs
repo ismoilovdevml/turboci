@@ -29,6 +29,7 @@ use runner::ParallelRunner;
 #[derive(Parser)]
 #[command(name = "turboci")]
 #[command(about = "⚡ Super fast CI/CD runner with distributed caching", long_about = None)]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -73,6 +74,8 @@ enum Commands {
         #[arg(short, long, default_value = "runner-config.toml")]
         config: String,
     },
+    /// Upgrade TurboCI to the latest version
+    Upgrade,
 }
 
 #[tokio::main]
@@ -279,6 +282,78 @@ async fn main() -> Result<()> {
                 stats.total_cached_size / 1024 / 1024
             );
             println!("  Cached Items: {}", stats.cached_items);
+        }
+        Commands::Upgrade => {
+            info!("🔄 Checking for updates...");
+
+            // Get current version
+            let current_version = env!("CARGO_PKG_VERSION");
+            println!("Current version: {}", current_version);
+
+            // Fetch latest release from GitHub
+            let client = reqwest::Client::new();
+            let response = client
+                .get("https://api.github.com/repos/ismoilovdevml/turboci/releases/latest")
+                .header("User-Agent", "TurboCI")
+                .send()
+                .await?;
+
+            let release: serde_json::Value = response.json().await?;
+            let latest_version = release["tag_name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get latest version"))?
+                .trim_start_matches('v');
+
+            println!("Latest version: {}", latest_version);
+
+            if current_version == latest_version {
+                println!("✅ You are already running the latest version!");
+                return Ok(());
+            }
+
+            println!("📥 Downloading TurboCI {}...", latest_version);
+
+            // Detect architecture
+            let target = if cfg!(target_arch = "x86_64") && cfg!(target_os = "linux") {
+                "x86_64-unknown-linux-musl"
+            } else {
+                return Err(anyhow::anyhow!("Unsupported platform for auto-upgrade"));
+            };
+
+            let download_url = format!(
+                "https://github.com/ismoilovdevml/turboci/releases/download/v{}/turboci-{}",
+                latest_version, target
+            );
+
+            // Download new binary
+            let binary_data = client
+                .get(&download_url)
+                .send()
+                .await?
+                .bytes()
+                .await?;
+
+            // Get current executable path
+            let current_exe = std::env::current_exe()?;
+            let temp_path = current_exe.with_extension("new");
+
+            // Write new binary
+            std::fs::write(&temp_path, binary_data)?;
+
+            // Make executable
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&temp_path)?.permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&temp_path, perms)?;
+            }
+
+            // Replace current binary
+            std::fs::rename(&temp_path, &current_exe)?;
+
+            println!("✅ Successfully upgraded to version {}", latest_version);
+            println!("🔄 Please restart TurboCI to use the new version");
         }
     }
 
