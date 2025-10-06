@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::gitlab::{GitLabClient, Job, JobState};
-use crate::security::SecretScrubber;
+use crate::security::secret_scrubber::SecretScrubber;
 use crate::storage::{HybridStorage, StorageBackend};
 
 pub mod config;

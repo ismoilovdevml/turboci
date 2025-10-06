@@ -4,10 +4,12 @@ use std::sync::OnceLock;
 /// Secret scrubber for masking sensitive information in logs and traces
 #[derive(Clone)]
 pub struct SecretScrubber {
+    #[allow(dead_code)]
     secrets: Vec<String>,
     patterns: Vec<Regex>,
 }
 
+#[allow(dead_code)]
 static DEFAULT_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
 
 impl SecretScrubber {
