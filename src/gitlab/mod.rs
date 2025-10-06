@@ -59,10 +59,16 @@ impl GitLabClient {
                 Ok(None)
             }
             StatusCode::OK | StatusCode::CREATED => {
-                let job: Job = response
-                    .json()
+                // Get response text first for debugging
+                let response_text = response
+                    .text()
                     .await
-                    .context("Failed to parse job response")?;
+                    .context("Failed to read response text")?;
+
+                debug!("Job response: {}", response_text);
+
+                let job: Job = serde_json::from_str(&response_text)
+                    .context(format!("Failed to parse job response: {}", response_text))?;
                 info!("Received job #{}", job.id);
                 Ok(Some(job))
             }
@@ -300,17 +306,29 @@ impl Default for RunnerInfo {
 pub struct Job {
     pub id: u64,
     pub token: String,
+    #[serde(default)]
     pub allow_git_fetch: bool,
-    pub job_info: JobInfo,
-    pub git_info: GitInfo,
-    pub runner_info: RunnerVariables,
+    #[serde(default)]
+    pub job_info: Option<JobInfo>,
+    #[serde(default)]
+    pub git_info: Option<GitInfo>,
+    #[serde(default)]
+    pub runner_info: Option<RunnerVariables>,
+    #[serde(default)]
     pub variables: Vec<Variable>,
+    #[serde(default)]
     pub steps: Vec<Step>,
+    #[serde(default)]
     pub image: Option<Image>,
+    #[serde(default)]
     pub services: Vec<Service>,
+    #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
     pub cache: Vec<Cache>,
+    #[serde(default)]
     pub credentials: Vec<Credential>,
+    #[serde(default)]
     pub dependencies: Vec<Dependency>,
     #[serde(default)]
     pub timeout: u32, // Job timeout in seconds (0 = use default)

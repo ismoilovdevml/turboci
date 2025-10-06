@@ -59,7 +59,12 @@ impl RunnerDaemon {
             // Request a job from GitLab
             match self.gitlab.request_job(&self.config.runner_token).await {
                 Ok(Some(job)) => {
-                    info!("📦 Received job #{} ({})", job.id, job.job_info.name);
+                    let job_name = job
+                        .job_info
+                        .as_ref()
+                        .map(|ji| ji.name.as_str())
+                        .unwrap_or("unknown");
+                    info!("📦 Received job #{} ({})", job.id, job_name);
 
                     // Execute job concurrently
                     let daemon = self.clone();
@@ -86,7 +91,12 @@ impl RunnerDaemon {
         // Acquire semaphore permit (limit concurrency)
         let _permit = self.semaphore.acquire().await?;
 
-        info!("▶️  Starting job #{}: {}", job.id, job.job_info.name);
+        let job_name = job
+            .job_info
+            .as_ref()
+            .map(|ji| ji.name.as_str())
+            .unwrap_or("unknown");
+        info!("▶️  Starting job #{}: {}", job.id, job_name);
 
         // Update job state to running
         self.gitlab
@@ -229,8 +239,10 @@ impl RunnerDaemon {
             }
         }
 
-        // Hash git commit SHA
-        hasher.update(job.git_info.sha.as_bytes());
+        // Hash git commit SHA if available
+        if let Some(ref git_info) = job.git_info {
+            hasher.update(git_info.sha.as_bytes());
+        }
 
         // Hash variables (for environment-specific cache)
         for var in &job.variables {
@@ -241,7 +253,8 @@ impl RunnerDaemon {
         }
 
         let hash = hasher.finalize().to_hex();
-        Ok(format!("job:{}:{}", job.job_info.project_id, hash))
+        let project_id = job.job_info.as_ref().map(|ji| ji.project_id).unwrap_or(0);
+        Ok(format!("job:{}:{}", project_id, hash))
     }
 
     /// Load job result from cache
