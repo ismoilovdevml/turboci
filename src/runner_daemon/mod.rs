@@ -222,6 +222,7 @@ impl RunnerDaemon {
                 // Upload artifacts if available (GitLab 17.x)
                 if let Some(ref artifacts) = job.artifacts {
                     for artifact in artifacts {
+                        let artifact_name = artifact.name.as_deref().unwrap_or("artifact");
                         // TODO: Collect artifacts from job workspace
                         // For now, create empty zip as placeholder
                         let artifact_data = Vec::new();
@@ -231,12 +232,12 @@ impl RunnerDaemon {
                                 job.id,
                                 &job.token,
                                 artifact_data,
-                                &artifact.name,
+                                artifact_name,
                                 artifact.expire_in.as_deref(),
                             )
                             .await
                         {
-                            warn!("Failed to upload artifact {}: {}", artifact.name, e);
+                            warn!("Failed to upload artifact {}: {}", artifact_name, e);
                         }
                     }
                 }

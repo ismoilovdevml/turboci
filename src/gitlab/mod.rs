@@ -500,7 +500,14 @@ pub struct Step {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Image {
     pub name: String,
+    #[serde(default)]
     pub entrypoint: Option<Vec<String>>,
+    #[serde(default)]
+    pub ports: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub executor_opts: Option<serde_json::Value>,
+    #[serde(default)]
+    pub pull_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -511,19 +518,32 @@ pub struct Service {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Artifact {
-    pub name: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub untracked: bool,
     pub paths: Vec<String>,
-    pub when: String,
+    #[serde(default)]
+    pub when: Option<String>,
+    #[serde(default)]
     pub expire_in: Option<String>,
+    #[serde(default)]
+    pub artifact_type: Option<String>,
+    #[serde(default)]
+    pub artifact_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Cache {
     pub key: String,
-    pub untracked: bool,
+    #[serde(default)]
+    pub untracked: Option<bool>,
     pub paths: Vec<String>,
     pub policy: String,
+    #[serde(default)]
+    pub when: Option<String>,
+    #[serde(default)]
+    pub fallback_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
