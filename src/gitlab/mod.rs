@@ -332,40 +332,76 @@ pub struct Job {
     pub dependencies: Vec<Dependency>,
     #[serde(default)]
     pub timeout: u32, // Job timeout in seconds (0 = use default)
+    #[serde(default)]
+    pub inputs: Option<serde_json::Value>,
+    #[serde(default)]
+    pub hooks: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub features: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JobInfo {
+    #[serde(default)]
+    pub id: u64,
     pub name: String,
     pub stage: String,
     pub project_id: u64,
     pub project_name: String,
+    #[serde(default)]
+    pub time_in_queue_seconds: Option<u64>,
+    #[serde(default)]
+    pub project_jobs_running_on_instance_runners_count: Option<String>,
+    #[serde(default)]
+    pub queue_size: Option<u64>,
+    #[serde(default)]
+    pub queue_depth: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitInfo {
     pub repo_url: String,
+    #[serde(rename = "ref", alias = "ref_name")]
     pub ref_name: String,
     pub ref_type: String,
     pub sha: String,
     pub before_sha: String,
+    #[serde(default)]
     pub depth: Option<u32>,
+    #[serde(default)]
     pub refspecs: Vec<String>,
+    #[serde(default)]
+    pub repo_object_format: Option<String>,
+    #[serde(default)]
+    pub protected: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RunnerVariables {
-    pub ci_concurrent_id: u32,
-    pub ci_concurrent_project_id: u32,
+    #[serde(default)]
+    pub ci_concurrent_id: Option<u32>,
+    #[serde(default)]
+    pub ci_concurrent_project_id: Option<u32>,
+    #[serde(default)]
+    pub timeout: Option<u32>,
+    #[serde(default)]
+    pub runner_session_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Variable {
     pub key: String,
     pub value: String,
+    #[serde(default)]
     pub public: bool,
+    #[serde(default)]
     pub masked: bool,
+    #[serde(default)]
     pub raw: bool,
+    #[serde(default)]
+    pub file: Option<bool>,
+    #[serde(default)]
+    pub internal: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
