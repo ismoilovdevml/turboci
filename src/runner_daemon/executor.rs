@@ -211,7 +211,7 @@ impl DockerExecutor {
                         cmd: Some(vec!["sh", "-c", &clone_cmd]),
                         attach_stdout: Some(true),
                         attach_stderr: Some(true),
-                        working_dir: Some("/builds"),  // Start from /builds, not /builds/project
+                        working_dir: Some("/builds"), // Start from /builds, not /builds/project
                         ..Default::default()
                     },
                 )
@@ -240,7 +240,10 @@ impl DockerExecutor {
             let inspect = self.docker.inspect_exec(&exec.id).await?;
             if let Some(exit_code) = inspect.exit_code {
                 if exit_code != 0 {
-                    return Err(anyhow::anyhow!("Git clone failed with exit code {}", exit_code));
+                    return Err(anyhow::anyhow!(
+                        "Git clone failed with exit code {}",
+                        exit_code
+                    ));
                 }
             }
 
