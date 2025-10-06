@@ -6,7 +6,6 @@ mod cache;
 mod config;
 mod optimizer;
 mod runner;
-mod security;
 
 // API module (optional)
 #[cfg(feature = "api")]
@@ -17,6 +16,8 @@ mod api;
 mod gitlab;
 #[cfg(feature = "runner")]
 mod runner_daemon;
+#[cfg(feature = "runner")]
+mod security;
 #[cfg(feature = "runner")]
 mod storage;
 
