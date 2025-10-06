@@ -196,12 +196,55 @@ impl DockerExecutor {
     /// Clone Git repository inside container
     async fn clone_repository(&self, job: &Job, container_id: &str) -> Result<String> {
         if let Some(ref git_info) = job.git_info {
+            // First, create the builds directory and cd into it
             let clone_cmd = format!(
-                "git clone --depth 1 --branch {} {} /builds/project",
+                "cd /builds && git clone --depth 1 --branch {} {} project",
                 git_info.ref_name, git_info.repo_url
             );
 
-            self.exec_in_container(container_id, &clone_cmd).await
+            // Execute git clone command from /builds directory (not /builds/project)
+            let exec = self
+                .docker
+                .create_exec(
+                    container_id,
+                    CreateExecOptions {
+                        cmd: Some(vec!["sh", "-c", &clone_cmd]),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        working_dir: Some("/builds"),  // Start from /builds, not /builds/project
+                        ..Default::default()
+                    },
+                )
+                .await
+                .context("Failed to create exec for git clone")?;
+
+            let mut output = String::new();
+
+            if let StartExecResults::Attached {
+                output: mut stream, ..
+            } = self.docker.start_exec(&exec.id, None).await?
+            {
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(msg) => {
+                            let text = msg.to_string();
+                            print!("{}", text);
+                            output.push_str(&text);
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+
+            // Check exit code
+            let inspect = self.docker.inspect_exec(&exec.id).await?;
+            if let Some(exit_code) = inspect.exit_code {
+                if exit_code != 0 {
+                    return Err(anyhow::anyhow!("Git clone failed with exit code {}", exit_code));
+                }
+            }
+
+            Ok(output)
         } else {
             Ok("No git repository to clone".to_string())
         }
@@ -241,6 +284,18 @@ impl DockerExecutor {
                     }
                     Err(e) => return Err(e.into()),
                 }
+            }
+        }
+
+        // Check exec exit code
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        if let Some(exit_code) = inspect.exit_code {
+            if exit_code != 0 {
+                return Err(anyhow::anyhow!(
+                    "Command failed with exit code {}: {}",
+                    exit_code,
+                    command
+                ));
             }
         }
 
