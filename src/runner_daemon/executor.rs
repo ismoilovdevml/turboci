@@ -1,7 +1,4 @@
 use anyhow::{Context, Result};
-use bollard::container::{
-    Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
-};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -70,6 +67,8 @@ impl DockerExecutor {
         info!("📦 Created container: {}", container_id);
 
         // Start container
+        use bollard::container::StartContainerOptions;
+        #[allow(deprecated)]
         self.docker
             .start_container(&container_id, None::<StartContainerOptions<String>>)
             .await
@@ -101,6 +100,7 @@ impl DockerExecutor {
     async fn pull_image(&self, image: &str) -> Result<()> {
         use bollard::image::CreateImageOptions;
 
+        #[allow(deprecated)]
         let options = Some(CreateImageOptions {
             from_image: image,
             ..Default::default()
@@ -120,15 +120,19 @@ impl DockerExecutor {
 
     /// Create Docker container
     async fn create_container(&self, job: &Job, image: &str) -> Result<String> {
+        use bollard::container::CreateContainerOptions;
+        use bollard::models::ContainerCreateBody;
+
+        #[allow(deprecated)]
         let options = CreateContainerOptions {
             name: format!("turboci-job-{}", job.id),
             ..Default::default()
         };
 
-        let config = Config {
-            image: Some(image),
-            working_dir: Some("/builds"),
-            cmd: Some(vec!["sleep", "3600"]), // Keep alive
+        let config = ContainerCreateBody {
+            image: Some(image.to_string()),
+            working_dir: Some("/builds".to_string()),
+            cmd: Some(vec!["sleep".to_string(), "3600".to_string()]),
             ..Default::default()
         };
 
@@ -193,6 +197,9 @@ impl DockerExecutor {
 
     /// Cleanup container
     async fn cleanup_container(&self, container_id: &str) -> Result<()> {
+        use bollard::container::RemoveContainerOptions;
+
+        #[allow(deprecated)]
         self.docker
             .remove_container(
                 container_id,
