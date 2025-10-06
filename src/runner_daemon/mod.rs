@@ -103,7 +103,32 @@ impl RunnerDaemon {
             .update_job(job.id, &job.token, JobState::Running, None)
             .await?;
 
-        // Download cache before execution (GitLab 17.x)
+        // STAGE 1: Prepare execution environment
+        info!("📋 Stage: Preparing execution environment");
+        let prepare_trace = "Preparing execution environment...\n";
+        let mut trace_offset = 0;
+        trace_offset = self
+            .gitlab
+            .patch_trace(job.id, &job.token, prepare_trace, trace_offset)
+            .await
+            .unwrap_or(0);
+
+        // STAGE 2: Get sources (git clone/fetch)
+        if let Some(ref git_info) = job.git_info {
+            info!("📥 Stage: Getting sources from {}", git_info.repo_url);
+            let git_trace = format!(
+                "Cloning repository {}...\nRef: {}\nSHA: {}\n",
+                git_info.repo_url, git_info.ref_name, git_info.sha
+            );
+            trace_offset = self
+                .gitlab
+                .patch_trace(job.id, &job.token, &git_trace, trace_offset)
+                .await
+                .unwrap_or(trace_offset);
+        }
+
+        // STAGE 3: Restore cache
+        info!("📦 Stage: Restoring cache");
         for cache_entry in &job.cache {
             if cache_entry.policy == "pull" || cache_entry.policy == "pull-push" {
                 if let Ok(Some(cache_data)) = self
@@ -111,12 +136,34 @@ impl RunnerDaemon {
                     .download_cache(job.id, &job.token, &cache_entry.key)
                     .await
                 {
-                    // Extract cache to job workspace
-                    info!("📥 Downloaded cache: {}", cache_entry.key);
+                    let cache_trace = format!(
+                        "✓ Restored cache: {} ({} bytes)\n",
+                        cache_entry.key,
+                        cache_data.len()
+                    );
+                    trace_offset = self
+                        .gitlab
+                        .patch_trace(job.id, &job.token, &cache_trace, trace_offset)
+                        .await
+                        .unwrap_or(trace_offset);
                     // TODO: Extract zip to workspace
-                    let _ = cache_data; // Suppress unused warning
                 }
             }
+        }
+
+        // STAGE 4: Download artifacts from dependencies
+        info!("📥 Stage: Downloading artifacts");
+        for dependency in &job.dependencies {
+            let dep_trace = format!(
+                "Downloading artifacts from job #{} ({})\n",
+                dependency.id, dependency.name
+            );
+            trace_offset = self
+                .gitlab
+                .patch_trace(job.id, &job.token, &dep_trace, trace_offset)
+                .await
+                .unwrap_or(trace_offset);
+            // TODO: Actually download artifacts using dependency.token
         }
 
         // Check internal cache before execution
@@ -157,13 +204,17 @@ impl RunnerDaemon {
                 let scrubbed_trace = scrubber.scrub(&trace);
 
                 // Stream trace to GitLab (GitLab 17.x)
-                if let Err(e) = self
+                let _final_offset = match self
                     .gitlab
                     .patch_trace(job.id, &job.token, &scrubbed_trace, 0)
                     .await
                 {
-                    warn!("Failed to stream trace: {}", e);
-                }
+                    Ok(offset) => offset,
+                    Err(e) => {
+                        warn!("Failed to stream trace: {}", e);
+                        0
+                    }
+                };
 
                 // Save to internal cache for future use
                 self.save_to_cache(&cache_key, &scrubbed_trace).await?;
@@ -215,9 +266,11 @@ impl RunnerDaemon {
                 let trace = format!("Job failed: {}", scrubbed_error);
 
                 // Stream failure trace to GitLab
-                if let Err(err) = self.gitlab.patch_trace(job.id, &job.token, &trace, 0).await {
-                    warn!("Failed to stream failure trace: {}", err);
-                }
+                let _ = self
+                    .gitlab
+                    .patch_trace(job.id, &job.token, &trace, 0)
+                    .await
+                    .map_err(|e| warn!("Failed to stream failure trace: {}", e));
 
                 self.gitlab
                     .update_job(job.id, &job.token, JobState::Failed, Some(&trace))

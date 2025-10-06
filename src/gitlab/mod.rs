@@ -56,8 +56,10 @@ impl GitLabClient {
             .post(&url)
             .json(&JobRequest {
                 token: runner_token.to_string(),
+                last_update: None,
                 info: RunnerInfo::default(),
                 system_id,
+                session: None,
             })
             .send()
             .await
@@ -134,23 +136,24 @@ impl GitLabClient {
     }
 
     /// Stream job trace (real-time logs) - GitLab 17.x
+    /// GitLab expects Content-Range format: "0-{size}" for total trace size
     pub async fn patch_trace(
         &self,
         job_id: u64,
         token: &str,
         trace: &str,
         offset: usize,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let url = format!("{}/api/v4/jobs/{}/trace", self.url, job_id);
+        let trace_bytes = trace.as_bytes();
+        let end_offset = offset + trace_bytes.len();
 
         let response = self
             .client
             .patch(&url)
             .header("JOB-TOKEN", token)
-            .header(
-                "Content-Range",
-                format!("{}-{}", offset, offset + trace.len()),
-            )
+            .header("Content-Range", format!("0-{}", end_offset))
+            .header("Content-Type", "text/plain")
             .body(trace.to_string())
             .send()
             .await
@@ -160,7 +163,7 @@ impl GitLabClient {
             warn!("Trace streaming failed: {}", response.status());
         }
 
-        Ok(())
+        Ok(end_offset)
     }
 
     /// Upload job artifacts (GitLab 17.x)
@@ -291,17 +294,69 @@ impl GitLabClient {
 #[derive(Debug, Serialize)]
 struct JobRequest {
     token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_update: Option<String>,
     info: RunnerInfo,
     system_id: String, // GitLab 17.x requirement
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<SessionInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
+struct SessionInfo {
+    url: Option<String>,
+    certificate: Option<String>,
+    authorization: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct RunnerInfo {
     name: String,
     version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
     platform: String,
     architecture: String,
     executor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    features: Option<RunnerFeatures>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct RunnerFeatures {
+    trace_checksum: bool,
+    trace_size: bool,
+    trace_reset: bool,
+    trace_update_interval: bool,
+    session: bool,
+    terminal: bool,
+    refspecs: bool,
+    multi_build_steps: bool,
+    vault_secrets: bool,
+    return_exit_code: bool,
+    raw_variables: bool,
+    artifacts_exclude: bool,
+    cancelable_stages: bool,
+}
+
+impl Default for RunnerFeatures {
+    fn default() -> Self {
+        Self {
+            trace_checksum: true,
+            trace_size: true,
+            trace_reset: true,
+            trace_update_interval: true,
+            session: false,
+            terminal: false,
+            refspecs: true,
+            multi_build_steps: true,
+            vault_secrets: false,
+            return_exit_code: true,
+            raw_variables: true,
+            artifacts_exclude: true,
+            cancelable_stages: false,
+        }
+    }
 }
 
 impl Default for RunnerInfo {
@@ -309,9 +364,11 @@ impl Default for RunnerInfo {
         Self {
             name: "turboci-runner".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            revision: Some(env!("CARGO_PKG_VERSION").to_string()),
             platform: std::env::consts::OS.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
             executor: "docker".to_string(),
+            features: Some(RunnerFeatures::default()),
         }
     }
 }
@@ -414,9 +471,11 @@ pub struct Variable {
     #[serde(default)]
     pub raw: bool,
     #[serde(default)]
-    pub file: Option<bool>,
+    pub file: bool,
     #[serde(default)]
-    pub internal: Option<bool>,
+    pub internal: bool,
+    #[serde(default, rename = "variable_type")]
+    pub variable_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
