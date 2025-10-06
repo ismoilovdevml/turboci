@@ -89,7 +89,7 @@ jobs:
             ${{ runner.os }}-target-build-
 
       - name: Build
-        run: cargo build --release --verbose
+        run: cargo build --release --all-features --verbose
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -132,7 +132,7 @@ jobs:
             ${{ runner.os }}-target-test-
 
       - name: Run tests
-        run: cargo test --all --verbose
+        run: cargo test --all-features --verbose
 
   all-checks:
     name: All Checks Passed

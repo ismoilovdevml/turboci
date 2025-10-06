@@ -68,7 +68,7 @@ jobs:
 
       - name: Build release
         run: |
-          cargo build --release --features runner --target ${{ matrix.target }}
+          cargo build --release --all-features --target ${{ matrix.target }}
 
       - name: Strip binary (Linux)
         if: contains(matrix.target, 'linux')
