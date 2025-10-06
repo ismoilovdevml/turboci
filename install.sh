@@ -153,9 +153,8 @@ get_latest_version() {
 install_turboci() {
     echo -e "\n${YELLOW}📥 Downloading TurboCI $LATEST_VERSION...${NC}"
 
-    # Use direct binary download (not tar.gz)
-    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_VERSION/turboci-linux-$DISPLAY_ARCH"
-    TEMP_FILE="/tmp/turboci-download"
+    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_VERSION/turboci-$TARGET"
+    TEMP_FILE="/tmp/turboci-download-$$"
 
     if ! curl -fsSL "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
         echo -e "${RED}❌ Download failed${NC}"
@@ -171,7 +170,7 @@ install_turboci() {
     chmod +x "$TEMP_FILE"
     mv "$TEMP_FILE" "$INSTALL_DIR/$BIN_NAME"
 
-    echo -e "${GREEN}✓${NC} TurboCI binary installed"
+    echo -e "${GREEN}✓${NC} TurboCI installed: ${BLUE}$INSTALL_DIR/$BIN_NAME${NC}"
 
     # Verify
     if $INSTALL_DIR/$BIN_NAME --version > /dev/null 2>&1; then

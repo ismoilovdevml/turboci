@@ -80,17 +80,15 @@ jobs:
         run: |
           strip target/${{ matrix.target }}/release/turboci || true
 
-      - name: Create archive
+      - name: Prepare binary for release
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf turboci-${{ matrix.target }}.tar.gz turboci
-          mv turboci-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
+          cp target/${{ matrix.target }}/release/turboci turboci-${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: turboci-${{ matrix.target }}
-          path: turboci-${{ matrix.target }}.tar.gz
+          path: turboci-${{ matrix.target }}
 
   release:
     name: Create Release
