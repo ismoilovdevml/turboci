@@ -195,12 +195,16 @@ impl DockerExecutor {
 
     /// Clone Git repository inside container
     async fn clone_repository(&self, job: &Job, container_id: &str) -> Result<String> {
-        let clone_cmd = format!(
-            "git clone --depth 1 --branch {} {} /builds/project",
-            job.git_info.ref_name, job.git_info.repo_url
-        );
+        if let Some(ref git_info) = job.git_info {
+            let clone_cmd = format!(
+                "git clone --depth 1 --branch {} {} /builds/project",
+                git_info.ref_name, git_info.repo_url
+            );
 
-        self.exec_in_container(container_id, &clone_cmd).await
+            self.exec_in_container(container_id, &clone_cmd).await
+        } else {
+            Ok("No git repository to clone".to_string())
+        }
     }
 
     /// Execute command in container
@@ -331,31 +335,36 @@ impl ShellExecutor {
 
     /// Clone Git repository
     async fn clone_repository(&self, job: &Job, job_dir: &str) -> Result<String> {
-        info!("📥 Cloning repository...");
+        if let Some(ref git_info) = job.git_info {
+            info!("📥 Cloning repository...");
 
-        let clone_output = Command::new("git")
-            .arg("clone")
-            .arg("--depth")
-            .arg("1")
-            .arg("--branch")
-            .arg(&job.git_info.ref_name)
-            .arg(&job.git_info.repo_url)
-            .arg(format!("{}/project", job_dir))
-            .output()
-            .await
-            .context("Failed to clone repository")?;
+            let clone_output = Command::new("git")
+                .arg("clone")
+                .arg("--depth")
+                .arg("1")
+                .arg("--branch")
+                .arg(&git_info.ref_name)
+                .arg(&git_info.repo_url)
+                .arg(format!("{}/project", job_dir))
+                .output()
+                .await
+                .context("Failed to clone repository")?;
 
-        let output = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&clone_output.stdout),
-            String::from_utf8_lossy(&clone_output.stderr)
-        );
+            let output = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&clone_output.stdout),
+                String::from_utf8_lossy(&clone_output.stderr)
+            );
 
-        if !clone_output.status.success() {
-            return Err(anyhow::anyhow!("Git clone failed: {}", output));
+            if !clone_output.status.success() {
+                return Err(anyhow::anyhow!("Git clone failed: {}", output));
+            }
+
+            Ok(output)
+        } else {
+            info!("No git repository configured, skipping clone");
+            Ok("No git repository to clone".to_string())
         }
-
-        Ok(output)
     }
 
     /// Execute command via shell
