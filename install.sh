@@ -173,9 +173,8 @@ install_turboci() {
     echo -e "${GREEN}✓${NC} TurboCI installed: ${BLUE}$INSTALL_DIR/$BIN_NAME${NC}"
 
     # Verify
-    if $INSTALL_DIR/$BIN_NAME --version > /dev/null 2>&1; then
-        VERSION=$($INSTALL_DIR/$BIN_NAME --version 2>/dev/null || echo "unknown")
-        echo -e "${GREEN}✓${NC} Version: ${BLUE}$VERSION${NC}"
+    if $INSTALL_DIR/$BIN_NAME --help > /dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Binary verified successfully"
     else
         echo -e "${RED}❌ Binary verification failed${NC}"
         exit 1
