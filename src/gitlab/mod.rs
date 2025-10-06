@@ -394,7 +394,7 @@ pub struct Job {
     #[serde(default)]
     pub services: Vec<Service>,
     #[serde(default)]
-    pub artifacts: Vec<Artifact>,
+    pub artifacts: Option<Vec<Artifact>>,
     #[serde(default)]
     pub cache: Vec<Cache>,
     #[serde(default)]

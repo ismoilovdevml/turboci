@@ -220,22 +220,24 @@ impl RunnerDaemon {
                 self.save_to_cache(&cache_key, &scrubbed_trace).await?;
 
                 // Upload artifacts if available (GitLab 17.x)
-                for artifact in &job.artifacts {
-                    // TODO: Collect artifacts from job workspace
-                    // For now, create empty zip as placeholder
-                    let artifact_data = Vec::new();
-                    if let Err(e) = self
-                        .gitlab
-                        .upload_artifacts(
-                            job.id,
-                            &job.token,
-                            artifact_data,
-                            &artifact.name,
-                            artifact.expire_in.as_deref(),
-                        )
-                        .await
-                    {
-                        warn!("Failed to upload artifact {}: {}", artifact.name, e);
+                if let Some(ref artifacts) = job.artifacts {
+                    for artifact in artifacts {
+                        // TODO: Collect artifacts from job workspace
+                        // For now, create empty zip as placeholder
+                        let artifact_data = Vec::new();
+                        if let Err(e) = self
+                            .gitlab
+                            .upload_artifacts(
+                                job.id,
+                                &job.token,
+                                artifact_data,
+                                &artifact.name,
+                                artifact.expire_in.as_deref(),
+                            )
+                            .await
+                        {
+                            warn!("Failed to upload artifact {}: {}", artifact.name, e);
+                        }
                     }
                 }
 
