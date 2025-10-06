@@ -33,6 +33,14 @@ pub struct DockerExecutor {
     default_image: String,
 }
 
+impl std::fmt::Debug for DockerExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DockerExecutor")
+            .field("default_image", &self.default_image)
+            .finish()
+    }
+}
+
 impl DockerExecutor {
     pub fn new(default_image: String) -> Result<Self> {
         let docker =

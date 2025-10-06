@@ -34,8 +34,11 @@ pub struct RunnerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorConfig {
-    pub executor_type: String, // "docker", "shell", "kubernetes"
+    pub executor_type: String, // "docker", "shell"
+    #[serde(default)]
     pub docker: DockerConfig,
+    #[serde(default)]
+    pub shell: ShellConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +47,19 @@ pub struct DockerConfig {
     pub privileged: bool,
     pub volumes: Vec<String>,
     pub network_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellConfig {
+    pub work_dir: String,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            work_dir: "/tmp/turboci-builds".to_string(),
+        }
+    }
 }
 
 impl Default for RunnerConfig {
@@ -67,8 +83,9 @@ impl Default for RunnerConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
-            executor_type: "docker".to_string(),
+            executor_type: "shell".to_string(), // Default to shell for speed!
             docker: DockerConfig::default(),
+            shell: ShellConfig::default(),
         }
     }
 }

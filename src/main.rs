@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "runner")]
         Commands::RunnerStart { config } => {
             use gitlab::GitLabClient;
-            use runner_daemon::executor::DockerExecutor;
+            use runner_daemon::executor::{DockerExecutor, ExecutorType, ShellExecutor};
             use runner_daemon::RunnerDaemon;
             use storage::{redis_storage::RedisStorage, s3_storage::S3Storage, HybridStorage};
 
@@ -132,6 +132,7 @@ async fn main() -> Result<()> {
 
             let storage = if let Some(bucket) = &runner_config.s3_bucket {
                 // S3 is configured - use hybrid storage
+                info!("💾 Using Hybrid storage (Redis + S3)");
                 let s3 = if let Some(endpoint) = &runner_config.s3_endpoint {
                     S3Storage::new_with_endpoint(
                         bucket.clone(),
@@ -145,13 +146,31 @@ async fn main() -> Result<()> {
                 HybridStorage::new(redis, s3, runner_config.storage_threshold)
             } else {
                 // S3 not configured - use Redis-only storage (faster!)
-                info!("⚡ Using Redis-only storage (no S3) for maximum speed!");
+                info!("⚡ Using Redis-only storage for maximum speed!");
                 HybridStorage::redis_only(redis)
             };
 
-            // Initialize executor
-            let executor =
-                DockerExecutor::new(runner_config.executor.docker.default_image.clone())?;
+            // Initialize executor based on config
+            let executor = match runner_config.executor.executor_type.as_str() {
+                "shell" => {
+                    info!("⚡ Using Shell executor (direct execution, super fast!)");
+                    ExecutorType::Shell(ShellExecutor::new(Some(
+                        runner_config.executor.shell.work_dir.clone(),
+                    )))
+                }
+                "docker" => {
+                    info!("🐳 Using Docker executor (isolated containers)");
+                    ExecutorType::Docker(DockerExecutor::new(
+                        runner_config.executor.docker.default_image.clone(),
+                    )?)
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unknown executor type: {}. Use 'shell' or 'docker'",
+                        runner_config.executor.executor_type
+                    ));
+                }
+            };
 
             // Start daemon
             let daemon = RunnerDaemon::new(runner_config, gitlab, storage, executor);
@@ -205,7 +224,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "runner")]
         Commands::RunnerStats { config } => {
             use gitlab::GitLabClient;
-            use runner_daemon::executor::DockerExecutor;
+            use runner_daemon::executor::{DockerExecutor, ExecutorType, ShellExecutor};
             use runner_daemon::RunnerDaemon;
             use storage::{redis_storage::RedisStorage, s3_storage::S3Storage, HybridStorage};
 
@@ -219,7 +238,6 @@ async fn main() -> Result<()> {
             let redis = RedisStorage::new(&runner_config.redis_url, 3600).await?;
 
             let storage = if let Some(bucket) = &runner_config.s3_bucket {
-                // S3 is configured - use hybrid storage
                 let s3 = if let Some(endpoint) = &runner_config.s3_endpoint {
                     S3Storage::new_with_endpoint(
                         bucket.clone(),
@@ -232,12 +250,18 @@ async fn main() -> Result<()> {
                 };
                 HybridStorage::new(redis, s3, runner_config.storage_threshold)
             } else {
-                // S3 not configured - use Redis-only storage
                 HybridStorage::redis_only(redis)
             };
 
-            let executor =
-                DockerExecutor::new(runner_config.executor.docker.default_image.clone())?;
+            let executor = match runner_config.executor.executor_type.as_str() {
+                "shell" => ExecutorType::Shell(ShellExecutor::new(Some(
+                    runner_config.executor.shell.work_dir.clone(),
+                ))),
+                "docker" => ExecutorType::Docker(DockerExecutor::new(
+                    runner_config.executor.docker.default_image.clone(),
+                )?),
+                _ => ExecutorType::Shell(ShellExecutor::new(None)),
+            };
 
             let daemon = RunnerDaemon::new(runner_config, gitlab, storage, executor);
             let stats = daemon.stats().await?;

@@ -13,23 +13,33 @@ runner_token = "glrt-YOUR_RUNNER_TOKEN_HERE"
 # GitLab instance URL
 gitlab_url = "https://gitlab.com"
 
-# Cache configuration
+# ===== CACHE CONFIGURATION =====
 cache_enabled = true
 redis_url = "redis://127.0.0.1:6379"
 
-# S3/MinIO configuration (optional, for large artifacts)
-s3_bucket = "turboci-cache"
-s3_endpoint = "http://localhost:9000"  # MinIO endpoint
+# S3/MinIO configuration (OPTIONAL - comment out to use Redis-only mode)
+# Redis-only mode is FASTER (no network overhead) but limited by RAM
+# s3_bucket = "turboci-cache"
+# s3_endpoint = "http://localhost:9000"  # MinIO endpoint
 s3_prefix = "turboci"
 
 # Storage threshold in bytes (10MB)
-# Files larger than this will be stored in S3
-# Files smaller will be stored in Redis
+# Files larger than this will be stored in S3 (if S3 is configured)
+# Files smaller will be stored in Redis (super fast!)
 storage_threshold = 10485760
 
+# ===== EXECUTOR CONFIGURATION =====
 [executor]
-executor_type = "docker"
+# Executor type: "shell" (FAST!) or "docker" (isolated)
+# shell = Direct execution on host (10x faster, less isolation)
+# docker = Container execution (slower, better isolation)
+executor_type = "shell"
 
+# Shell executor configuration (used when executor_type = "shell")
+[executor.shell]
+work_dir = "/tmp/turboci-builds"
+
+# Docker executor configuration (used when executor_type = "docker")
 [executor.docker]
 # Default Docker image if job doesn't specify one
 default_image = "alpine:latest"
@@ -38,10 +48,7 @@ default_image = "alpine:latest"
 privileged = false
 
 # Mount volumes
-volumes = [
-    "/cache:/cache:rw",
-    "/var/run/docker.sock:/var/run/docker.sock:ro"
-]
+volumes = []
 
 # Docker network mode
 network_mode = "bridge"

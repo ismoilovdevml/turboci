@@ -16,7 +16,7 @@ pub struct RunnerDaemon {
     config: Arc<config::RunnerConfig>,
     gitlab: Arc<GitLabClient>,
     storage: Arc<HybridStorage>,
-    executor: Arc<executor::DockerExecutor>,
+    executor: Arc<executor::ExecutorType>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -25,7 +25,7 @@ impl RunnerDaemon {
         config: config::RunnerConfig,
         gitlab: GitLabClient,
         storage: HybridStorage,
-        executor: executor::DockerExecutor,
+        executor: executor::ExecutorType,
     ) -> Self {
         let concurrent = config.concurrent as usize;
 
