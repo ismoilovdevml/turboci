@@ -1,7 +1,21 @@
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{debug, info, warn};
+
+/// Deserialize null JSON values as None for Option<String>
+fn deserialize_null_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(other) => Ok(Some(other.to_string())),
+        None => Ok(None),
+    }
+}
 
 #[cfg(feature = "runner")]
 use uuid::Uuid;
@@ -391,7 +405,7 @@ pub struct RunnerVariables {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Variable {
     pub key: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_string")]
     pub value: Option<String>,
     #[serde(default)]
     pub public: bool,
