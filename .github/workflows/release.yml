@@ -15,15 +15,12 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux musl builds (static binaries)
+          # Linux musl build (static binary for x86_64)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: false
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            cross: true
 
-          # macOS builds
+          # macOS builds (covers both Intel and Apple Silicon)
           - os: macos-latest
             target: x86_64-apple-darwin
             cross: false
@@ -68,29 +65,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - name: Cache cross binary
-        if: matrix.cross
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cross
-          key: ${{ runner.os }}-cross-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cross-
-
-      - name: Install cross (for ARM Linux)
-        if: matrix.cross
-        run: |
-          if ! command -v cross &> /dev/null; then
-            cargo install cross --git https://github.com/cross-rs/cross
-          fi
-
-      - name: Build with cross
-        if: matrix.cross
-        run: |
-          cross build --release --features runner --target ${{ matrix.target }}
-
-      - name: Build native
-        if: ${{ !matrix.cross }}
+      - name: Build release
         run: |
           cargo build --release --features runner --target ${{ matrix.target }}
 
@@ -163,10 +138,9 @@ jobs:
             ### 📦 Pre-built Binaries
 
             Download the appropriate binary for your platform:
-            - `turboci-x86_64-unknown-linux-musl.tar.gz` - Linux x86_64 (static binary)
-            - `turboci-aarch64-unknown-linux-musl.tar.gz` - Linux ARM64 (static binary)
+            - `turboci-x86_64-unknown-linux-musl.tar.gz` - Linux x86_64 (static binary, works on all distros)
             - `turboci-x86_64-apple-darwin.tar.gz` - macOS Intel
-            - `turboci-aarch64-apple-darwin.tar.gz` - macOS Apple Silicon (M1/M2/M3)
+            - `turboci-aarch64-apple-darwin.tar.gz` - macOS Apple Silicon (M1/M2/M3/M4)
 
             ### ✨ Features
 

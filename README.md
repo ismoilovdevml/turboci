@@ -39,9 +39,9 @@ curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.s
 
 **Supported Platforms:**
 - ✅ Linux x86_64 (static musl binary)
-- ✅ Linux ARM64 (static musl binary)
+- ✅ 
 - ✅ macOS Intel (x86_64)
-- ✅ macOS Apple Silicon (M1/M2/M3)
+- ✅ macOS Apple Silicon (M1/M2/M3/M4)
 
 ### Manual Installation
 
