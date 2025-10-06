@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct GitLabClient {
     client: Client,
     url: String,
+    #[allow(dead_code)]
     token: String,
 }
 
@@ -75,6 +76,7 @@ impl GitLabClient {
     }
 
     /// Upload job artifacts
+    #[allow(dead_code)]
     pub async fn upload_artifacts(
         &self,
         job_id: u64,
@@ -96,6 +98,7 @@ impl GitLabClient {
     }
 
     /// Download job artifacts
+    #[allow(dead_code)]
     pub async fn download_artifacts(&self, job_id: u64, token: &str) -> Result<Vec<u8>> {
         let url = format!("{}/api/v4/jobs/{}/artifacts", self.url, job_id);
 

@@ -14,9 +14,11 @@ pub trait StorageBackend: Send + Sync {
     async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
     /// Check if key exists
+    #[allow(dead_code)]
     async fn exists(&self, key: &str) -> Result<bool>;
 
     /// Delete data by key
+    #[allow(dead_code)]
     async fn delete(&self, key: &str) -> Result<()>;
 
     /// Get storage statistics
