@@ -326,12 +326,7 @@ async fn main() -> Result<()> {
             );
 
             // Download new binary
-            let binary_data = client
-                .get(&download_url)
-                .send()
-                .await?
-                .bytes()
-                .await?;
+            let binary_data = client.get(&download_url).send().await?.bytes().await?;
 
             // Get current executable path
             let current_exe = std::env::current_exe()?;
