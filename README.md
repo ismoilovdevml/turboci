@@ -30,21 +30,41 @@ A modern CI/CD runner that accelerates your build pipeline by 5-10x with distrib
 
 ## 📦 Installation
 
-### Binary (Fast)
+### Quick Install (Recommended)
+
+**Linux & macOS:**
 ```bash
-curl -sSL https://turboci.dev/install.sh | sh
+curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh | bash
 ```
 
-### Via Cargo
+**Supported Platforms:**
+- ✅ Linux x86_64 (static musl binary)
+- ✅ Linux ARM64 (static musl binary)
+- ✅ macOS Intel (x86_64)
+- ✅ macOS Apple Silicon (M1/M2/M3)
+
+### Manual Installation
+
+Download pre-built binaries from [Releases](https://github.com/ismoilovdevml/turboci/releases):
+
 ```bash
-cargo install turboci
+# Example: Linux x86_64
+wget https://github.com/ismoilovdevml/turboci/releases/latest/download/turboci-x86_64-unknown-linux-musl.tar.gz
+tar xzf turboci-x86_64-unknown-linux-musl.tar.gz
+sudo mv turboci /usr/local/bin/
 ```
 
 ### Build from Source
 ```bash
-git clone https://github.com/turboci/turboci.git
+git clone https://github.com/ismoilovdevml/turboci.git
 cd turboci
-cargo build --release
+cargo build --release --features runner
+sudo cp target/release/turboci /usr/local/bin/
+```
+
+### Uninstall
+```bash
+curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/uninstall.sh | bash
 ```
 
 ## 🎯 Usage
