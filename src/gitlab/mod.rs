@@ -404,7 +404,7 @@ pub struct Job {
     #[serde(default)]
     pub timeout: u32, // Job timeout in seconds (0 = use default)
     #[serde(default)]
-    pub inputs: Option<serde_json::Value>,
+    pub inputs: Vec<serde_json::Value>,
     #[serde(default)]
     pub hooks: Vec<serde_json::Value>,
     #[serde(default)]
