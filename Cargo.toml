@@ -1,6 +1,6 @@
 [package]
 name = "turboci"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["TurboCI Team"]
 description = "Super fast CI/CD runner with distributed caching and parallel execution"
