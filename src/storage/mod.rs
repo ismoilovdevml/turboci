@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub mod compression;
 pub mod redis_storage;
 pub mod s3_storage;
 

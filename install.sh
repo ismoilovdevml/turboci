@@ -1,19 +1,28 @@
 #!/bin/bash
 set -e
 
-# TurboCI Installer
-# Supports macOS (Intel/Apple Silicon) and Linux (x86_64/ARM64)
+# TurboCI Automated Installer
+# Installs: Redis + TurboCI + Systemd Service
+# Supports: Ubuntu, Debian, RHEL, Rocky, AlmaLinux, Fedora
 
 REPO="ismoilovdevml/turboci"
-INSTALL_DIR="${TURBOCI_INSTALL_DIR:-$HOME/.local/bin}"
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc"
 BIN_NAME="turboci"
+SERVICE_NAME="turboci"
 
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}❌ Please run as root: sudo $0${NC}"
+    exit 1
+fi
 
 echo -e "${BLUE}"
 cat << "EOF"
@@ -23,184 +32,303 @@ cat << "EOF"
    | || |_| | |  | |_) | (_) |__) | |
    |_| \__,_|_|  |_.__/ \___/____/___|
 
-  ⚡ Super Fast CI/CD Runner
+  ⚡ TurboCI Installer
 EOF
 echo -e "${NC}"
 
-# Detect OS and architecture
-detect_platform() {
-    local OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-    local ARCH=$(uname -m)
+# Detect OS
+detect_os() {
+    echo -e "${YELLOW}🔍 Detecting OS...${NC}"
 
-    case "$OS" in
-        linux*)
-            OS="linux"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID=$ID
+        OS_VERSION=$VERSION_ID
+    else
+        echo -e "${RED}❌ Cannot detect OS${NC}"
+        exit 1
+    fi
+
+    case "$OS_ID" in
+        ubuntu|debian)
+            PKG_MANAGER="apt-get"
+            REDIS_PKG="redis-server"
+            REDIS_SERVICE="redis-server"
             ;;
-        darwin*)
-            OS="darwin"
+        rhel|rocky|almalinux|fedora|centos)
+            PKG_MANAGER="dnf"
+            REDIS_PKG="redis"
+            REDIS_SERVICE="redis"
+            # Fallback to yum if dnf not available
+            if ! command -v dnf &> /dev/null; then
+                PKG_MANAGER="yum"
+            fi
             ;;
         *)
-            echo -e "${RED}❌ Unsupported OS: $OS${NC}"
+            echo -e "${RED}❌ Unsupported OS: $OS_ID${NC}"
+            echo -e "${YELLOW}Supported: Ubuntu, Debian, RHEL, Rocky, AlmaLinux, Fedora${NC}"
             exit 1
             ;;
     esac
+
+    echo -e "${GREEN}✓${NC} OS: ${BLUE}$NAME $VERSION_ID${NC}"
+    echo -e "${GREEN}✓${NC} Package manager: ${BLUE}$PKG_MANAGER${NC}"
+}
+
+# Detect architecture
+detect_arch() {
+    ARCH=$(uname -m)
 
     case "$ARCH" in
         x86_64|amd64)
-            ARCH="x86_64"
-            ;;
-        aarch64|arm64)
-            ARCH="aarch64"
+            TARGET="x86_64-unknown-linux-musl"
+            DISPLAY_ARCH="x86_64"
             ;;
         *)
             echo -e "${RED}❌ Unsupported architecture: $ARCH${NC}"
+            echo -e "${YELLOW}Supported: x86_64${NC}"
             exit 1
             ;;
     esac
 
-    # Determine target triple
-    if [ "$OS" = "linux" ]; then
-        TARGET="${ARCH}-unknown-linux-musl"
-    elif [ "$OS" = "darwin" ]; then
-        if [ "$ARCH" = "aarch64" ]; then
-            TARGET="aarch64-apple-darwin"
-        else
-            TARGET="x86_64-apple-darwin"
-        fi
-    fi
-
-    echo -e "${GREEN}✓${NC} Detected platform: ${BLUE}$TARGET${NC}"
+    echo -e "${GREEN}✓${NC} Architecture: ${BLUE}$DISPLAY_ARCH${NC}"
 }
 
-# Get latest release version
+# Install Redis
+install_redis() {
+    echo -e "\n${YELLOW}📦 Installing Redis...${NC}"
+
+    # Check if already installed
+    if systemctl is-active --quiet $REDIS_SERVICE 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} Redis already running"
+        return
+    fi
+
+    if command -v redis-server &> /dev/null; then
+        echo -e "${GREEN}✓${NC} Redis already installed"
+    else
+        echo -e "${YELLOW}⏳ Installing $REDIS_PKG...${NC}"
+        $PKG_MANAGER update -y > /dev/null 2>&1 || true
+        $PKG_MANAGER install -y $REDIS_PKG
+        echo -e "${GREEN}✓${NC} Redis installed"
+    fi
+
+    # Enable and start Redis
+    systemctl enable $REDIS_SERVICE
+    systemctl start $REDIS_SERVICE
+
+    # Verify
+    if systemctl is-active --quiet $REDIS_SERVICE; then
+        echo -e "${GREEN}✓${NC} Redis service running"
+
+        # Test connection
+        if redis-cli ping > /dev/null 2>&1; then
+            echo -e "${GREEN}✓${NC} Redis connection test: OK"
+        else
+            echo -e "${YELLOW}⚠️  Redis installed but not responding${NC}"
+        fi
+    else
+        echo -e "${RED}❌ Failed to start Redis${NC}"
+        exit 1
+    fi
+}
+
+# Get latest TurboCI release
 get_latest_version() {
-    echo -e "${YELLOW}📡 Fetching latest release...${NC}"
+    echo -e "\n${YELLOW}📡 Fetching latest TurboCI release...${NC}"
 
-    LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    LATEST_VERSION=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | \
+                     grep '"tag_name":' | \
+                     sed -E 's/.*"([^"]+)".*/\1/')
 
-    if [ -z "$LATEST_RELEASE" ]; then
+    if [ -z "$LATEST_VERSION" ]; then
         echo -e "${RED}❌ Failed to fetch latest release${NC}"
         exit 1
     fi
 
-    echo -e "${GREEN}✓${NC} Latest version: ${BLUE}$LATEST_RELEASE${NC}"
+    echo -e "${GREEN}✓${NC} Latest version: ${BLUE}$LATEST_VERSION${NC}"
 }
 
-# Download and install
+# Download and install TurboCI
 install_turboci() {
-    local DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/turboci-$TARGET.tar.gz"
-    local TEMP_DIR=$(mktemp -d)
-    local ARCHIVE="$TEMP_DIR/turboci.tar.gz"
+    echo -e "\n${YELLOW}📥 Downloading TurboCI $LATEST_VERSION...${NC}"
 
-    echo -e "${YELLOW}📥 Downloading TurboCI...${NC}"
-    echo -e "   URL: $DOWNLOAD_URL"
+    # Use direct binary download (not tar.gz)
+    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_VERSION/turboci-linux-$DISPLAY_ARCH"
+    TEMP_FILE="/tmp/turboci-download"
 
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE"; then
+    if ! curl -fsSL "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
         echo -e "${RED}❌ Download failed${NC}"
-        rm -rf "$TEMP_DIR"
+        echo -e "${YELLOW}URL: $DOWNLOAD_URL${NC}"
+        rm -f "$TEMP_FILE"
         exit 1
     fi
 
     echo -e "${GREEN}✓${NC} Downloaded successfully"
 
-    # Create install directory
-    mkdir -p "$INSTALL_DIR"
-
-    # Extract and install
+    # Install binary
     echo -e "${YELLOW}📦 Installing to $INSTALL_DIR...${NC}"
-    tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
+    chmod +x "$TEMP_FILE"
+    mv "$TEMP_FILE" "$INSTALL_DIR/$BIN_NAME"
 
-    # Make executable and move
-    chmod +x "$TEMP_DIR/$BIN_NAME"
-    mv "$TEMP_DIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+    echo -e "${GREEN}✓${NC} TurboCI binary installed"
 
-    # Cleanup
-    rm -rf "$TEMP_DIR"
-
-    echo -e "${GREEN}✓${NC} Installed to: ${BLUE}$INSTALL_DIR/$BIN_NAME${NC}"
-}
-
-# Update PATH
-update_path() {
-    local SHELL_CONFIG=""
-
-    # Detect shell
-    case "$SHELL" in
-        */bash)
-            SHELL_CONFIG="$HOME/.bashrc"
-            ;;
-        */zsh)
-            SHELL_CONFIG="$HOME/.zshrc"
-            ;;
-        */fish)
-            SHELL_CONFIG="$HOME/.config/fish/config.fish"
-            ;;
-    esac
-
-    # Check if already in PATH
-    if echo "$PATH" | grep -q "$INSTALL_DIR"; then
-        echo -e "${GREEN}✓${NC} $INSTALL_DIR is already in PATH"
-        return
-    fi
-
-    if [ -n "$SHELL_CONFIG" ] && [ -f "$SHELL_CONFIG" ]; then
-        if ! grep -q "export PATH=\"\$INSTALL_DIR:\$PATH\"" "$SHELL_CONFIG" 2>/dev/null; then
-            echo -e "${YELLOW}📝 Adding $INSTALL_DIR to PATH in $SHELL_CONFIG${NC}"
-            echo "" >> "$SHELL_CONFIG"
-            echo "# TurboCI" >> "$SHELL_CONFIG"
-            echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$SHELL_CONFIG"
-            echo -e "${GREEN}✓${NC} Added to PATH. Run: ${BLUE}source $SHELL_CONFIG${NC}"
-        fi
+    # Verify
+    if $INSTALL_DIR/$BIN_NAME --version > /dev/null 2>&1; then
+        VERSION=$($INSTALL_DIR/$BIN_NAME --version 2>/dev/null || echo "unknown")
+        echo -e "${GREEN}✓${NC} Version: ${BLUE}$VERSION${NC}"
     else
-        echo -e "${YELLOW}⚠️  Please manually add $INSTALL_DIR to your PATH${NC}"
-        echo -e "   Add this to your shell config:"
-        echo -e "   ${BLUE}export PATH=\"$INSTALL_DIR:\$PATH\"${NC}"
-    fi
-}
-
-# Verify installation
-verify_installation() {
-    echo -e "\n${YELLOW}🔍 Verifying installation...${NC}"
-
-    if [ -x "$INSTALL_DIR/$BIN_NAME" ]; then
-        echo -e "${GREEN}✓${NC} TurboCI installed successfully!"
-
-        # Try to run version check (if already in PATH)
-        if command -v turboci &> /dev/null; then
-            VERSION=$(turboci --version 2>/dev/null || echo "unknown")
-            echo -e "${GREEN}✓${NC} Version: ${BLUE}$VERSION${NC}"
-        else
-            echo -e "${YELLOW}⚠️  Restart your terminal or run: ${BLUE}source ~/.bashrc${NC} (or ~/.zshrc)"
-        fi
-    else
-        echo -e "${RED}❌ Installation verification failed${NC}"
+        echo -e "${RED}❌ Binary verification failed${NC}"
         exit 1
     fi
 }
 
-# Main installation
-main() {
-    echo -e "${BLUE}Starting TurboCI installation...${NC}\n"
+# Create TurboCI config
+create_config() {
+    echo -e "\n${YELLOW}📝 Creating configuration...${NC}"
 
-    detect_platform
-    get_latest_version
-    install_turboci
-    update_path
-    verify_installation
+    CONFIG_FILE="$CONFIG_DIR/turboci-runner.toml"
 
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}⚠️  Config already exists: $CONFIG_FILE${NC}"
+        read -p "Overwrite? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}ℹ️  Keeping existing config${NC}"
+            return
+        fi
+    fi
+
+    # Create config
+    cat > "$CONFIG_FILE" << 'EOF'
+# TurboCI Runner Configuration
+concurrent = 4
+runner_token = ""
+gitlab_url = "https://gitlab.com"
+redis_url = "redis://127.0.0.1:6379"
+cache_enabled = true
+cache_ttl_seconds = 604800
+
+[executor]
+executor_type = "shell"
+
+[executor.shell]
+work_dir = "/tmp/turboci-builds"
+
+[executor.docker]
+default_image = "alpine:latest"
+EOF
+
+    echo -e "${GREEN}✓${NC} Config created: ${BLUE}$CONFIG_FILE${NC}"
+    echo -e "${YELLOW}⚠️  You must edit this file and set your runner_token${NC}"
+}
+
+# Create systemd service
+create_service() {
+    echo -e "\n${YELLOW}🔧 Creating systemd service...${NC}"
+
+    SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=TurboCI Runner
+Documentation=https://github.com/$REPO
+After=network.target $REDIS_SERVICE.service
+Requires=$REDIS_SERVICE.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/tmp
+ExecStart=$INSTALL_DIR/$BIN_NAME runner-start -c $CONFIG_DIR/turboci-runner.toml
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=false
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    echo -e "${GREEN}✓${NC} Service created: ${BLUE}$SERVICE_FILE${NC}"
+
+    # Reload systemd
+    systemctl daemon-reload
+    echo -e "${GREEN}✓${NC} Systemd reloaded"
+}
+
+# Enable service (but don't start yet - needs config)
+enable_service() {
+    echo -e "\n${YELLOW}🎬 Enabling service...${NC}"
+
+    systemctl enable $SERVICE_NAME
+    echo -e "${GREEN}✓${NC} Service enabled (auto-start on boot)"
+    echo -e "${YELLOW}ℹ️  Service NOT started yet - configure token first${NC}"
+}
+
+# Print next steps
+print_next_steps() {
     echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}✨ TurboCI $LATEST_RELEASE installed successfully!${NC}"
+    echo -e "${GREEN}✨ Installation Complete!${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "\n${BLUE}🚀 Quick Start:${NC}"
-    echo -e "   ${YELLOW}turboci --help${NC}              # Show help"
-    echo -e "   ${YELLOW}turboci hash${NC}                # Compute content hash"
-    echo -e "   ${YELLOW}turboci init-cache${NC}          # Initialize cache"
-    echo -e "   ${YELLOW}turboci init-runner${NC}         # Create runner config"
+
+    echo -e "\n${BLUE}📋 Next Steps:${NC}"
+    echo -e "\n${YELLOW}1. Get GitLab Runner Token:${NC}"
+    echo -e "   • Open your GitLab project"
+    echo -e "   • Go to Settings → CI/CD → Runners"
+    echo -e "   • Click 'New project runner'"
+    echo -e "   • Add tag: ${BLUE}turboci${NC}"
+    echo -e "   • Copy the token (starts with glrt-)"
+
+    echo -e "\n${YELLOW}2. Configure TurboCI:${NC}"
+    echo -e "   ${BLUE}nano $CONFIG_DIR/turboci-runner.toml${NC}"
+    echo -e "   Set: ${BLUE}runner_token = \"glrt-YOUR-TOKEN-HERE\"${NC}"
+
+    echo -e "\n${YELLOW}3. Start TurboCI:${NC}"
+    echo -e "   ${BLUE}systemctl start turboci${NC}"
+    echo -e "   ${BLUE}systemctl status turboci${NC}"
+
+    echo -e "\n${YELLOW}4. Check Logs:${NC}"
+    echo -e "   ${BLUE}journalctl -u turboci -f${NC}"
+
+    echo -e "\n${BLUE}📊 Installed Components:${NC}"
+    echo -e "   ✓ Redis Server:  ${GREEN}Running${NC}"
+    echo -e "   ✓ TurboCI:       ${GREEN}$LATEST_VERSION${NC}"
+    echo -e "   ✓ Config:        ${BLUE}$CONFIG_DIR/turboci-runner.toml${NC}"
+    echo -e "   ✓ Service:       ${GREEN}Enabled${NC} (not started)"
+
+    echo -e "\n${BLUE}🔧 Management Commands:${NC}"
+    echo -e "   ${BLUE}systemctl status turboci${NC}   # Check status"
+    echo -e "   ${BLUE}systemctl restart turboci${NC}  # Restart"
+    echo -e "   ${BLUE}systemctl stop turboci${NC}     # Stop"
+    echo -e "   ${BLUE}journalctl -u turboci -f${NC}   # View logs"
+
     echo -e "\n${BLUE}📚 Documentation:${NC}"
     echo -e "   https://github.com/$REPO"
+
     echo -e "\n${BLUE}🗑️  Uninstall:${NC}"
-    echo -e "   ${YELLOW}curl -sSL https://raw.githubusercontent.com/$REPO/main/uninstall.sh | bash${NC}"
+    echo -e "   ${BLUE}curl -sSL https://raw.githubusercontent.com/$REPO/main/uninstall.sh | sudo bash${NC}"
+
     echo ""
+}
+
+# Main installation
+main() {
+    echo -e "${BLUE}Starting automated installation...${NC}\n"
+
+    detect_os
+    detect_arch
+    install_redis
+    get_latest_version
+    install_turboci
+    create_config
+    create_service
+    enable_service
+    print_next_steps
 }
 
 main "$@"

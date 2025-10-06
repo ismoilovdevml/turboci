@@ -6,6 +6,11 @@ mod cache;
 mod config;
 mod optimizer;
 mod runner;
+mod security;
+
+// API module (optional)
+#[cfg(feature = "api")]
+mod api;
 
 // Runner modules (optional, for future)
 #[cfg(feature = "runner")]

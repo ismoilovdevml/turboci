@@ -6,6 +6,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::gitlab::{GitLabClient, Job, JobState};
+use crate::security::SecretScrubber;
 use crate::storage::{HybridStorage, StorageBackend};
 
 pub mod config;
@@ -18,6 +19,7 @@ pub struct RunnerDaemon {
     storage: Arc<HybridStorage>,
     executor: Arc<executor::ExecutorType>,
     semaphore: Arc<Semaphore>,
+    scrubber: Arc<SecretScrubber>,
 }
 
 impl RunnerDaemon {
@@ -29,12 +31,21 @@ impl RunnerDaemon {
     ) -> Self {
         let concurrent = config.concurrent as usize;
 
+        // Create secret scrubber with runner token
+        let mut scrubber = SecretScrubber::new(vec![config.runner_token.clone()]);
+
+        // Add GitLab URL as potential secret location
+        if config.gitlab_url.contains('@') {
+            scrubber.add_secret(config.gitlab_url.clone());
+        }
+
         Self {
             config: Arc::new(config),
             gitlab: Arc::new(gitlab),
             storage: Arc::new(storage),
             executor: Arc::new(executor),
             semaphore: Arc::new(Semaphore::new(concurrent)),
+            scrubber: Arc::new(scrubber),
         }
     }
 
@@ -82,7 +93,23 @@ impl RunnerDaemon {
             .update_job(job.id, &job.token, JobState::Running, None)
             .await?;
 
-        // Check cache before execution
+        // Download cache before execution (GitLab 17.x)
+        for cache_entry in &job.cache {
+            if cache_entry.policy == "pull" || cache_entry.policy == "pull-push" {
+                if let Ok(Some(cache_data)) = self
+                    .gitlab
+                    .download_cache(job.id, &job.token, &cache_entry.key)
+                    .await
+                {
+                    // Extract cache to job workspace
+                    info!("📥 Downloaded cache: {}", cache_entry.key);
+                    // TODO: Extract zip to workspace
+                    let _ = cache_data; // Suppress unused warning
+                }
+            }
+        }
+
+        // Check internal cache before execution
         let cache_key = self.compute_cache_key(&job).await?;
         if let Some(_cached_result) = self.load_from_cache(&cache_key).await? {
             info!("✅ Job #{} completed from cache!", job.id);
@@ -99,27 +126,87 @@ impl RunnerDaemon {
             return Ok(());
         }
 
-        // Execute job
+        // Add job secrets to scrubber
+        let mut scrubber = (*self.scrubber).clone();
+        for var in &job.variables {
+            if var.masked {
+                scrubber.add_secret(var.value.clone());
+            }
+        }
+
+        // Execute job with trace streaming
         let result = self.executor.execute(&job).await;
 
         match result {
             Ok(trace) => {
                 info!("✅ Job #{} completed successfully", job.id);
 
-                // Save to cache for future use
-                self.save_to_cache(&cache_key, &trace).await?;
+                // Scrub secrets from trace
+                let scrubbed_trace = scrubber.scrub(&trace);
 
-                // Upload artifacts if available (placeholder - artifacts path from job output)
-                // In real implementation, parse artifacts from job execution result
+                // Stream trace to GitLab (GitLab 17.x)
+                if let Err(e) = self
+                    .gitlab
+                    .patch_trace(job.id, &job.token, &scrubbed_trace, 0)
+                    .await
+                {
+                    warn!("Failed to stream trace: {}", e);
+                }
+
+                // Save to internal cache for future use
+                self.save_to_cache(&cache_key, &scrubbed_trace).await?;
+
+                // Upload artifacts if available (GitLab 17.x)
+                for artifact in &job.artifacts {
+                    // TODO: Collect artifacts from job workspace
+                    // For now, create empty zip as placeholder
+                    let artifact_data = Vec::new();
+                    if let Err(e) = self
+                        .gitlab
+                        .upload_artifacts(
+                            job.id,
+                            &job.token,
+                            artifact_data,
+                            &artifact.name,
+                            artifact.expire_in.as_deref(),
+                        )
+                        .await
+                    {
+                        warn!("Failed to upload artifact {}: {}", artifact.name, e);
+                    }
+                }
+
+                // Upload cache after execution (GitLab 17.x)
+                for cache_entry in &job.cache {
+                    if cache_entry.policy == "push" || cache_entry.policy == "pull-push" {
+                        // TODO: Create zip from cache paths
+                        let cache_data = Vec::new();
+                        if let Err(e) = self
+                            .gitlab
+                            .upload_cache(job.id, &job.token, &cache_entry.key, cache_data)
+                            .await
+                        {
+                            warn!("Failed to upload cache {}: {}", cache_entry.key, e);
+                        }
+                    }
+                }
 
                 self.gitlab
-                    .update_job(job.id, &job.token, JobState::Success, Some(&trace))
+                    .update_job(job.id, &job.token, JobState::Success, Some(&scrubbed_trace))
                     .await?;
             }
             Err(e) => {
-                error!("❌ Job #{} failed: {}", job.id, e);
+                let error_msg = format!("{}", e);
+                let scrubbed_error = scrubber.scrub(&error_msg);
+                error!("❌ Job #{} failed: {}", job.id, scrubbed_error);
 
-                let trace = format!("Job failed: {}", e);
+                let trace = format!("Job failed: {}", scrubbed_error);
+
+                // Stream failure trace to GitLab
+                if let Err(err) = self.gitlab.patch_trace(job.id, &job.token, &trace, 0).await {
+                    warn!("Failed to stream failure trace: {}", err);
+                }
+
                 self.gitlab
                     .update_job(job.id, &job.token, JobState::Failed, Some(&trace))
                     .await?;

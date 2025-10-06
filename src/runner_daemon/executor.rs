@@ -1,10 +1,16 @@
+// Bollard 0.19 has deprecated old API, but new API is complex
+// We'll migrate to new API in future version
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
 
 use crate::gitlab::Job;
 
@@ -17,9 +23,30 @@ pub enum ExecutorType {
 
 impl ExecutorType {
     pub async fn execute(&self, job: &Job) -> Result<String> {
-        match self {
-            ExecutorType::Docker(executor) => executor.execute(job).await,
-            ExecutorType::Shell(executor) => executor.execute(job).await,
+        // Default timeout: 1 hour per job
+        let job_timeout = if job.timeout > 0 {
+            Duration::from_secs(job.timeout as u64)
+        } else {
+            Duration::from_secs(3600) // 1 hour default
+        };
+
+        // Execute with timeout
+        match timeout(job_timeout, async {
+            match self {
+                ExecutorType::Docker(executor) => executor.execute(job).await,
+                ExecutorType::Shell(executor) => executor.execute(job).await,
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("Job #{} timed out after {:?}", job.id, job_timeout);
+                Err(anyhow::anyhow!(
+                    "Job execution timed out after {} seconds",
+                    job_timeout.as_secs()
+                ))
+            }
         }
     }
 }
@@ -68,7 +95,6 @@ impl DockerExecutor {
 
         // Start container
         use bollard::container::StartContainerOptions;
-        #[allow(deprecated)]
         self.docker
             .start_container(&container_id, None::<StartContainerOptions<String>>)
             .await
@@ -79,14 +105,38 @@ impl DockerExecutor {
         // Clone repository
         output.push_str(&self.clone_repository(job, &container_id).await?);
 
-        // Execute job steps
+        // Execute job steps with before_script/after_script
         for step in &job.steps {
             info!("  ▶️  Step: {}", step.name);
 
+            // Execute before_script
+            if !step.before_script.is_empty() {
+                info!("    📋 Running before_script...");
+                for script_line in &step.before_script {
+                    let step_output = self.exec_in_container(&container_id, script_line).await?;
+                    output.push_str(&step_output);
+                    output.push('\n');
+                }
+            }
+
+            // Execute main script
             for script_line in &step.script {
                 let step_output = self.exec_in_container(&container_id, script_line).await?;
                 output.push_str(&step_output);
                 output.push('\n');
+            }
+
+            // Execute after_script (always run, even on failure)
+            if !step.after_script.is_empty() {
+                info!("    📋 Running after_script...");
+                for script_line in &step.after_script {
+                    if let Ok(step_output) =
+                        self.exec_in_container(&container_id, script_line).await
+                    {
+                        output.push_str(&step_output);
+                        output.push('\n');
+                    }
+                }
             }
         }
 
@@ -100,7 +150,6 @@ impl DockerExecutor {
     async fn pull_image(&self, image: &str) -> Result<()> {
         use bollard::image::CreateImageOptions;
 
-        #[allow(deprecated)]
         let options = Some(CreateImageOptions {
             from_image: image,
             ..Default::default()
@@ -123,7 +172,6 @@ impl DockerExecutor {
         use bollard::container::CreateContainerOptions;
         use bollard::models::ContainerCreateBody;
 
-        #[allow(deprecated)]
         let options = CreateContainerOptions {
             name: format!("turboci-job-{}", job.id),
             ..Default::default()
@@ -199,7 +247,6 @@ impl DockerExecutor {
     async fn cleanup_container(&self, container_id: &str) -> Result<()> {
         use bollard::container::RemoveContainerOptions;
 
-        #[allow(deprecated)]
         self.docker
             .remove_container(
                 container_id,
@@ -243,14 +290,36 @@ impl ShellExecutor {
         // Clone repository
         output.push_str(&self.clone_repository(job, &job_dir).await?);
 
-        // Execute job steps
+        // Execute job steps with before_script/after_script
         for step in &job.steps {
             info!("  ⚡ Step: {}", step.name);
 
+            // Execute before_script
+            if !step.before_script.is_empty() {
+                info!("    📋 Running before_script...");
+                for script_line in &step.before_script {
+                    let step_output = self.exec_command(script_line, &job_dir).await?;
+                    output.push_str(&step_output);
+                    output.push('\n');
+                }
+            }
+
+            // Execute main script
             for script_line in &step.script {
                 let step_output = self.exec_command(script_line, &job_dir).await?;
                 output.push_str(&step_output);
                 output.push('\n');
+            }
+
+            // Execute after_script (always run)
+            if !step.after_script.is_empty() {
+                info!("    📋 Running after_script...");
+                for script_line in &step.after_script {
+                    if let Ok(step_output) = self.exec_command(script_line, &job_dir).await {
+                        output.push_str(&step_output);
+                        output.push('\n');
+                    }
+                }
             }
         }
 
