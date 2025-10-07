@@ -377,8 +377,9 @@ impl DockerExecutor {
 
                                 if should_flush && !buffer.is_empty() {
                                     let new_offset = trace_offset + buffer.len();
-                                    if let Err(e) =
-                                        client.patch_trace(job_id, token, &buffer, trace_offset).await
+                                    if let Err(e) = client
+                                        .patch_trace(job_id, token, &buffer, trace_offset)
+                                        .await
                                     {
                                         warn!("Failed to stream clone output: {}", e);
                                     }
@@ -395,7 +396,9 @@ impl DockerExecutor {
                 // Flush remaining buffer
                 if let Some((client, job_id, token)) = gitlab_params {
                     if !buffer.is_empty() {
-                        if let Err(e) = client.patch_trace(job_id, token, &buffer, trace_offset).await
+                        if let Err(e) = client
+                            .patch_trace(job_id, token, &buffer, trace_offset)
+                            .await
                         {
                             warn!("Failed to stream final clone output: {}", e);
                         }
