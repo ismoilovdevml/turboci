@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use tracing::{info, warn};
-use zip::{ZipArchive, ZipWriter};
+use zip::ZipArchive;
 
 /// Download and extract artifacts for a job
 pub async fn download_and_extract_artifacts(
@@ -136,7 +136,6 @@ fn extract_zip_to_workspace(zip_data: &[u8], workspace_path: &str) -> Result<()>
 /// Create ZIP archive from paths (used for artifacts and cache upload)
 pub async fn create_zip_from_paths(workspace_path: &str, paths: &[String]) -> Result<Vec<u8>> {
     use std::io::Write;
-    use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
     let mut zip_buffer = Vec::new();
@@ -158,9 +157,7 @@ pub async fn create_zip_from_paths(workspace_path: &str, paths: &[String]) -> Re
         }
     }
 
-    zip.finish()?;
-    drop(zip);
-
+    let _writer = zip.finish()?;
     Ok(zip_buffer)
 }
 
@@ -185,7 +182,7 @@ async fn add_file_to_zip<W: Write + std::io::Seek>(
 
     // Get file permissions and set high compression
     #[cfg(unix)]
-    let options = {
+    let options: FileOptions<'_, ()> = {
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::metadata(file_path)?;
         FileOptions::default()
@@ -195,7 +192,7 @@ async fn add_file_to_zip<W: Write + std::io::Seek>(
     };
 
     #[cfg(not(unix))]
-    let options = FileOptions::default()
+    let options: FileOptions<'_, ()> = FileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .compression_level(Some(9)); // Best compression
 
