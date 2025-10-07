@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use tracing::{info, warn};
 use zip::{ZipArchive, ZipWriter};

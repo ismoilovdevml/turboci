@@ -22,6 +22,7 @@ pub enum ExecutorType {
 }
 
 impl ExecutorType {
+    #[allow(dead_code)]
     pub async fn execute(&self, job: &Job) -> Result<String> {
         self.execute_with_streaming(job, None).await
     }
@@ -87,6 +88,7 @@ impl DockerExecutor {
     }
 
     /// Execute a GitLab job in Docker container
+    #[allow(dead_code)]
     pub async fn execute(&self, job: &Job) -> Result<String> {
         self.execute_with_streaming(job, None).await
     }
@@ -318,6 +320,7 @@ impl DockerExecutor {
     }
 
     /// Execute command in container
+    #[allow(dead_code)]
     async fn exec_in_container(&self, container_id: &str, command: &str) -> Result<String> {
         self.exec_in_container_with_streaming(container_id, command, None, 0)
             .await
