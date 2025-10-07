@@ -55,8 +55,24 @@ impl RunnerDaemon {
         info!("🚀 TurboCI Runner Daemon starting...");
         info!("   Concurrent jobs: {}", self.config.concurrent);
         info!("   Check interval: {}s", self.config.check_interval);
+        info!("   Cache enabled: {}", self.config.cache_enabled);
+
+        // Log cache statistics every 100 jobs
+        let mut job_counter = 0;
 
         loop {
+            // Print cache stats every 100 jobs
+            if job_counter > 0 && job_counter % 100 == 0 {
+                if let Ok(stats) = self.stats().await {
+                    info!("📊 Cache Statistics (after {} jobs):", job_counter);
+                    info!("   Hit rate: {:.1}%", stats.cache_hit_rate);
+                    info!("   Cached items: {}", stats.cached_items);
+                    info!(
+                        "   Total size: {:.2} MB",
+                        stats.total_cached_size as f64 / 1_048_576.0
+                    );
+                }
+            }
             // Request a job from GitLab
             match self.gitlab.request_job(&self.config.runner_token).await {
                 Ok(Some(job)) => {
@@ -66,6 +82,8 @@ impl RunnerDaemon {
                         .map(|ji| ji.name.as_str())
                         .unwrap_or("unknown");
                     info!("📦 Received job #{} ({})", job.id, job_name);
+
+                    job_counter += 1;
 
                     // Execute job concurrently
                     let daemon = self.clone();

@@ -350,6 +350,10 @@ impl DockerExecutor {
 
         let mut output = String::new();
         let mut current_offset = trace_offset;
+        let mut buffer = String::new();
+        let mut last_flush = std::time::Instant::now();
+        const BUFFER_SIZE: usize = 10 * 1024; // 10KB batching
+        const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
         if let StartExecResults::Attached {
             output: mut stream, ..
@@ -361,21 +365,41 @@ impl DockerExecutor {
                         let text = msg.to_string();
                         print!("{}", text);
                         output.push_str(&text);
+                        buffer.push_str(&text);
 
-                        // Stream to GitLab in real-time if client is provided
+                        // Batched streaming: flush when buffer >= 10KB or 1s elapsed
                         if let Some((client, job_id, token)) = gitlab_client {
-                            let new_offset = current_offset + text.len();
-                            if let Err(e) = client
-                                .patch_trace(job_id, token, &text, current_offset)
-                                .await
-                            {
-                                warn!("Failed to stream trace: {}", e);
-                            } else {
-                                current_offset = new_offset;
+                            let should_flush = buffer.len() >= BUFFER_SIZE
+                                || last_flush.elapsed() >= FLUSH_INTERVAL;
+
+                            if should_flush && !buffer.is_empty() {
+                                let new_offset = current_offset + buffer.len();
+                                if let Err(e) = client
+                                    .patch_trace(job_id, token, &buffer, current_offset)
+                                    .await
+                                {
+                                    warn!("Failed to stream trace batch: {}", e);
+                                } else {
+                                    current_offset = new_offset;
+                                    buffer.clear();
+                                    last_flush = std::time::Instant::now();
+                                }
                             }
                         }
                     }
                     Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        // Flush remaining buffer before checking exit code
+        if let Some((client, job_id, token)) = gitlab_client {
+            if !buffer.is_empty() {
+                if let Err(e) = client
+                    .patch_trace(job_id, token, &buffer, current_offset)
+                    .await
+                {
+                    warn!("Failed to flush final trace: {}", e);
                 }
             }
         }

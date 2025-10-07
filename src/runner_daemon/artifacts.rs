@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use tracing::{info, warn};
-use zip::ZipArchive;
+use zip::{ZipArchive, ZipWriter};
 
 /// Download and extract artifacts for a job
 pub async fn download_and_extract_artifacts(
