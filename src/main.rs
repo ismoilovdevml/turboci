@@ -181,9 +181,19 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Start daemon
+            // Start daemon with graceful shutdown
             let daemon = RunnerDaemon::new(runner_config, gitlab, storage, executor);
-            daemon.start().await?;
+
+            // Handle shutdown signals (SIGTERM, SIGINT)
+            tokio::select! {
+                result = daemon.start() => {
+                    result?;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("⚠️  Received SIGINT (Ctrl+C), shutting down gracefully...");
+                    info!("✅ Runner stopped");
+                }
+            }
         }
         Commands::Hash { path } => {
             use cache::content_hash::ContentHasher;

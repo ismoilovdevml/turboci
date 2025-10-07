@@ -164,13 +164,14 @@ pub async fn create_zip_from_paths(workspace_path: &str, paths: &[String]) -> Re
     Ok(zip_buffer)
 }
 
-/// Add a single file to ZIP archive
+/// Add a single file to ZIP archive with best compression
 async fn add_file_to_zip<W: Write + std::io::Seek>(
     zip: &mut ZipWriter<W>,
     file_path: &Path,
     workspace_path: &str,
 ) -> Result<()> {
-    use zip::write::SimpleFileOptions;
+    use zip::write::FileOptions;
+    use zip::CompressionMethod;
 
     // Get relative path for ZIP entry
     let relative_path = file_path
@@ -182,16 +183,21 @@ async fn add_file_to_zip<W: Write + std::io::Seek>(
     // Read file content
     let file_data = tokio::fs::read(file_path).await?;
 
-    // Get file permissions
+    // Get file permissions and set high compression
     #[cfg(unix)]
     let options = {
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::metadata(file_path)?;
-        SimpleFileOptions::default().unix_permissions(metadata.permissions().mode())
+        FileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(9)) // Best compression (0-9)
+            .unix_permissions(metadata.permissions().mode())
     };
 
     #[cfg(not(unix))]
-    let options = SimpleFileOptions::default();
+    let options = FileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .compression_level(Some(9)); // Best compression
 
     // Add to ZIP
     zip.start_file(relative_path, options)?;

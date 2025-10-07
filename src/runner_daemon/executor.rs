@@ -12,7 +12,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::gitlab::Job;
+use crate::gitlab::{GitLabClient, Job};
 
 /// Executor type enum
 #[derive(Debug, Clone)]
@@ -23,6 +23,14 @@ pub enum ExecutorType {
 
 impl ExecutorType {
     pub async fn execute(&self, job: &Job) -> Result<String> {
+        self.execute_with_streaming(job, None).await
+    }
+
+    pub async fn execute_with_streaming(
+        &self,
+        job: &Job,
+        gitlab_client: Option<&GitLabClient>,
+    ) -> Result<String> {
         // Default timeout: 1 hour per job
         let job_timeout = if job.timeout > 0 {
             Duration::from_secs(job.timeout as u64)
@@ -33,7 +41,9 @@ impl ExecutorType {
         // Execute with timeout
         match timeout(job_timeout, async {
             match self {
-                ExecutorType::Docker(executor) => executor.execute(job).await,
+                ExecutorType::Docker(executor) => {
+                    executor.execute_with_streaming(job, gitlab_client).await
+                }
                 ExecutorType::Shell(executor) => executor.execute(job).await,
             }
         })
@@ -78,6 +88,15 @@ impl DockerExecutor {
 
     /// Execute a GitLab job in Docker container
     pub async fn execute(&self, job: &Job) -> Result<String> {
+        self.execute_with_streaming(job, None).await
+    }
+
+    /// Execute a GitLab job in Docker container with real-time trace streaming
+    pub async fn execute_with_streaming(
+        &self,
+        job: &Job,
+        gitlab_client: Option<&GitLabClient>,
+    ) -> Result<String> {
         let image = job
             .image
             .as_ref()
@@ -101,9 +120,15 @@ impl DockerExecutor {
             .context("Failed to start container")?;
 
         let mut output = String::new();
+        let mut trace_offset = 0;
 
         // Clone repository
-        output.push_str(&self.clone_repository(job, &container_id).await?);
+        let clone_output = self.clone_repository(job, &container_id).await?;
+        output.push_str(&clone_output);
+        trace_offset += clone_output.len();
+
+        // Prepare streaming parameters
+        let streaming_params = gitlab_client.map(|client| (client, job.id, job.token.as_str()));
 
         // Execute job steps with before_script/after_script
         for step in &job.steps {
@@ -113,28 +138,54 @@ impl DockerExecutor {
             if !step.before_script.is_empty() {
                 info!("    📋 Running before_script...");
                 for script_line in &step.before_script {
-                    let step_output = self.exec_in_container(&container_id, script_line).await?;
+                    let step_output = self
+                        .exec_in_container_with_streaming(
+                            &container_id,
+                            script_line,
+                            streaming_params,
+                            trace_offset,
+                        )
+                        .await?;
+                    trace_offset += step_output.len();
                     output.push_str(&step_output);
                     output.push('\n');
+                    trace_offset += 1;
                 }
             }
 
             // Execute main script
             for script_line in &step.script {
-                let step_output = self.exec_in_container(&container_id, script_line).await?;
+                let step_output = self
+                    .exec_in_container_with_streaming(
+                        &container_id,
+                        script_line,
+                        streaming_params,
+                        trace_offset,
+                    )
+                    .await?;
+                trace_offset += step_output.len();
                 output.push_str(&step_output);
                 output.push('\n');
+                trace_offset += 1;
             }
 
             // Execute after_script (always run, even on failure)
             if !step.after_script.is_empty() {
                 info!("    📋 Running after_script...");
                 for script_line in &step.after_script {
-                    if let Ok(step_output) =
-                        self.exec_in_container(&container_id, script_line).await
+                    if let Ok(step_output) = self
+                        .exec_in_container_with_streaming(
+                            &container_id,
+                            script_line,
+                            streaming_params,
+                            trace_offset,
+                        )
+                        .await
                     {
+                        trace_offset += step_output.len();
                         output.push_str(&step_output);
                         output.push('\n');
+                        trace_offset += 1;
                     }
                 }
             }
@@ -268,6 +319,18 @@ impl DockerExecutor {
 
     /// Execute command in container
     async fn exec_in_container(&self, container_id: &str, command: &str) -> Result<String> {
+        self.exec_in_container_with_streaming(container_id, command, None, 0)
+            .await
+    }
+
+    /// Execute command in container with optional real-time streaming
+    async fn exec_in_container_with_streaming(
+        &self,
+        container_id: &str,
+        command: &str,
+        gitlab_client: Option<(&GitLabClient, u64, &str)>, // (client, job_id, token)
+        trace_offset: usize,
+    ) -> Result<String> {
         debug!("Executing: {}", command);
 
         let exec = self
@@ -286,6 +349,7 @@ impl DockerExecutor {
             .context("Failed to create exec")?;
 
         let mut output = String::new();
+        let mut current_offset = trace_offset;
 
         if let StartExecResults::Attached {
             output: mut stream, ..
@@ -297,6 +361,19 @@ impl DockerExecutor {
                         let text = msg.to_string();
                         print!("{}", text);
                         output.push_str(&text);
+
+                        // Stream to GitLab in real-time if client is provided
+                        if let Some((client, job_id, token)) = gitlab_client {
+                            let new_offset = current_offset + text.len();
+                            if let Err(e) = client
+                                .patch_trace(job_id, token, &text, current_offset)
+                                .await
+                            {
+                                warn!("Failed to stream trace: {}", e);
+                            } else {
+                                current_offset = new_offset;
+                            }
+                        }
                     }
                     Err(e) => return Err(e.into()),
                 }

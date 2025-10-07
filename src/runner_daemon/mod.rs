@@ -242,8 +242,11 @@ impl RunnerDaemon {
             }
         }
 
-        // Execute job with trace streaming
-        let result = self.executor.execute(&job).await;
+        // Execute job with real-time trace streaming to GitLab
+        let result = self
+            .executor
+            .execute_with_streaming(&job, Some(&self.gitlab))
+            .await;
 
         match result {
             Ok(trace) => {
@@ -268,8 +271,10 @@ impl RunnerDaemon {
                 // Save to internal cache for future use
                 self.save_to_cache(&cache_key, &scrubbed_trace).await?;
 
-                // Upload artifacts if available (GitLab 17.x)
+                // Upload artifacts in parallel if available (GitLab 17.x)
                 if let Some(ref artifacts) = job.artifacts {
+                    let mut upload_futures = Vec::new();
+
                     for artifact in artifacts {
                         let artifact_name = artifact.name.as_deref().unwrap_or("artifact");
 
@@ -294,18 +299,40 @@ impl RunnerDaemon {
                             artifact_data.len()
                         );
 
-                        if let Err(e) = self
-                            .gitlab
-                            .upload_artifacts(
-                                job.id,
-                                &job.token,
-                                artifact_data,
-                                artifact_name,
-                                artifact.expire_in.as_deref(),
-                            )
-                            .await
-                        {
-                            warn!("Failed to upload artifact {}: {}", artifact_name, e);
+                        // Spawn parallel upload task
+                        let gitlab = self.gitlab.clone();
+                        let job_id = job.id;
+                        let job_token = job.token.clone();
+                        let artifact_name_owned = artifact_name.to_string();
+                        let expire_in_owned = artifact.expire_in.clone();
+
+                        let upload_task = tokio::spawn(async move {
+                            gitlab
+                                .upload_artifacts(
+                                    job_id,
+                                    &job_token,
+                                    artifact_data,
+                                    &artifact_name_owned,
+                                    expire_in_owned.as_deref(),
+                                )
+                                .await
+                        });
+
+                        upload_futures.push((artifact_name.to_string(), upload_task));
+                    }
+
+                    // Wait for all uploads to complete in parallel
+                    for (artifact_name, upload_task) in upload_futures {
+                        match upload_task.await {
+                            Ok(Ok(())) => {
+                                info!("✅ Uploaded artifact: {}", artifact_name);
+                            }
+                            Ok(Err(e)) => {
+                                warn!("Failed to upload artifact {}: {}", artifact_name, e);
+                            }
+                            Err(e) => {
+                                warn!("Upload task panicked for {}: {}", artifact_name, e);
+                            }
                         }
                     }
                 }

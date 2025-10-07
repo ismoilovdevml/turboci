@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Deserialize null JSON values as None for Option<String>
@@ -38,6 +39,35 @@ impl GitLabClient {
             url,
             token,
         }
+    }
+
+    /// Retry helper with exponential backoff (3 attempts)
+    async fn retry_with_backoff<F, Fut, T>(&self, operation: F) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let max_attempts = 3;
+        let mut last_error = None;
+
+        for attempt in 1..=max_attempts {
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < max_attempts {
+                        let backoff = Duration::from_millis(100 * 2_u64.pow(attempt - 1));
+                        warn!(
+                            "Operation failed (attempt {}/{}), retrying in {:?}",
+                            attempt, max_attempts, backoff
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
     }
 
     /// Request a new job from GitLab (GitLab 17.x compatible)
@@ -135,7 +165,7 @@ impl GitLabClient {
         Ok(())
     }
 
-    /// Stream job trace (real-time logs) - GitLab 17.x
+    /// Stream job trace (real-time logs) - GitLab 17.x with retry
     /// GitLab expects Content-Range format: "0-{size}" for total trace size
     pub async fn patch_trace(
         &self,
@@ -147,31 +177,40 @@ impl GitLabClient {
         let url = format!("{}/api/v4/jobs/{}/trace", self.url, job_id);
         let trace_bytes = trace.as_bytes();
         let end_offset = offset + trace_bytes.len();
+        let trace_owned = trace.to_string();
+        let token_owned = token.to_string();
 
-        let response = self
-            .client
-            .patch(&url)
-            .header("JOB-TOKEN", token)
-            .header("Content-Range", format!("{}-{}", offset, end_offset)) // ✅ Fixed: cumulative offset
-            .header("Content-Type", "text/plain")
-            .body(trace.to_string())
-            .send()
-            .await
-            .context("Failed to stream trace")?;
+        self.retry_with_backoff(|| async {
+            let response = self
+                .client
+                .patch(&url)
+                .header("JOB-TOKEN", &token_owned)
+                .header("Content-Range", format!("{}-{}", offset, end_offset))
+                .header("Content-Type", "text/plain")
+                .body(trace_owned.clone())
+                .send()
+                .await
+                .context("Failed to stream trace")?;
 
-        if !response.status().is_success() {
-            warn!(
-                "Trace streaming failed: {} - Range: {}-{}",
-                response.status(),
-                offset,
-                end_offset
-            );
-        }
+            if !response.status().is_success() {
+                warn!(
+                    "Trace streaming failed: {} - Range: {}-{}",
+                    response.status(),
+                    offset,
+                    end_offset
+                );
+                return Err(anyhow::anyhow!(
+                    "Trace streaming failed: {}",
+                    response.status()
+                ));
+            }
 
-        Ok(end_offset)
+            Ok(end_offset)
+        })
+        .await
     }
 
-    /// Upload job artifacts (GitLab 17.x)
+    /// Upload job artifacts (GitLab 17.x) with retry
     pub async fn upload_artifacts(
         &self,
         job_id: u64,
@@ -186,21 +225,29 @@ impl GitLabClient {
             url = format!("{}?expire_in={}", url, expiration);
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .header("JOB-TOKEN", token)
-            .header("Content-Type", "application/zip")
-            .header("artifact-type", artifact_type)
-            .body(artifact_data)
-            .send()
-            .await
-            .context("Failed to upload artifacts")?;
+        let token_owned = token.to_string();
+        let artifact_type_owned = artifact_type.to_string();
 
-        if !response.status().is_success() {
-            let error = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("Artifact upload failed: {}", error));
-        }
+        self.retry_with_backoff(|| async {
+            let response = self
+                .client
+                .post(&url)
+                .header("JOB-TOKEN", &token_owned)
+                .header("Content-Type", "application/zip")
+                .header("artifact-type", &artifact_type_owned)
+                .body(artifact_data.clone())
+                .send()
+                .await
+                .context("Failed to upload artifacts")?;
+
+            if !response.status().is_success() {
+                let error = response.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!("Artifact upload failed: {}", error));
+            }
+
+            Ok(())
+        })
+        .await?;
 
         info!("Artifacts uploaded for job #{}", job_id);
         Ok(())
@@ -232,6 +279,7 @@ impl GitLabClient {
     }
 
     /// Upload cache archive (GitLab 17.x)
+    /// Upload cache with retry
     pub async fn upload_cache(
         &self,
         job_id: u64,
@@ -240,24 +288,33 @@ impl GitLabClient {
         cache_data: Vec<u8>,
     ) -> Result<()> {
         let url = format!("{}/api/v4/jobs/{}/cache", self.url, job_id);
+        let token_owned = token.to_string();
+        let key_owned = key.to_string();
 
-        let response = self
-            .client
-            .post(&url)
-            .header("JOB-TOKEN", token)
-            .header("Cache-Key", key)
-            .header("Content-Type", "application/zip")
-            .body(cache_data)
-            .send()
-            .await
-            .context("Failed to upload cache")?;
+        self.retry_with_backoff(|| async {
+            let response = self
+                .client
+                .post(&url)
+                .header("JOB-TOKEN", &token_owned)
+                .header("Cache-Key", &key_owned)
+                .header("Content-Type", "application/zip")
+                .body(cache_data.clone())
+                .send()
+                .await
+                .context("Failed to upload cache")?;
 
-        if !response.status().is_success() {
-            warn!("Cache upload failed: {}", response.status());
-        } else {
-            info!("Cache uploaded: {}", key);
-        }
+            if !response.status().is_success() {
+                return Err(anyhow::anyhow!(
+                    "Cache upload failed: {}",
+                    response.status()
+                ));
+            }
 
+            Ok(())
+        })
+        .await?;
+
+        info!("Cache uploaded: {}", key);
         Ok(())
     }
 

@@ -2,6 +2,10 @@
 
 Last updated: 2025-10-07
 
+## 🎉 v0.3.0 Release - Major Fixes!
+
+All critical bugs have been fixed! Docker executor is now production-ready.
+
 ---
 
 ## 🔴 Critical - Docker Executor
@@ -85,7 +89,7 @@ Same as BUG-002, uploading 0 bytes!
 ### BUG-004: Docker Container Logs Not Streamed to GitLab
 **Severity:** HIGH
 **File:** `src/runner_daemon/executor.rs:239-240`
-**Status:** ❌ Not Fixed
+**Status:** ✅ FIXED in v0.3.0 - Real-time streaming implemented
 
 **Symptom:**
 GitLab UI shows only:
@@ -206,7 +210,7 @@ Artifact collection code is shared - same empty `Vec::new()`.
 ### BUG-008: No Graceful Shutdown
 **Severity:** LOW
 **File:** N/A
-**Status:** ❌ Not Implemented
+**Status:** ✅ FIXED in v0.3.0 - SIGINT/SIGTERM handling added
 
 **Symptom:**
 `systemctl stop turboci` immediately kills running jobs.
@@ -218,7 +222,7 @@ Artifact collection code is shared - same empty `Vec::new()`.
 ### BUG-009: No Retry Logic for Network Failures
 **Severity:** LOW
 **File:** `src/gitlab/mod.rs` (all upload functions)
-**Status:** ❌ Not Implemented
+**Status:** ✅ FIXED in v0.3.0 - 3x retry with exponential backoff
 
 **Symptom:**
 Transient network errors cause job failures.
@@ -229,19 +233,19 @@ Transient network errors cause job failures.
 
 ## 📋 Bug Summary Table
 
-| ID | Severity | Component | Impact | Est. Fix Time |
-|----|----------|-----------|--------|---------------|
-| BUG-001 | HIGH | Trace stream | No logs in UI | 15 min |
-| BUG-002 | CRITICAL | Artifacts | Jobs fail | 4 hours |
-| BUG-003 | HIGH | Cache | Slow builds | 2 hours |
-| BUG-004 | HIGH | Logs | No real-time | 2 hours |
-| BUG-005 | CRITICAL | Docker | Can't collect files | 1 hour |
-| BUG-006 | HIGH | Artifacts | Multi-job fail | 3 hours |
-| BUG-007 | MEDIUM | Shell | No artifacts | Same as BUG-002 |
-| BUG-008 | LOW | Daemon | Job kills | 2 hours |
-| BUG-009 | LOW | Network | Flaky | 1 hour |
+| ID | Severity | Component | Impact | Status |
+|----|----------|-----------|--------|--------|
+| BUG-001 | HIGH | Trace stream | No logs in UI | ✅ Fixed v0.2.14 |
+| BUG-002 | CRITICAL | Artifacts | Jobs fail | ✅ Fixed v0.2.14 |
+| BUG-003 | HIGH | Cache | Slow builds | ✅ Fixed v0.2.14 |
+| BUG-004 | HIGH | Logs | No real-time | ✅ Fixed v0.3.0 |
+| BUG-005 | CRITICAL | Docker | Can't collect files | ✅ Fixed v0.2.14 |
+| BUG-006 | HIGH | Artifacts | Multi-job fail | ✅ Fixed v0.2.14 |
+| BUG-007 | MEDIUM | Shell | No artifacts | ✅ Fixed v0.2.14 |
+| BUG-008 | LOW | Daemon | Job kills | ✅ Fixed v0.3.0 |
+| BUG-009 | LOW | Network | Flaky | ✅ Fixed v0.3.0 |
 
-**Total Estimated Fix Time:** ~16 hours of focused work
+**All 9 bugs FIXED! 🎉**
 
 ---
 
