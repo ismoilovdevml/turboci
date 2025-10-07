@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use tracing::{info, warn};
-use zip::ZipArchive;
+use zip::{ZipArchive, ZipWriter};
 
 /// Download and extract artifacts for a job
 pub async fn download_and_extract_artifacts(
@@ -135,9 +135,6 @@ fn extract_zip_to_workspace(zip_data: &[u8], workspace_path: &str) -> Result<()>
 
 /// Create ZIP archive from paths (used for artifacts and cache upload)
 pub async fn create_zip_from_paths(workspace_path: &str, paths: &[String]) -> Result<Vec<u8>> {
-    use std::io::Write;
-    use zip::ZipWriter;
-
     let mut zip_buffer = Vec::new();
     let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
 
