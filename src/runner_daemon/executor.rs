@@ -196,7 +196,7 @@ impl DockerExecutor {
         }
 
         // Cleanup
-        self.cleanup_container(&container_id).await?;
+        self.cleanup_container(&container_id, job.id).await?;
 
         Ok(output)
     }
@@ -526,8 +526,8 @@ impl DockerExecutor {
         Ok(output)
     }
 
-    /// Cleanup container
-    async fn cleanup_container(&self, container_id: &str) -> Result<()> {
+    /// Cleanup container and workspace
+    async fn cleanup_container(&self, container_id: &str, job_id: u64) -> Result<()> {
         use bollard::container::RemoveContainerOptions;
 
         // Stop and remove container
@@ -545,16 +545,12 @@ impl DockerExecutor {
 
         info!("🗑️  Removed container: {}", container_id);
 
-        // Extract job ID from container name (format: turboci-job-{id})
-        if let Some(job_id_str) = container_id.strip_prefix("turboci-job-") {
-            let workspace = format!("/tmp/turboci-builds/job-{}", job_id_str);
-
-            // Clean up host workspace to free disk space
-            if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
-                warn!("Failed to remove workspace {}: {}", workspace, e);
-            } else {
-                info!("💾 Freed disk space: {}", workspace);
-            }
+        // Clean up host workspace to free disk space
+        let workspace = format!("/tmp/turboci-builds/job-{}", job_id);
+        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
+            warn!("Failed to remove workspace {}: {}", workspace, e);
+        } else {
+            info!("💾 Freed disk space: {}", workspace);
         }
 
         Ok(())
