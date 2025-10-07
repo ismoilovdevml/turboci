@@ -170,17 +170,28 @@ impl DockerExecutor {
     /// Create Docker container
     async fn create_container(&self, job: &Job, image: &str) -> Result<String> {
         use bollard::container::CreateContainerOptions;
-        use bollard::models::ContainerCreateBody;
+        use bollard::models::{ContainerCreateBody, HostConfig};
 
         let options = CreateContainerOptions {
             name: format!("turboci-job-{}", job.id),
             ..Default::default()
         };
 
+        // Create workspace directory on host for volume mount
+        let host_workspace = format!("/tmp/turboci-builds/job-{}", job.id);
+        tokio::fs::create_dir_all(&host_workspace).await
+            .context("Failed to create host workspace")?;
+
         let config = ContainerCreateBody {
             image: Some(image.to_string()),
             working_dir: Some("/builds".to_string()),
             cmd: Some(vec!["sleep".to_string(), "3600".to_string()]),
+            host_config: Some(HostConfig {
+                binds: Some(vec![
+                    format!("{}:/builds", host_workspace),  // ✅ Mount workspace
+                ]),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -190,6 +201,7 @@ impl DockerExecutor {
             .await
             .context("Failed to create container")?;
 
+        info!("📁 Mounted host workspace: {} -> /builds", host_workspace);
         Ok(response.id)
     }
 

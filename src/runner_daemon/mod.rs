@@ -223,9 +223,19 @@ impl RunnerDaemon {
                 if let Some(ref artifacts) = job.artifacts {
                     for artifact in artifacts {
                         let artifact_name = artifact.name.as_deref().unwrap_or("artifact");
-                        // TODO: Collect artifacts from job workspace
-                        // For now, create empty zip as placeholder
-                        let artifact_data = Vec::new();
+
+                        // Collect and ZIP artifacts from workspace
+                        let workspace_path = format!("/tmp/turboci-builds/job-{}/project", job.id);
+                        let artifact_data = match self.create_artifact_zip(&workspace_path, &artifact.paths).await {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!("Failed to create artifact ZIP: {}", e);
+                                continue;
+                            }
+                        };
+
+                        info!("📦 Created artifact ZIP: {} ({} bytes)", artifact_name, artifact_data.len());
+
                         if let Err(e) = self
                             .gitlab
                             .upload_artifacts(
@@ -245,8 +255,18 @@ impl RunnerDaemon {
                 // Upload cache after execution (GitLab 17.x)
                 for cache_entry in &job.cache {
                     if cache_entry.policy == "push" || cache_entry.policy == "pull-push" {
-                        // TODO: Create zip from cache paths
-                        let cache_data = Vec::new();
+                        // Create ZIP from cache paths
+                        let workspace_path = format!("/tmp/turboci-builds/job-{}/project", job.id);
+                        let cache_data = match self.create_artifact_zip(&workspace_path, &cache_entry.paths).await {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!("Failed to create cache ZIP: {}", e);
+                                continue;
+                            }
+                        };
+
+                        info!("📦 Created cache ZIP: {} ({} bytes)", cache_entry.key, cache_data.len());
+
                         if let Err(e) = self
                             .gitlab
                             .upload_cache(job.id, &job.token, &cache_entry.key, cache_data)
@@ -362,6 +382,47 @@ impl RunnerDaemon {
             total_cached_size: storage_stats.total_size,
             cached_items: storage_stats.item_count,
         })
+    }
+
+    /// Create ZIP archive from artifact paths
+    async fn create_artifact_zip(&self, workspace_path: &str, paths: &[String]) -> Result<Vec<u8>> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let mut zip_buffer = Vec::new();
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
+
+        for path_pattern in paths {
+            let full_pattern = format!("{}/{}", workspace_path, path_pattern);
+
+            // Use glob to find matching files
+            for entry in glob::glob(&full_pattern)? {
+                let file_path = entry?;
+                if !file_path.is_file() {
+                    continue;
+                }
+
+                // Get relative path for ZIP entry
+                let relative_path = file_path
+                    .strip_prefix(workspace_path)
+                    .unwrap_or(&file_path)
+                    .to_string_lossy()
+                    .to_string();
+
+                // Read file content
+                let file_data = tokio::fs::read(&file_path).await?;
+
+                // Add to ZIP
+                zip.start_file(relative_path, SimpleFileOptions::default())?;
+                zip.write_all(&file_data)?;
+            }
+        }
+
+        zip.finish()?;
+        drop(zip);
+
+        Ok(zip_buffer)
     }
 }
 
