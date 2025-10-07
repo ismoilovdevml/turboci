@@ -152,7 +152,7 @@ impl GitLabClient {
             .client
             .patch(&url)
             .header("JOB-TOKEN", token)
-            .header("Content-Range", format!("{}-{}", offset, end_offset))  // ✅ Fixed: cumulative offset
+            .header("Content-Range", format!("{}-{}", offset, end_offset)) // ✅ Fixed: cumulative offset
             .header("Content-Type", "text/plain")
             .body(trace.to_string())
             .send()
@@ -160,7 +160,12 @@ impl GitLabClient {
             .context("Failed to stream trace")?;
 
         if !response.status().is_success() {
-            warn!("Trace streaming failed: {} - Range: {}-{}", response.status(), offset, end_offset);
+            warn!(
+                "Trace streaming failed: {} - Range: {}-{}",
+                response.status(),
+                offset,
+                end_offset
+            );
         }
 
         Ok(end_offset)

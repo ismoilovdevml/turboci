@@ -226,7 +226,10 @@ impl RunnerDaemon {
 
                         // Collect and ZIP artifacts from workspace
                         let workspace_path = format!("/tmp/turboci-builds/job-{}/project", job.id);
-                        let artifact_data = match self.create_artifact_zip(&workspace_path, &artifact.paths).await {
+                        let artifact_data = match self
+                            .create_artifact_zip(&workspace_path, &artifact.paths)
+                            .await
+                        {
                             Ok(data) => data,
                             Err(e) => {
                                 warn!("Failed to create artifact ZIP: {}", e);
@@ -234,7 +237,11 @@ impl RunnerDaemon {
                             }
                         };
 
-                        info!("📦 Created artifact ZIP: {} ({} bytes)", artifact_name, artifact_data.len());
+                        info!(
+                            "📦 Created artifact ZIP: {} ({} bytes)",
+                            artifact_name,
+                            artifact_data.len()
+                        );
 
                         if let Err(e) = self
                             .gitlab
@@ -257,7 +264,10 @@ impl RunnerDaemon {
                     if cache_entry.policy == "push" || cache_entry.policy == "pull-push" {
                         // Create ZIP from cache paths
                         let workspace_path = format!("/tmp/turboci-builds/job-{}/project", job.id);
-                        let cache_data = match self.create_artifact_zip(&workspace_path, &cache_entry.paths).await {
+                        let cache_data = match self
+                            .create_artifact_zip(&workspace_path, &cache_entry.paths)
+                            .await
+                        {
                             Ok(data) => data,
                             Err(e) => {
                                 warn!("Failed to create cache ZIP: {}", e);
@@ -265,7 +275,11 @@ impl RunnerDaemon {
                             }
                         };
 
-                        info!("📦 Created cache ZIP: {} ({} bytes)", cache_entry.key, cache_data.len());
+                        info!(
+                            "📦 Created cache ZIP: {} ({} bytes)",
+                            cache_entry.key,
+                            cache_data.len()
+                        );
 
                         if let Err(e) = self
                             .gitlab

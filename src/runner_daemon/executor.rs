@@ -179,7 +179,8 @@ impl DockerExecutor {
 
         // Create workspace directory on host for volume mount
         let host_workspace = format!("/tmp/turboci-builds/job-{}", job.id);
-        tokio::fs::create_dir_all(&host_workspace).await
+        tokio::fs::create_dir_all(&host_workspace)
+            .await
             .context("Failed to create host workspace")?;
 
         let config = ContainerCreateBody {
@@ -188,7 +189,7 @@ impl DockerExecutor {
             cmd: Some(vec!["sleep".to_string(), "3600".to_string()]),
             host_config: Some(HostConfig {
                 binds: Some(vec![
-                    format!("{}:/builds", host_workspace),  // ✅ Mount workspace
+                    format!("{}:/builds", host_workspace), // ✅ Mount workspace
                 ]),
                 ..Default::default()
             }),
