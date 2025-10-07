@@ -27,3 +27,6 @@ build/
 
 # Redis
 dump.rdb
+
+# GitLab Runner source code (for reference only)
+gitlab-runner/

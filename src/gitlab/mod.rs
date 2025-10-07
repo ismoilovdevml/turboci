@@ -185,24 +185,41 @@ impl GitLabClient {
                 .client
                 .patch(&url)
                 .header("JOB-TOKEN", &token_owned)
-                .header("Content-Range", format!("{}-{}", offset, end_offset))
+                .header("Content-Range", format!("{}-{}", offset, end_offset - 1))
                 .header("Content-Type", "text/plain")
                 .body(trace_owned.clone())
                 .send()
                 .await
                 .context("Failed to stream trace")?;
 
-            if !response.status().is_success() {
+            let status = response.status();
+
+            // Handle 416 Range Not Satisfiable - parse server offset
+            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                if let Some(range_header) = response.headers().get("Range") {
+                    if let Ok(range_str) = range_header.to_str() {
+                        // Parse "0-123" format - take end offset
+                        if let Some((_start, end)) = range_str.split_once('-') {
+                            if let Ok(server_offset) = end.parse::<usize>() {
+                                debug!("Range mismatch: server at {}, we sent {}-{}",
+                                      server_offset, offset, end_offset - 1);
+                                return Ok(server_offset);
+                            }
+                        }
+                    }
+                }
+                warn!("Range mismatch but couldn't parse server offset");
+                return Err(anyhow::anyhow!("Range mismatch: {}", status));
+            }
+
+            if !status.is_success() {
                 warn!(
                     "Trace streaming failed: {} - Range: {}-{}",
-                    response.status(),
+                    status,
                     offset,
-                    end_offset
+                    end_offset - 1
                 );
-                return Err(anyhow::anyhow!(
-                    "Trace streaming failed: {}",
-                    response.status()
-                ));
+                return Err(anyhow::anyhow!("Trace streaming failed: {}", status));
             }
 
             Ok(end_offset)
