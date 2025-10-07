@@ -9,6 +9,7 @@ use crate::gitlab::{GitLabClient, Job, JobState};
 use crate::security::secret_scrubber::SecretScrubber;
 use crate::storage::{HybridStorage, StorageBackend};
 
+pub mod artifacts;
 pub mod config;
 pub mod executor;
 
@@ -146,13 +147,45 @@ impl RunnerDaemon {
                         .patch_trace(job.id, &job.token, &cache_trace, trace_offset)
                         .await
                         .unwrap_or(trace_offset);
-                    // TODO: Extract zip to workspace
+
+                    // Extract cache to workspace
+                    let workspace_path = match &*self.executor {
+                        executor::ExecutorType::Docker(_) => {
+                            format!("/tmp/turboci-builds/job-{}/project", job.id)
+                        }
+                        executor::ExecutorType::Shell(_) => {
+                            format!("/tmp/turboci/job-{}/project", job.id)
+                        }
+                    };
+
+                    if let Err(e) = artifacts::download_and_extract_cache(
+                        &self.config.gitlab_url,
+                        job.id,
+                        &job.token,
+                        &workspace_path,
+                        &cache_entry.key,
+                    )
+                    .await
+                    {
+                        warn!("Failed to extract cache {}: {}", cache_entry.key, e);
+                    }
                 }
             }
         }
 
         // STAGE 4: Download artifacts from dependencies
         info!("📥 Stage: Downloading artifacts");
+
+        // Determine workspace path based on executor type
+        let workspace_path = match &*self.executor {
+            executor::ExecutorType::Docker(_) => {
+                format!("/tmp/turboci-builds/job-{}/project", job.id)
+            }
+            executor::ExecutorType::Shell(_) => {
+                format!("/tmp/turboci/job-{}/project", job.id)
+            }
+        };
+
         for dependency in &job.dependencies {
             let dep_trace = format!(
                 "Downloading artifacts from job #{} ({})\n",
@@ -163,7 +196,23 @@ impl RunnerDaemon {
                 .patch_trace(job.id, &job.token, &dep_trace, trace_offset)
                 .await
                 .unwrap_or(trace_offset);
-            // TODO: Actually download artifacts using dependency.token
+
+            // Download and extract artifacts
+            let artifact_names = vec!["artifact".to_string()]; // Default name, should come from job config
+            if let Err(e) = artifacts::download_and_extract_artifacts(
+                &self.config.gitlab_url,
+                dependency.id,
+                &dependency.token,
+                &workspace_path,
+                &artifact_names,
+            )
+            .await
+            {
+                warn!(
+                    "Failed to download artifacts from job #{}: {}",
+                    dependency.id, e
+                );
+            }
         }
 
         // Check internal cache before execution
@@ -226,9 +275,11 @@ impl RunnerDaemon {
 
                         // Collect and ZIP artifacts from workspace
                         let workspace_path = format!("/tmp/turboci-builds/job-{}/project", job.id);
-                        let artifact_data = match self
-                            .create_artifact_zip(&workspace_path, &artifact.paths)
-                            .await
+                        let artifact_data = match artifacts::create_zip_from_paths(
+                            &workspace_path,
+                            &artifact.paths,
+                        )
+                        .await
                         {
                             Ok(data) => data,
                             Err(e) => {
@@ -264,9 +315,11 @@ impl RunnerDaemon {
                     if cache_entry.policy == "push" || cache_entry.policy == "pull-push" {
                         // Create ZIP from cache paths
                         let workspace_path = format!("/tmp/turboci-builds/job-{}/project", job.id);
-                        let cache_data = match self
-                            .create_artifact_zip(&workspace_path, &cache_entry.paths)
-                            .await
+                        let cache_data = match artifacts::create_zip_from_paths(
+                            &workspace_path,
+                            &cache_entry.paths,
+                        )
+                        .await
                         {
                             Ok(data) => data,
                             Err(e) => {
@@ -396,47 +449,6 @@ impl RunnerDaemon {
             total_cached_size: storage_stats.total_size,
             cached_items: storage_stats.item_count,
         })
-    }
-
-    /// Create ZIP archive from artifact paths
-    async fn create_artifact_zip(&self, workspace_path: &str, paths: &[String]) -> Result<Vec<u8>> {
-        use std::io::Write;
-        use zip::write::SimpleFileOptions;
-        use zip::ZipWriter;
-
-        let mut zip_buffer = Vec::new();
-        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
-
-        for path_pattern in paths {
-            let full_pattern = format!("{}/{}", workspace_path, path_pattern);
-
-            // Use glob to find matching files
-            for entry in glob::glob(&full_pattern)? {
-                let file_path = entry?;
-                if !file_path.is_file() {
-                    continue;
-                }
-
-                // Get relative path for ZIP entry
-                let relative_path = file_path
-                    .strip_prefix(workspace_path)
-                    .unwrap_or(&file_path)
-                    .to_string_lossy()
-                    .to_string();
-
-                // Read file content
-                let file_data = tokio::fs::read(&file_path).await?;
-
-                // Add to ZIP
-                zip.start_file(relative_path, SimpleFileOptions::default())?;
-                zip.write_all(&file_data)?;
-            }
-        }
-
-        zip.finish()?;
-        drop(zip);
-
-        Ok(zip_buffer)
     }
 }
 

@@ -9,7 +9,7 @@ Last updated: 2025-10-07
 ### BUG-001: Trace Streaming Returns 416 Range Not Satisfiable
 **Severity:** HIGH
 **File:** `src/gitlab/mod.rs:155`
-**Status:** ❌ Not Fixed
+**Status:** ✅ FIXED in v0.2.14
 
 **Symptom:**
 ```
@@ -37,7 +37,7 @@ GitLab expects cumulative offset:
 ### BUG-002: Artifacts Upload Empty Data
 **Severity:** CRITICAL
 **File:** `src/runner_daemon/mod.rs:226-228`
-**Status:** ❌ Not Implemented
+**Status:** ✅ FIXED in v0.2.14 - Implemented in artifacts.rs module
 
 **Symptom:**
 ```
@@ -64,7 +64,7 @@ Literally uploading 0 bytes!
 ### BUG-003: Cache Upload Empty Data
 **Severity:** HIGH
 **File:** `src/runner_daemon/mod.rs:248-249`
-**Status:** ❌ Not Implemented
+**Status:** ✅ FIXED in v0.2.14 - Implemented in artifacts.rs module
 
 **Symptom:**
 ```
@@ -123,7 +123,7 @@ while let Some(chunk) = stream.next().await {
 ### BUG-005: Docker Containers Have No Volume Mounts
 **Severity:** CRITICAL
 **File:** `src/runner_daemon/executor.rs:180-185`
-**Status:** ❌ Not Implemented
+**Status:** ✅ FIXED in v0.2.14
 
 **Symptom:**
 Artifacts created inside container are lost when container is removed.
@@ -163,7 +163,7 @@ let config = ContainerCreateBody {
 ### BUG-006: Downloaded Artifacts/Cache Not Extracted
 **Severity:** HIGH
 **File:** `src/runner_daemon/mod.rs:149`
-**Status:** ❌ Not Implemented
+**Status:** ✅ FIXED in v0.2.14 - Full implementation in artifacts.rs
 
 **Symptom:**
 Jobs with `dependencies:` or `needs:` fail because previous job artifacts are missing.
@@ -189,7 +189,7 @@ info!("📥 Stage: Downloading artifacts");
 ### BUG-007: Shell Executor Artifact Upload Fails Too
 **Severity:** MEDIUM
 **File:** Same as BUG-002
-**Status:** ❌ Not Fixed
+**Status:** ✅ FIXED in v0.2.14 - Same artifacts.rs module used
 
 **Symptom:**
 Even Shell executor can't upload artifacts!
