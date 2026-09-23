@@ -1,16 +1,18 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::gitlab::{ArtifactUpload, GitLabClient, Job, JobState};
+use crate::gitlab::{ArtifactUpload, FailureReason, GitLabClient, Job, JobState, RemoteState};
 use crate::security::secret_scrubber::SecretScrubber;
+use cancel::CancelSignal;
 use executor::{JobFailure, JobOutcome};
 use trace::TraceWriter;
 
 pub mod artifacts;
+pub mod cancel;
 pub mod config;
 pub mod executor;
 pub mod git;
@@ -35,17 +37,67 @@ fn project_id(job: &Job) -> u64 {
 ///
 /// The permit is taken before the request, so the runner never accepts more jobs
 /// than `concurrent`; it is returned with the job and released when the job ends.
+#[cfg(test)]
 async fn claim_job(
     semaphore: &Arc<Semaphore>,
     gitlab: &GitLabClient,
     runner_token: &str,
 ) -> Result<Option<(Job, OwnedSemaphorePermit)>> {
     let permit = semaphore.clone().acquire_owned().await?;
+    claim_with_permit(permit, gitlab, runner_token).await
+}
+
+/// Ask GitLab for a job for an already reserved slot; the slot is released
+/// when no job is returned
+async fn claim_with_permit(
+    permit: OwnedSemaphorePermit,
+    gitlab: &GitLabClient,
+    runner_token: &str,
+) -> Result<Option<(Job, OwnedSemaphorePermit)>> {
     Ok(gitlab
         .request_job(runner_token)
         .await?
         .map(|job| (job, permit)))
 }
+
+/// How the runner is stopping
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Shutdown {
+    Running,
+    /// Take no new jobs, let running jobs finish (SIGQUIT)
+    Graceful,
+    /// Take no new jobs, stop running jobs and report them failed (SIGTERM/SIGINT)
+    Abort,
+}
+
+/// Requests a shutdown of a running daemon
+#[derive(Clone)]
+pub struct ShutdownHandle(Arc<watch::Sender<Shutdown>>);
+
+impl ShutdownHandle {
+    /// Escalate the shutdown mode (a graceful request never undoes an abort)
+    pub fn request(&self, mode: Shutdown) {
+        self.0.send_if_modified(|current| {
+            let escalates = mode > *current;
+            if escalates {
+                *current = mode;
+            }
+            escalates
+        });
+    }
+}
+
+/// Resolve once an abort shutdown is requested
+async fn abort_requested(shutdown: &mut watch::Receiver<Shutdown>) {
+    // Drop the borrowed value right away: it must not be held across awaits
+    let _ = shutdown
+        .wait_for(|mode| *mode == Shutdown::Abort)
+        .await
+        .map(|_| ());
+}
+
+/// Interval between keep-alive updates that also detect remote cancellation
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct RunnerDaemon {
@@ -55,6 +107,8 @@ pub struct RunnerDaemon {
     executor: Arc<executor::ExecutorType>,
     semaphore: Arc<Semaphore>,
     scrubber: Arc<SecretScrubber>,
+    shutdown: Arc<watch::Sender<Shutdown>>,
+    heartbeat_interval: Duration,
 }
 
 impl RunnerDaemon {
@@ -80,7 +134,18 @@ impl RunnerDaemon {
             executor: Arc::new(executor),
             semaphore: Arc::new(Semaphore::new(concurrent)),
             scrubber: Arc::new(scrubber),
+            shutdown: Arc::new(watch::Sender::new(Shutdown::Running)),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
         }
+    }
+
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle(self.shutdown.clone())
+    }
+
+    async fn shutdown_requested(&self) {
+        let mut rx = self.shutdown.subscribe();
+        let _ = rx.wait_for(|mode| *mode != Shutdown::Running).await;
     }
 
     /// Start the runner daemon
@@ -91,8 +156,14 @@ impl RunnerDaemon {
         info!("   Cache enabled: {}", self.config.cache_enabled);
 
         loop {
-            // Request a job only when a slot is free
-            match claim_job(&self.semaphore, &self.gitlab, &self.config.runner_token).await {
+            // Wait for a free slot; a shutdown interrupts only this wait and the
+            // sleeps, never a job request GitLab may already have answered
+            let permit = tokio::select! {
+                permit = self.semaphore.clone().acquire_owned() => permit?,
+                _ = self.shutdown_requested() => break,
+            };
+            let claimed = claim_with_permit(permit, &self.gitlab, &self.config.runner_token).await;
+            let idle = match claimed {
                 Ok(Some((job, permit))) => {
                     let job_name = job
                         .job_info
@@ -101,7 +172,6 @@ impl RunnerDaemon {
                         .unwrap_or("unknown");
                     info!("📦 Received job #{} ({})", job.id, job_name);
 
-                    // Execute job concurrently
                     let daemon = self.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -109,17 +179,26 @@ impl RunnerDaemon {
                             error!("Job execution failed: {}", e);
                         }
                     });
+                    false
                 }
-                Ok(None) => {
-                    // No jobs available, wait
-                    sleep(Duration::from_secs(self.config.check_interval)).await;
-                }
+                Ok(None) => true,
                 Err(e) => {
                     warn!("Failed to request job: {}", e);
-                    sleep(Duration::from_secs(self.config.check_interval)).await;
+                    true
+                }
+            };
+            if idle {
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(self.config.check_interval)) => {}
+                    _ = self.shutdown_requested() => break,
                 }
             }
         }
+
+        info!("⏳ Waiting for running jobs to finish...");
+        let _ = self.semaphore.acquire_many(self.config.concurrent).await;
+        info!("✅ Runner stopped");
+        Ok(())
     }
 
     /// Run a job end to end and always report a final state to GitLab
@@ -133,7 +212,10 @@ impl RunnerDaemon {
 
         // Mask the job token, dependency tokens and masked variables
         let scrubber = self.scrubber.with_job_secrets(&job);
-        let mut trace = TraceWriter::new(Some(&self.gitlab), job.id, &job.token, &scrubber);
+        let cancel = CancelSignal::default();
+        let mut trace = TraceWriter::new(Some(&self.gitlab), job.id, &job.token, &scrubber)
+            .with_cancel(cancel.clone());
+        let heartbeat = self.spawn_heartbeat(&job, cancel.clone());
         trace
             .write(&format!(
                 "Running with TurboCI {}\n",
@@ -149,6 +231,17 @@ impl RunnerDaemon {
             .await;
         self.upload_cache(&job, &mut trace, outcome.is_ok()).await;
         self.executor.cleanup(job.id).await;
+        heartbeat.abort();
+
+        // Jobs stopped by a runner shutdown are the runner's failure, not the user's
+        let stopped_by_shutdown = *self.shutdown.borrow() == Shutdown::Abort;
+        let outcome = outcome.map_err(|mut failure| {
+            if stopped_by_shutdown && failure.reason == FailureReason::JobCanceled {
+                failure.reason = FailureReason::RunnerSystemFailure;
+                failure.message = "the runner is shutting down".to_string();
+            }
+            failure
+        });
 
         let (state, reason, exit_code) = match &outcome {
             Ok(()) => {
@@ -167,9 +260,38 @@ impl RunnerDaemon {
         };
         trace.finish().await;
 
+        if cancel.state() == RemoteState::Aborted && !stopped_by_shutdown {
+            // Canceled in GitLab: it already has the final state and rejects updates
+            info!("🛑 Job #{} was canceled", job.id);
+            return Ok(());
+        }
         self.gitlab
             .update_job(job.id, &job.token, state, reason, exit_code)
             .await
+    }
+
+    /// Keep-alive for the job: learns about remote cancellation even when the job
+    /// prints nothing, and aborts the job when the runner is told to abort
+    fn spawn_heartbeat(&self, job: &Job, cancel: CancelSignal) -> tokio::task::JoinHandle<()> {
+        let gitlab = self.gitlab.clone();
+        let mut shutdown = self.shutdown.subscribe();
+        let interval = self.heartbeat_interval;
+        let (job_id, token) = (job.id, job.token.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sleep(interval) => {
+                        if let Ok(state) = gitlab.touch_job(job_id, &token).await {
+                            cancel.update(state);
+                        }
+                    }
+                    _ = abort_requested(&mut shutdown) => {
+                        cancel.update(RemoteState::Aborted);
+                        return;
+                    }
+                }
+            }
+        })
     }
 
     /// Create the workspace and restore cache and dependency artifacts into it
@@ -567,6 +689,85 @@ mod tests {
             trace
         );
         assert!(trace.contains("cached-dep"), "{}", trace);
+    }
+
+    #[tokio::test]
+    async fn job_canceled_in_gitlab_stops_and_runs_after_script() {
+        let server = MockServer::start().await;
+        // Keep-alive updates learn that the job is being canceled
+        Mock::given(method("PUT"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"state": "running"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).insert_header("Job-Status", "canceling"))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&server, dir.path()).await;
+        daemon.heartbeat_interval = Duration::from_millis(200);
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 41, "token": "job-token-41",
+            "steps": [
+                {"name": "script", "script": ["sleep 30"], "when": "on_success", "timeout": 60},
+                {"name": "after_script", "script": ["echo cleanup-ran"], "when": "always",
+                 "allow_failure": true, "timeout": 10}
+            ]
+        }))
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        daemon.execute_job(job).await.unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let trace = trace_of(&server, 41).await;
+        assert!(trace.contains("cleanup-ran"), "{}", trace);
+        assert!(trace.contains("ERROR: Job failed: canceled"), "{}", trace);
+    }
+
+    #[tokio::test]
+    async fn abort_shutdown_fails_running_job_as_runner_failure() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let job = lifecycle_job(51, &["sleep 30"], "on_success");
+        let handle = daemon.shutdown_handle();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(500)).await;
+            handle.request(Shutdown::Abort);
+        });
+
+        let started = std::time::Instant::now();
+        daemon.execute_job(job).await.unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let update = final_update(&server, 51).await;
+        assert_eq!(update["state"], "failed");
+        assert_eq!(update["failure_reason"], "runner_system_failure");
+        assert!(trace_of(&server, 51)
+            .await
+            .contains("the runner is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn start_returns_after_shutdown_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let handle = daemon.shutdown_handle();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(300)).await;
+            handle.request(Shutdown::Graceful);
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), daemon.start())
+            .await
+            .expect("daemon stopped")
+            .unwrap();
     }
 
     #[tokio::test]

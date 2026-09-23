@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 use tracing::warn;
 
+use super::cancel::CancelSignal;
 use crate::gitlab::GitLabClient;
 use crate::security::secret_scrubber::{SecretScrubber, StreamScrubber};
 
@@ -25,6 +26,7 @@ pub struct TraceWriter<'a> {
     last_flush: Instant,
     limit: usize,
     truncated: bool,
+    cancel: CancelSignal,
 }
 
 impl<'a> TraceWriter<'a> {
@@ -45,7 +47,19 @@ impl<'a> TraceWriter<'a> {
             last_flush: Instant::now(),
             limit: DEFAULT_LIMIT,
             truncated: false,
+            cancel: CancelSignal::default(),
         }
+    }
+
+    /// Share `cancel` so remote cancellation seen on trace responses reaches the job
+    pub fn with_cancel(mut self, cancel: CancelSignal) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// The job's cancellation signal
+    pub fn cancel(&self) -> CancelSignal {
+        self.cancel.clone()
     }
 
     #[cfg(test)]
@@ -86,7 +100,14 @@ impl<'a> TraceWriter<'a> {
             .await
         {
             // On success this is the end of what we sent; on 416 it is what GitLab has
-            Ok(offset) => self.sent = offset.min(self.trace.len()),
+            Ok(patch) => {
+                self.sent = patch.offset.min(self.trace.len());
+                self.cancel.update(patch.remote);
+                if patch.remote == crate::gitlab::RemoteState::Aborted {
+                    // GitLab no longer accepts output for this job
+                    self.sent = self.trace.len();
+                }
+            }
             Err(e) => warn!("Failed to send trace for job #{}: {}", self.job_id, e),
         }
         self.sent >= self.trace.len()

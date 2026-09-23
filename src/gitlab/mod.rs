@@ -214,7 +214,7 @@ impl GitLabClient {
         let url = format!("{}/api/v4/jobs/{}", self.url, job_id);
 
         let mut body = serde_json::json!({ "token": token, "state": state });
-        if let Some(reason) = failure_reason {
+        if let Some(reason) = failure_reason.filter(|r| *r != FailureReason::JobCanceled) {
             body["failure_reason"] = serde_json::to_value(reason)?;
         }
         if let Some(code) = exit_code {
@@ -262,9 +262,12 @@ impl GitLabClient {
         token: &str,
         trace: &[u8],
         offset: usize,
-    ) -> Result<usize> {
+    ) -> Result<TracePatch> {
         if trace.is_empty() {
-            return Ok(offset);
+            return Ok(TracePatch {
+                offset,
+                remote: RemoteState::Running,
+            });
         }
         let url = format!("{}/api/v4/jobs/{}/trace", self.url, job_id);
         let end_offset = offset + trace.len();
@@ -284,24 +287,32 @@ impl GitLabClient {
                 .context("Failed to stream trace")?;
 
             let status = response.status();
+            let remote = RemoteState::from_response(&response);
+
+            if status == StatusCode::FORBIDDEN {
+                // The job is no longer running (canceled, or not ours any more)
+                return Ok(TracePatch { offset, remote });
+            }
 
             // Handle 416 Range Not Satisfiable - parse server offset
-            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                if let Some(range_header) = response.headers().get("Range") {
-                    if let Ok(range_str) = range_header.to_str() {
-                        // Parse "0-123" format - take end offset
-                        if let Some((_start, end)) = range_str.split_once('-') {
-                            if let Ok(server_offset) = end.parse::<usize>() {
-                                debug!(
-                                    "Range mismatch: server at {}, we sent {}-{}",
-                                    server_offset,
-                                    offset,
-                                    end_offset - 1
-                                );
-                                return Ok(server_offset);
-                            }
-                        }
-                    }
+            if status == StatusCode::RANGE_NOT_SATISFIABLE {
+                if let Some(server_offset) = response
+                    .headers()
+                    .get("Range")
+                    .and_then(|range| range.to_str().ok())
+                    .and_then(|range| range.split_once('-'))
+                    .and_then(|(_, end)| end.parse::<usize>().ok())
+                {
+                    debug!(
+                        "Range mismatch: server at {}, we sent {}-{}",
+                        server_offset,
+                        offset,
+                        end_offset - 1
+                    );
+                    return Ok(TracePatch {
+                        offset: server_offset,
+                        remote,
+                    });
                 }
                 warn!("Range mismatch but couldn't parse server offset");
                 return Err(anyhow::anyhow!("Range mismatch: {}", status));
@@ -317,9 +328,25 @@ impl GitLabClient {
                 return Err(anyhow::anyhow!("Trace streaming failed: {}", status));
             }
 
-            Ok(end_offset)
+            Ok(TracePatch {
+                offset: end_offset,
+                remote,
+            })
         })
         .await
+    }
+
+    /// Tell GitLab the job is still running (a keep-alive for jobs with no new
+    /// output) and learn whether it has been canceled meanwhile
+    pub async fn touch_job(&self, job_id: u64, token: &str) -> Result<RemoteState> {
+        let response = self
+            .client
+            .put(format!("{}/api/v4/jobs/{}", self.url, job_id))
+            .json(&serde_json::json!({ "token": token, "state": "running" }))
+            .send()
+            .await
+            .context("Failed to touch job")?;
+        Ok(RemoteState::from_response(&response))
     }
 
     /// Upload an artifacts archive as gitlab-runner does: multipart `file` field,
@@ -480,6 +507,8 @@ impl RunnerFeatures {
             raw_variables: true,
             multi_build_steps: true,
             return_exit_code: true,
+            cancelable: true,
+            cancel_gracefully: true,
             ..Self::default()
         }
     }
@@ -729,6 +758,42 @@ pub struct ArtifactUpload {
     pub expire_in: Option<String>,
 }
 
+/// What GitLab says about a running job, from the `Job-Status` header of trace
+/// and update responses (as gitlab-runner interprets it)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RemoteState {
+    Running,
+    /// Canceled in the UI: stop the script, still run after_script
+    Canceling,
+    /// Canceled, failed or no longer ours: stop everything
+    Aborted,
+}
+
+impl RemoteState {
+    fn from_response(response: &reqwest::Response) -> Self {
+        if response.status() == StatusCode::FORBIDDEN {
+            return RemoteState::Aborted;
+        }
+        match response
+            .headers()
+            .get("Job-Status")
+            .and_then(|value| value.to_str().ok())
+        {
+            Some("canceling") => RemoteState::Canceling,
+            Some("canceled") | Some("failed") => RemoteState::Aborted,
+            _ => RemoteState::Running,
+        }
+    }
+}
+
+/// Result of appending to the trace
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TracePatch {
+    /// End of what GitLab has; after a 416 this is where to resend from
+    pub offset: usize,
+    pub remote: RemoteState,
+}
+
 /// Why a job failed, as GitLab expects it in `failure_reason`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -737,6 +802,8 @@ pub enum FailureReason {
     RunnerSystemFailure,
     JobExecutionTimeout,
     ImagePullFailure,
+    /// Runner-internal (like gitlab-runner's job_canceled): never sent to GitLab
+    JobCanceled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -946,6 +1013,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trace_and_touch_report_remote_cancellation() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(202).insert_header("Job-Status", "canceling"))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Job-Status", "canceled"))
+            .mount(&server)
+            .await;
+        let client = client(&server);
+
+        let patch = client.patch_trace(7, "t", b"x", 0).await.unwrap();
+        assert_eq!(patch.remote, RemoteState::Canceling);
+        assert_eq!(patch.offset, 1);
+        assert_eq!(
+            client.touch_job(7, "t").await.unwrap(),
+            RemoteState::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_forbidden_means_job_is_gone() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let patch = client(&server).patch_trace(7, "t", b"x", 0).await.unwrap();
+
+        assert_eq!(patch.remote, RemoteState::Aborted);
+        assert_eq!(patch.offset, 0);
+    }
+
+    #[tokio::test]
     async fn request_job_fails_on_forbidden() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -974,7 +1078,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(next, 15);
+        assert_eq!(next.offset, 15);
+        assert_eq!(next.remote, RemoteState::Running);
     }
 
     #[tokio::test]
@@ -991,7 +1096,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(next, 3);
+        assert_eq!(next.offset, 3);
     }
 
     #[tokio::test]

@@ -189,6 +189,14 @@ sudo systemctl stop turboci
 sudo systemctl disable --now turboci
 ```
 
+`systemctl stop`/`restart` send SIGTERM: running jobs are stopped, cleaned up
+and reported as failed (runner system failure). To let running jobs finish
+first, send SIGQUIT and wait for the service to exit:
+
+```bash
+sudo systemctl kill -s SIGQUIT turboci
+```
+
 ## 🗑️ Uninstallation
 
 ```bash

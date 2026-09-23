@@ -20,10 +20,11 @@ use tokio::process::Command;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+use super::cancel::CancelSignal;
 use super::git::{self, GitStrategy};
 use super::script::{self, JobEnv};
 use super::trace::TraceWriter;
-use crate::gitlab::{FailureReason, Job};
+use crate::gitlab::{FailureReason, Job, RemoteState};
 
 /// Used when GitLab sends no job timeout
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -95,6 +96,14 @@ impl ExecutorType {
 enum RunStatus {
     Exited(i32),
     TimedOut,
+    Canceled,
+}
+
+/// A script run stops at its deadline or once cancellation reaches `stop_at`
+struct Limits<'a> {
+    deadline: Instant,
+    cancel: &'a CancelSignal,
+    stop_at: RemoteState,
 }
 
 /// How an executor runs a shell script in a directory, streaming output to the trace
@@ -105,7 +114,7 @@ trait ScriptRunner: Send + Sync {
         script: &str,
         workdir: &str,
         trace: &mut TraceWriter<'_>,
-        deadline: Instant,
+        limits: &Limits<'_>,
     ) -> Result<RunStatus>;
 }
 
@@ -129,20 +138,39 @@ async fn run_job_steps(
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_JOB_TIMEOUT);
     let deadline = Instant::now() + timeout;
+    let cancel = trace.cancel();
+    let canceled = || JobFailure {
+        reason: FailureReason::JobCanceled,
+        exit_code: None,
+        message: "canceled".to_string(),
+    };
     let timed_out = || JobFailure {
         reason: FailureReason::JobExecutionTimeout,
         exit_code: None,
         message: format!("execution took longer than {}s", timeout.as_secs()),
     };
 
-    let mut failure = match get_sources(job, runner, trace, dirs, deadline).await {
+    let script_limits = Limits {
+        deadline,
+        cancel: &cancel,
+        stop_at: RemoteState::Canceling,
+    };
+    let mut failure = match get_sources(job, runner, trace, dirs, &script_limits).await {
         Ok(()) => None,
         Err(RunError::TimedOut) => Some(timed_out()),
+        Err(RunError::Canceled) => Some(canceled()),
         Err(RunError::Failed(f)) => Some(f),
     };
 
     for step in &job.steps {
+        if cancel.state() == RemoteState::Aborted {
+            failure.get_or_insert_with(canceled);
+            break;
+        }
         let is_after_script = step.name == "after_script";
+        if !is_after_script && cancel.state() != RemoteState::Running {
+            failure.get_or_insert_with(canceled);
+        }
         let should_run = match step.when.as_str() {
             "always" => true,
             "on_failure" => failure.is_some(),
@@ -158,15 +186,21 @@ async fn run_job_steps(
             continue;
         }
 
-        let step_deadline = if is_after_script {
+        // after_script still runs when the job is being canceled (canceling), and
+        // only stops when it is aborted
+        let limits = if is_after_script {
             trace.write("\nRunning after_script\n").await;
             let secs = u64::from(step.timeout);
-            Instant::now()
-                + if secs > 0 {
-                    Duration::from_secs(secs)
-                } else {
-                    DEFAULT_AFTER_SCRIPT_TIMEOUT
-                }
+            Limits {
+                deadline: Instant::now()
+                    + if secs > 0 {
+                        Duration::from_secs(secs)
+                    } else {
+                        DEFAULT_AFTER_SCRIPT_TIMEOUT
+                    },
+                cancel: &cancel,
+                stop_at: RemoteState::Aborted,
+            }
         } else {
             trace
                 .write(&format!(
@@ -174,16 +208,15 @@ async fn run_job_steps(
                     step.name
                 ))
                 .await;
-            deadline
+            Limits {
+                deadline,
+                cancel: &cancel,
+                stop_at: RemoteState::Canceling,
+            }
         };
 
         let result = runner
-            .run(
-                &script::step_script(&lines),
-                &dirs.project,
-                trace,
-                step_deadline,
-            )
+            .run(&script::step_script(&lines), &dirs.project, trace, &limits)
             .await;
         match result {
             Ok(RunStatus::Exited(0)) => {}
@@ -208,6 +241,12 @@ async fn run_job_steps(
             Ok(RunStatus::TimedOut) => {
                 failure.get_or_insert_with(timed_out);
             }
+            Ok(RunStatus::Canceled) if is_after_script => {
+                trace.write("WARNING: after_script canceled\n").await;
+            }
+            Ok(RunStatus::Canceled) => {
+                failure.get_or_insert_with(canceled);
+            }
             Err(e) if is_after_script => {
                 trace
                     .write(&format!("WARNING: after_script could not run: {}\n", e))
@@ -224,6 +263,7 @@ async fn run_job_steps(
 
 enum RunError {
     TimedOut,
+    Canceled,
     Failed(JobFailure),
 }
 
@@ -232,7 +272,7 @@ async fn get_sources(
     runner: &dyn ScriptRunner,
     trace: &mut TraceWriter<'_>,
     dirs: &JobDirs,
-    deadline: Instant,
+    limits: &Limits<'_>,
 ) -> std::result::Result<(), RunError> {
     let Some(ref git_info) = job.git_info else {
         return Ok(());
@@ -262,12 +302,7 @@ async fn get_sources(
         .await;
 
     match runner
-        .run(
-            &script::argv_script(&commands),
-            &dirs.builds,
-            trace,
-            deadline,
-        )
+        .run(&script::argv_script(&commands), &dirs.builds, trace, limits)
         .await
     {
         Ok(RunStatus::Exited(0)) => Ok(()),
@@ -277,6 +312,7 @@ async fn get_sources(
             message: format!("getting sources failed with exit code {}", code),
         })),
         Ok(RunStatus::TimedOut) => Err(RunError::TimedOut),
+        Ok(RunStatus::Canceled) => Err(RunError::Canceled),
         Err(e) => Err(RunError::Failed(JobFailure::system(format!("{:#}", e)))),
     }
 }
@@ -541,7 +577,7 @@ impl ScriptRunner for DockerRunner<'_> {
         script: &str,
         workdir: &str,
         trace: &mut TraceWriter<'_>,
-        deadline: Instant,
+        limits: &Limits<'_>,
     ) -> Result<RunStatus> {
         let exec = self
             .docker
@@ -565,8 +601,12 @@ impl ScriptRunner for DockerRunner<'_> {
             self.docker.start_exec(&exec.id, None).await?
         {
             loop {
-                let chunk = match tokio::time::timeout_at(deadline, output.next()).await {
-                    // The exec keeps running until the container is removed
+                // On timeout or cancel the exec keeps running until the container is removed
+                let next = tokio::select! {
+                    next = tokio::time::timeout_at(limits.deadline, output.next()) => next,
+                    _ = limits.cancel.reached(limits.stop_at) => return Ok(RunStatus::Canceled),
+                };
+                let chunk = match next {
                     Err(_) => return Ok(RunStatus::TimedOut),
                     Ok(None) => break,
                     Ok(Some(chunk)) => chunk?,
@@ -640,7 +680,7 @@ impl ScriptRunner for ShellRunner {
         script: &str,
         workdir: &str,
         trace: &mut TraceWriter<'_>,
-        deadline: Instant,
+        limits: &Limits<'_>,
     ) -> Result<RunStatus> {
         let mut command = Command::new("sh");
         command
@@ -674,10 +714,15 @@ impl ScriptRunner for ShellRunner {
                     0 => err_open = false,
                     n => trace.write(&stderr.decode(&err_buf[..n])).await,
                 },
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = tokio::time::sleep_until(limits.deadline) => {
                     kill_process_group(pid);
                     let _ = child.wait().await;
                     return Ok(RunStatus::TimedOut);
+                }
+                _ = limits.cancel.reached(limits.stop_at) => {
+                    kill_process_group(pid);
+                    let _ = child.wait().await;
+                    return Ok(RunStatus::Canceled);
                 }
             }
         }
@@ -686,10 +731,15 @@ impl ScriptRunner for ShellRunner {
 
         let status = tokio::select! {
             status = child.wait() => status?,
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(limits.deadline) => {
                 kill_process_group(pid);
                 let _ = child.wait().await;
                 return Ok(RunStatus::TimedOut);
+            }
+            _ = limits.cancel.reached(limits.stop_at) => {
+                kill_process_group(pid);
+                let _ = child.wait().await;
+                return Ok(RunStatus::Canceled);
             }
         };
         Ok(RunStatus::Exited(status.code().unwrap_or(-1)))
@@ -800,6 +850,58 @@ mod tests {
         assert!(log.contains("after-timeout"), "{}", log);
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(!marker.exists(), "background process outlived the timeout");
+    }
+
+    async fn run_shell_canceled(
+        job: &Job,
+        work_dir: &Path,
+        state: RemoteState,
+    ) -> (JobOutcome, String) {
+        let executor = ShellExecutor::new(Some(work_dir.to_string_lossy().into_owned()));
+        let scrubber = SecretScrubber::new(vec![]);
+        let cancel = CancelSignal::default();
+        let mut trace =
+            TraceWriter::new(None, job.id, &job.token, &scrubber).with_cancel(cancel.clone());
+        let trigger = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cancel.update(state);
+        });
+        let outcome = executor.execute(job, &mut trace).await;
+        trigger.await.unwrap();
+        trace.finish().await;
+        (outcome, trace.text())
+    }
+
+    #[tokio::test]
+    async fn canceling_stops_script_but_runs_after_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 5, "token": "t",
+            "steps": steps(&["echo started", "sleep 30", "echo not-reached"], &["echo cleanup-ran"])
+        }));
+
+        let started = std::time::Instant::now();
+        let (outcome, log) = run_shell_canceled(&j, dir.path(), RemoteState::Canceling).await;
+
+        assert_eq!(outcome.unwrap_err().reason, FailureReason::JobCanceled);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(log.contains("started"), "{}", log);
+        assert!(!log.contains("\nnot-reached"), "{}", log);
+        assert!(log.contains("cleanup-ran"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn abort_stops_everything_including_after_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 6, "token": "t",
+            "steps": steps(&["sleep 30"], &["echo cleanup-ran"])
+        }));
+
+        let (outcome, log) = run_shell_canceled(&j, dir.path(), RemoteState::Aborted).await;
+
+        assert_eq!(outcome.unwrap_err().reason, FailureReason::JobCanceled);
+        assert!(!log.contains("cleanup-ran"), "{}", log);
     }
 
     #[tokio::test]

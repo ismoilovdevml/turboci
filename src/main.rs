@@ -166,19 +166,9 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Start daemon with graceful shutdown
             let daemon = RunnerDaemon::new(runner_config, gitlab, executor);
-
-            // Handle shutdown signals (SIGTERM, SIGINT)
-            tokio::select! {
-                result = daemon.start() => {
-                    result?;
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("⚠️  Received SIGINT (Ctrl+C), shutting down gracefully...");
-                    info!("✅ Runner stopped");
-                }
-            }
+            spawn_signal_handler(daemon.shutdown_handle())?;
+            daemon.start().await?;
         }
         Commands::Hash { path } => {
             use cache::content_hash::ContentHasher;
@@ -305,5 +295,37 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// SIGQUIT: finish running jobs, then exit. SIGTERM/SIGINT: stop running jobs,
+/// report them failed and exit (the same signals gitlab-runner uses)
+#[cfg(feature = "runner")]
+fn spawn_signal_handler(shutdown: runner_daemon::ShutdownHandle) -> Result<()> {
+    use runner_daemon::Shutdown;
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut quit = signal(SignalKind::quit())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::spawn(async move {
+        loop {
+            let mode = tokio::select! {
+                _ = quit.recv() => {
+                    info!("⚠️  SIGQUIT: taking no new jobs, waiting for running jobs to finish");
+                    Shutdown::Graceful
+                }
+                _ = terminate.recv() => {
+                    info!("⚠️  SIGTERM: stopping running jobs");
+                    Shutdown::Abort
+                }
+                _ = interrupt.recv() => {
+                    info!("⚠️  SIGINT: stopping running jobs");
+                    Shutdown::Abort
+                }
+            };
+            shutdown.request(mode);
+        }
+    });
     Ok(())
 }
