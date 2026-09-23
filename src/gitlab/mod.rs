@@ -18,7 +18,6 @@ where
     }
 }
 
-#[cfg(feature = "runner")]
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -27,6 +26,8 @@ pub struct GitLabClient {
     url: String,
     #[allow(dead_code)]
     token: String,
+    /// Identifies this runner manager to GitLab; must stay the same across requests
+    system_id: String,
 }
 
 impl GitLabClient {
@@ -38,7 +39,14 @@ impl GitLabClient {
                 .unwrap_or_default(),
             url,
             token,
+            system_id: format!("r_{}", &Uuid::new_v4().simple().to_string()[..12]),
         }
+    }
+
+    /// Use a persisted system ID (see `runner_daemon::system_id`)
+    pub fn with_system_id(mut self, system_id: String) -> Self {
+        self.system_id = system_id;
+        self
     }
 
     /// Retry helper with exponential backoff (3 attempts)
@@ -76,11 +84,6 @@ impl GitLabClient {
 
         debug!("Requesting job from: {}", url);
 
-        #[cfg(feature = "runner")]
-        let system_id = format!("s_{}", Uuid::new_v4().simple());
-        #[cfg(not(feature = "runner"))]
-        let system_id = format!("s_{}", "default");
-
         let response = self
             .client
             .post(&url)
@@ -88,7 +91,7 @@ impl GitLabClient {
                 token: runner_token.to_string(),
                 last_update: None,
                 info: RunnerInfo::default(),
-                system_id,
+                system_id: self.system_id.clone(),
                 session: None,
             })
             .send()
@@ -717,6 +720,24 @@ mod tests {
         assert_eq!(job.id, 42);
         assert_eq!(job.token, "job-token");
         assert_eq!(job.steps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_job_sends_same_system_id_on_every_poll() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .and(body_partial_json(
+                serde_json::json!({"system_id": "s_0123456789ab"}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = client(&server).with_system_id("s_0123456789ab".to_string());
+
+        client.request_job("runner-token").await.unwrap();
+        client.request_job("runner-token").await.unwrap();
     }
 
     #[tokio::test]

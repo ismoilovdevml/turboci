@@ -132,11 +132,16 @@ async fn main() -> Result<()> {
             info!("🚀 Starting TurboCI Runner Daemon...");
             let runner_config = runner_daemon::config::RunnerConfig::load(&config)?;
 
-            // Initialize GitLab client
+            // Initialize GitLab client with a system ID that survives restarts
+            let system_id = runner_daemon::system_id::load_or_create(
+                &std::path::Path::new(&config).with_file_name(".runner_system_id"),
+            );
+            info!("   System ID: {}", system_id);
             let gitlab = GitLabClient::new(
                 runner_config.gitlab_url.clone(),
                 runner_config.runner_token.clone(),
-            );
+            )
+            .with_system_id(system_id);
 
             // Initialize storage
             let redis = RedisStorage::new(&runner_config.redis_url, 3600).await?;

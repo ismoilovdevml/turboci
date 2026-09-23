@@ -13,6 +13,7 @@ pub mod artifacts;
 pub mod config;
 pub mod executor;
 pub mod git;
+pub mod system_id;
 
 #[derive(Clone)]
 pub struct RunnerDaemon {
