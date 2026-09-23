@@ -815,6 +815,67 @@ mod tests {
         assert!(outcome.is_ok());
     }
 
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_executor_runs_job_and_cleans_up() {
+        let executor =
+            ExecutorType::Docker(DockerExecutor::new("alpine:3.20".to_string()).unwrap());
+        let job_id = 900_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "variables": [
+                {"key": "GREETING", "value": "hello"},
+                {"key": "API_KEY", "value": "top-secret-key", "masked": true},
+                {"key": "CONFIG", "value": "file-content", "file": true}
+            ],
+            "steps": steps(
+                &[
+                    "cd /tmp",
+                    "echo \"$GREETING from $PWD as $(id -u)\"",
+                    "echo key=$API_KEY",
+                    "cat \"$CONFIG\"",
+                    "mkdir -p \"$CI_PROJECT_DIR/out\" && echo artifact > \"$CI_PROJECT_DIR/out/a.txt\"",
+                    "exit 4"
+                ],
+                &["echo after-ran"]
+            )
+        }));
+        let scrubber = SecretScrubber::new(vec![]).with_job_secrets(&j);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(failure.reason, FailureReason::ScriptFailure, "{}", log);
+        assert_eq!(failure.exit_code, Some(4), "{}", log);
+        assert!(log.contains("hello from /tmp as 0"), "{}", log);
+        assert!(log.contains("key=[MASKED]"), "{}", log);
+        assert!(!log.contains("top-secret-key"));
+        assert!(log.contains("file-content"), "{}", log);
+        assert!(log.contains("after-ran"), "{}", log);
+
+        // Files the container created as root are left for artifact upload...
+        let job_dir = executor.job_dir(job_id);
+        assert_eq!(
+            std::fs::read_to_string(job_dir.join("project/out/a.txt")).unwrap(),
+            "artifact\n"
+        );
+        // ...the container is gone...
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        assert!(docker
+            .inspect_container(
+                &format!("turboci-job-{}", job_id),
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .is_err());
+        // ...and the runner's user can delete the workspace
+        executor.cleanup(job_id).await;
+        assert!(!job_dir.exists());
+    }
+
     #[test]
     fn utf8_decoder_keeps_characters_split_across_chunks() {
         let text = "ok ✓ done";

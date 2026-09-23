@@ -76,3 +76,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
       - run: cargo build --locked --release --all-features --target x86_64-unknown-linux-musl
+
+  docker-integration:
+    name: Docker executor integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-all-features
+          save-if: false
+      # Tests marked #[ignore] need a Docker daemon, which GitHub's Ubuntu runners have
+      - run: cargo test --locked --all-features -- --ignored
