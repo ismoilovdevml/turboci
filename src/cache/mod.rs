@@ -115,10 +115,20 @@ impl CacheManager {
         Ok(exists)
     }
 
-    /// Clear all cache entries
+    /// Clear TurboCI's build cache entries (`build:*`), leaving other data in the
+    /// Redis database alone
     pub async fn clear(&self) -> Result<()> {
         let mut conn = (*self.redis_client).clone();
-        let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await?;
+        let mut keys: Vec<String> = Vec::new();
+        {
+            let mut iter: redis::AsyncIter<String> = conn.scan_match("build:*").await?;
+            while let Some(key) = iter.next_item().await {
+                keys.push(key?);
+            }
+        }
+        for batch in keys.chunks(500) {
+            let _: () = conn.del(batch).await?;
+        }
 
         let mut stats = self.stats.lock().await;
         *stats = CacheStats::default();

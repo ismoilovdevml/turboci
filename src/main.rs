@@ -7,10 +7,6 @@ mod config;
 mod optimizer;
 mod runner;
 
-// API module (optional)
-#[cfg(feature = "api")]
-mod api;
-
 // Runner modules (optional, for future)
 #[cfg(feature = "runner")]
 mod gitlab;

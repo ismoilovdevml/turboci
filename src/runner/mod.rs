@@ -186,23 +186,30 @@ impl ParallelRunner {
         let stdout = child.stdout.take().context("Failed to capture stdout")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
 
-        let mut output = String::new();
-
-        // Read stdout
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        while let Some(line) = stdout_reader.next_line().await? {
-            println!("    {}", line);
-            output.push_str(&line);
-            output.push('\n');
-        }
-
-        // Read stderr
-        let mut stderr_reader = BufReader::new(stderr).lines();
-        while let Some(line) = stderr_reader.next_line().await? {
-            eprintln!("    {}", line);
-            output.push_str(&line);
-            output.push('\n');
-        }
+        // Read both pipes at the same time: a child blocked on a full stderr pipe
+        // would never close stdout
+        let read_stdout = async {
+            let mut out = String::new();
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next_line().await? {
+                println!("    {}", line);
+                out.push_str(&line);
+                out.push('\n');
+            }
+            anyhow::Ok(out)
+        };
+        let read_stderr = async {
+            let mut out = String::new();
+            let mut lines = BufReader::new(stderr).lines();
+            while let Some(line) = lines.next_line().await? {
+                eprintln!("    {}", line);
+                out.push_str(&line);
+                out.push('\n');
+            }
+            anyhow::Ok(out)
+        };
+        let (out, err) = tokio::try_join!(read_stdout, read_stderr)?;
+        let output = out + &err;
 
         let status = child.wait().await?;
 
@@ -281,5 +288,24 @@ mod tests {
 
         let result = ParallelRunner::execute_step(&step).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn large_stderr_before_stdout_does_not_hang() {
+        let step = Step {
+            name: "Noisy".to_string(),
+            // ~200KB on stderr (more than a pipe buffer) before any stdout
+            run: "i=0; while [ $i -lt 4000 ]; do echo 'err line padded to fifty bytes.............' >&2; i=$((i+1)); done; echo done".to_string(),
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            ParallelRunner::execute_step(&step),
+        )
+        .await
+        .expect("step hung on a full stderr pipe")
+        .unwrap();
+
+        assert!(result.starts_with("done\n"));
     }
 }
