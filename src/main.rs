@@ -136,7 +136,8 @@ async fn main() -> Result<()> {
                 runner_config.gitlab_url.clone(),
                 runner_config.runner_token.clone(),
             )
-            .with_system_id(system_id);
+            .with_system_id(system_id)
+            .with_executor(&runner_config.executor.executor_type);
 
             // Initialize executor based on config
             let executor = match runner_config.executor.executor_type.as_str() {

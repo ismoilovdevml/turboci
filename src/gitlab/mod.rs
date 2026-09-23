@@ -58,6 +58,8 @@ pub struct GitLabClient {
     token: String,
     /// Identifies this runner manager to GitLab; must stay the same across requests
     system_id: String,
+    /// Executor name reported to GitLab ("docker" or "shell")
+    executor: String,
 }
 
 impl GitLabClient {
@@ -70,7 +72,14 @@ impl GitLabClient {
             url,
             token,
             system_id: format!("r_{}", &Uuid::new_v4().simple().to_string()[..12]),
+            executor: "docker".to_string(),
         }
+    }
+
+    /// Report the configured executor and its capabilities to GitLab
+    pub fn with_executor(mut self, executor: &str) -> Self {
+        self.executor = executor.to_string();
+        self
     }
 
     /// Use a persisted system ID (see `runner_daemon::system_id`)
@@ -120,7 +129,7 @@ impl GitLabClient {
             .json(&JobRequest {
                 token: runner_token.to_string(),
                 last_update: None,
-                info: RunnerInfo::default(),
+                info: RunnerInfo::new(&self.executor),
                 system_id: self.system_id.clone(),
                 session: None,
             })
@@ -423,53 +432,69 @@ struct RunnerInfo {
     features: Option<RunnerFeatures>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+/// Capabilities sent to GitLab with every job request (field names follow
+/// gitlab-runner's FeaturesInfo). Only what TurboCI implements is `true`, so
+/// GitLab does not route jobs that rely on missing features here.
+#[derive(Debug, Serialize, Clone, Default, PartialEq, Eq)]
 struct RunnerFeatures {
-    trace_checksum: bool,
-    trace_size: bool,
-    trace_reset: bool,
-    trace_update_interval: bool,
+    variables: bool,
+    image: bool,
+    services: bool,
+    artifacts: bool,
+    cache: bool,
+    fallback_cache_keys: bool,
+    shared: bool,
+    upload_multiple_artifacts: bool,
+    upload_raw_artifacts: bool,
     session: bool,
     terminal: bool,
     refspecs: bool,
-    multi_build_steps: bool,
-    vault_secrets: bool,
-    return_exit_code: bool,
+    masking: bool,
+    proxy: bool,
     raw_variables: bool,
     artifacts_exclude: bool,
-    cancelable_stages: bool,
+    multi_build_steps: bool,
+    trace_reset: bool,
+    trace_checksum: bool,
+    trace_size: bool,
+    vault_secrets: bool,
+    cancelable: bool,
+    return_exit_code: bool,
+    service_variables: bool,
+    cancel_gracefully: bool,
 }
 
-impl Default for RunnerFeatures {
-    fn default() -> Self {
+impl RunnerFeatures {
+    fn for_executor(executor: &str) -> Self {
         Self {
-            trace_checksum: true,
-            trace_size: true,
-            trace_reset: true,
-            trace_update_interval: true,
-            session: false,
-            terminal: false,
+            variables: true,
+            image: executor == "docker",
+            artifacts: true,
+            cache: true,
+            fallback_cache_keys: true,
+            shared: executor == "shell",
+            upload_multiple_artifacts: true,
+            upload_raw_artifacts: true,
             refspecs: true,
-            multi_build_steps: true,
-            vault_secrets: false,
-            return_exit_code: true,
+            masking: true,
             raw_variables: true,
-            artifacts_exclude: true,
-            cancelable_stages: false,
+            multi_build_steps: true,
+            return_exit_code: true,
+            ..Self::default()
         }
     }
 }
 
-impl Default for RunnerInfo {
-    fn default() -> Self {
+impl RunnerInfo {
+    fn new(executor: &str) -> Self {
         Self {
             name: "turboci-runner".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             revision: Some(env!("CARGO_PKG_VERSION").to_string()),
             platform: std::env::consts::OS.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
-            executor: "docker".to_string(),
-            features: Some(RunnerFeatures::default()),
+            executor: executor.to_string(),
+            features: Some(RunnerFeatures::for_executor(executor)),
         }
     }
 }
@@ -893,6 +918,31 @@ mod tests {
             .find(|r| r.method.as_str() == "PUT")
             .unwrap();
         assert!(!String::from_utf8_lossy(&update.body).contains("super-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn request_job_reports_executor_and_only_implemented_features() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .and(body_partial_json(serde_json::json!({"info": {
+                "executor": "shell",
+                "features": {
+                    "variables": true, "refspecs": true, "masking": true,
+                    "return_exit_code": true, "image": false, "services": false,
+                    "trace_checksum": false, "trace_reset": false, "artifacts_exclude": false
+                }
+            }})))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .with_executor("shell")
+            .request_job("runner-token")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
