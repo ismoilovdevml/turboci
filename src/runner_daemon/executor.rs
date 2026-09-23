@@ -132,6 +132,7 @@ struct JobDirs {
 /// has its own timeout and never changes the job result.
 async fn run_job_steps(
     job: &Job,
+    sources: &dyn ScriptRunner,
     runner: &dyn ScriptRunner,
     trace: &mut TraceWriter<'_>,
     dirs: &JobDirs,
@@ -158,7 +159,7 @@ async fn run_job_steps(
         cancel: &cancel,
         stop_at: RemoteState::Canceling,
     };
-    let mut failure = match get_sources(job, runner, trace, dirs, &script_limits).await {
+    let mut failure = match get_sources(job, sources, trace, dirs, &script_limits).await {
         Ok(()) => None,
         Err(RunError::TimedOut) => Some(timed_out()),
         Err(RunError::Canceled) => Some(canceled()),
@@ -381,6 +382,8 @@ impl std::fmt::Debug for DockerExecutor {
 #[derive(Default)]
 struct JobContainers {
     network: Option<String>,
+    /// Checks out sources, so job images do not need git (like gitlab-runner's helper)
+    helper: Option<String>,
     services: Vec<String>,
     job: Option<String>,
 }
@@ -432,6 +435,17 @@ impl DockerExecutor {
             .await
             .map_err(|e| JobFailure::system(format!("Failed to create host workspace: {}", e)))?;
 
+        if job.git_info.is_some() && git::strategy(&job.variables) != GitStrategy::None {
+            let helper = self.config.helper_image.clone();
+            self.ensure_image(&helper, &["if-not-present".to_string()], job, trace)
+                .await?;
+            let id = self
+                .start_helper(job, job_dir, &env)
+                .await
+                .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+            containers.helper = Some(id);
+        }
+
         // Services need a network of their own to be reachable by alias
         if !job.services.is_empty() {
             let network = format!("turboci-job-{}", job.id);
@@ -458,6 +472,8 @@ impl DockerExecutor {
             image: Some(image.clone()),
             working_dir: Some("/builds".to_string()),
             env: Some(env.to_docker()),
+            // `image: {entrypoint: [""]}` clears an entrypoint that is not a shell
+            entrypoint: job.image.as_ref().and_then(|img| img.entrypoint.clone()),
             // Keep the container alive for the whole job; steps run as execs
             cmd: Some(vec![
                 "sh".to_string(),
@@ -492,11 +508,44 @@ impl DockerExecutor {
             container_id: &id,
             env: env.to_docker(),
         };
+        let helper_id = containers.helper.clone().unwrap_or_else(|| id.clone());
+        let sources = DockerRunner {
+            docker: &self.docker,
+            container_id: &helper_id,
+            env: env.to_docker(),
+        };
         let dirs = JobDirs {
             builds: "/builds".to_string(),
             project: "/builds/project".to_string(),
         };
-        run_job_steps(job, &runner, trace, &dirs).await
+        run_job_steps(job, &sources, &runner, trace, &dirs).await
+    }
+
+    /// Start the container that checks out sources, with the workspace mounted
+    async fn start_helper(&self, job: &Job, job_dir: &Path, env: &JobEnv) -> Result<String> {
+        let config = ContainerCreateBody {
+            image: Some(self.config.helper_image.clone()),
+            working_dir: Some("/builds".to_string()),
+            env: Some(env.to_docker()),
+            // Helper images may have their own entrypoint (alpine/git's is `git`)
+            entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+            cmd: Some(vec!["while :; do sleep 3600; done".to_string()]),
+            host_config: Some(HostConfig {
+                binds: Some(vec![format!("{}:/builds", job_dir.display())]),
+                network_mode: Some(self.config.network_mode.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = self
+            .create_named(&format!("turboci-job-{}-sources", job.id), config)
+            .await?;
+        use bollard::container::StartContainerOptions;
+        self.docker
+            .start_container(&id, None::<StartContainerOptions<String>>)
+            .await
+            .context("Failed to start helper container")?;
+        Ok(id)
     }
 
     /// Host settings shared by job and service containers
@@ -674,7 +723,12 @@ impl DockerExecutor {
             }
         }
 
-        for id in containers.job.iter().chain(&containers.services) {
+        for id in containers
+            .job
+            .iter()
+            .chain(&containers.helper)
+            .chain(&containers.services)
+        {
             match self
                 .docker
                 .remove_container(
@@ -822,7 +876,7 @@ impl ShellExecutor {
             .map_err(JobFailure::system)?;
 
         let runner = ShellRunner { env: env.vars };
-        run_job_steps(job, &runner, trace, &dirs).await
+        run_job_steps(job, &runner, &runner, trace, &dirs).await
     }
 }
 
@@ -1196,6 +1250,86 @@ mod tests {
             .inspect_network(
                 &format!("turboci-job-{}", job_id),
                 None::<bollard::query_parameters::InspectNetworkOptions>
+            )
+            .await
+            .is_err());
+        executor.cleanup(job_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_executor_checks_out_sources_without_git_in_job_image() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 920_000_000 + u64::from(std::process::id());
+        let job_dir = executor.job_dir(job_id);
+
+        // Origin repository inside the workspace, visible to containers as /builds/origin.git
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let work = job_dir.join("origin-work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "hello from git\n").unwrap();
+        git(&work, &["add", "file.txt"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        let sha = git(&work, &["rev-parse", "HEAD"]);
+        git(
+            &job_dir,
+            &["clone", "-q", "--bare", "origin-work", "origin.git"],
+        );
+
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "alpine:3.20"},
+            "git_info": {
+                "repo_url": "file:///builds/origin.git", "ref": "main", "ref_type": "branch",
+                "sha": sha, "before_sha": "", "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]
+            },
+            // The origin repo belongs to the host user, not root in the helper
+            "variables": [
+                {"key": "GIT_CONFIG_COUNT", "value": "1"},
+                {"key": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+                {"key": "GIT_CONFIG_VALUE_0", "value": "*"}
+            ],
+            "steps": steps(&["cat file.txt", "command -v git || echo no-git-in-job-image"], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("hello from git"), "{}", log);
+        assert!(log.contains("no-git-in-job-image"), "{}", log);
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        assert!(docker
+            .inspect_container(
+                &format!("turboci-job-{}-sources", job_id),
+                None::<bollard::query_parameters::InspectContainerOptions>
             )
             .await
             .is_err());

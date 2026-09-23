@@ -48,6 +48,9 @@ network_mode = "bridge"
 # A job's image:pull_policy overrides it.
 pull_policy = "always"
 
+# Image with git and sh that checks out sources, so job images need neither
+helper_image = "alpine/git:latest"
+
 # Resource limits per container (job and services); unset = no limit
 # memory = "2g"
 # cpus = 2.0

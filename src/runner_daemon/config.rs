@@ -51,6 +51,8 @@ pub struct DockerConfig {
     pub network_mode: String,
     /// "always", "if-not-present" or "never" (a job's image:pull_policy overrides it)
     pub pull_policy: String,
+    /// Image with git and sh that checks out sources (job images need neither)
+    pub helper_image: String,
     /// Memory limit per container, e.g. "2g" or "512m"
     pub memory: Option<String>,
     /// CPU limit per container, e.g. 1.5
@@ -161,6 +163,7 @@ impl Default for DockerConfig {
             volumes: vec![],
             network_mode: "bridge".to_string(),
             pull_policy: "always".to_string(),
+            helper_image: "alpine/git:latest".to_string(),
             memory: None,
             cpus: None,
         }
