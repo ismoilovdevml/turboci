@@ -82,12 +82,19 @@ impl ExecutorType {
     }
 
     /// Check out sources and run the job's steps, writing output to `trace`
-    pub async fn execute(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
+    pub async fn execute(
+        &self,
+        job: &Job,
+        trace: &mut TraceWriter<'_>,
+        restore: &dyn Restore,
+    ) -> JobOutcome {
         match self {
             ExecutorType::Docker(executor) => {
-                executor.execute(job, &self.job_dir(job.id), trace).await
+                executor
+                    .execute(job, &self.job_dir(job.id), trace, restore)
+                    .await
             }
-            ExecutorType::Shell(executor) => executor.execute(job, trace).await,
+            ExecutorType::Shell(executor) => executor.execute(job, trace, restore).await,
         }
     }
 
@@ -99,6 +106,26 @@ impl ExecutorType {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!("Failed to remove workspace {}: {}", dir.display(), e),
         }
+    }
+}
+
+/// Restores cache and dependency artifacts into the project, after sources are
+/// checked out and before the scripts run (gitlab-runner's order: otherwise
+/// `git checkout -f` would revert restored tracked files)
+#[async_trait]
+pub trait Restore: Send + Sync {
+    async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome;
+}
+
+/// Nothing to restore
+#[cfg(test)]
+pub struct NoRestore;
+
+#[cfg(test)]
+#[async_trait]
+impl Restore for NoRestore {
+    async fn restore(&self, _job: &Job, _trace: &mut TraceWriter<'_>) -> JobOutcome {
+        Ok(())
     }
 }
 
@@ -144,6 +171,7 @@ async fn run_job_steps(
     runner: &dyn ScriptRunner,
     trace: &mut TraceWriter<'_>,
     dirs: &JobDirs,
+    restore: &dyn Restore,
 ) -> JobOutcome {
     let timeout = job
         .timeout_secs()
@@ -173,6 +201,9 @@ async fn run_job_steps(
         Err(RunError::Canceled) => Some(canceled()),
         Err(RunError::Failed(f)) => Some(f),
     };
+    if failure.is_none() {
+        failure = restore.restore(job, trace).await.err();
+    }
 
     for step in &job.steps {
         if cancel.state() == RemoteState::Aborted {
@@ -227,9 +258,17 @@ async fn run_job_steps(
             }
         };
 
-        let result = runner
-            .run(&script::step_script(&lines), &dirs.project, trace, &limits)
-            .await;
+        let mut script = script::step_script(&lines);
+        if is_after_script {
+            // Like gitlab-runner, after_script can tell how the job went
+            let status = match &failure {
+                None => "success",
+                Some(f) if f.reason == FailureReason::JobCanceled => "canceled",
+                Some(_) => "failed",
+            };
+            script = format!("export CI_JOB_STATUS={}\n{}", status, script);
+        }
+        let result = runner.run(&script, &dirs.project, trace, &limits).await;
         match result {
             Ok(RunStatus::Exited(0)) => {}
             Ok(RunStatus::Exited(code)) if step.allow_failure || is_after_script => {
@@ -314,7 +353,14 @@ async fn get_sources(
         .await;
 
     match runner
-        .run(&script::argv_script(&commands), &dirs.builds, trace, limits)
+        .run(
+            // Checked-out files must stay writable for the runner (restore) and
+            // for images with a non-root USER, as with gitlab-runner
+            &format!("umask 0000\n{}", script::argv_script(&commands)),
+            &dirs.builds,
+            trace,
+            limits,
+        )
         .await
     {
         Ok(RunStatus::Exited(0)) => Ok(()),
@@ -408,10 +454,16 @@ impl DockerExecutor {
         })
     }
 
-    async fn execute(&self, job: &Job, job_dir: &Path, trace: &mut TraceWriter<'_>) -> JobOutcome {
+    async fn execute(
+        &self,
+        job: &Job,
+        job_dir: &Path,
+        trace: &mut TraceWriter<'_>,
+        restore: &dyn Restore,
+    ) -> JobOutcome {
         let mut containers = JobContainers::default();
         let outcome = self
-            .start_and_run(job, job_dir, trace, &mut containers)
+            .start_and_run(job, job_dir, trace, &mut containers, restore)
             .await;
         // Always runs, including after failures, timeouts and cancellation
         self.release(job.id, &containers, job_dir).await;
@@ -424,6 +476,7 @@ impl DockerExecutor {
         job_dir: &Path,
         trace: &mut TraceWriter<'_>,
         containers: &mut JobContainers,
+        restore: &dyn Restore,
     ) -> JobOutcome {
         let env = script::job_env(job, "/builds", job_dir);
         // Image and service names may use variables, e.g. $CI_REGISTRY_IMAGE/ci
@@ -538,7 +591,7 @@ impl DockerExecutor {
             builds: "/builds".to_string(),
             project: "/builds/project".to_string(),
         };
-        run_job_steps(job, &sources, &runner, trace, &dirs).await
+        run_job_steps(job, &sources, &runner, trace, &dirs, restore).await
     }
 
     /// Start the container that checks out sources, with the workspace mounted
@@ -942,7 +995,12 @@ impl ShellExecutor {
         Path::new(&self.work_dir).join(format!("job-{}", job_id))
     }
 
-    async fn execute(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
+    async fn execute(
+        &self,
+        job: &Job,
+        trace: &mut TraceWriter<'_>,
+        restore: &dyn Restore,
+    ) -> JobOutcome {
         trace.write("Using Shell executor...\n").await;
 
         let job_dir = self.job_dir(job.id);
@@ -960,7 +1018,7 @@ impl ShellExecutor {
             .map_err(JobFailure::system)?;
 
         let runner = ShellRunner { env: env.vars };
-        run_job_steps(job, &runner, &runner, trace, &dirs).await
+        run_job_steps(job, &runner, &runner, trace, &dirs, restore).await
     }
 }
 
@@ -1061,7 +1119,7 @@ mod tests {
         let executor = ShellExecutor::new(Some(work_dir.to_string_lossy().into_owned()));
         let scrubber = SecretScrubber::new(vec![]).with_job_secrets(job);
         let mut trace = TraceWriter::new(None, job.id, &job.token, &scrubber);
-        let outcome = executor.execute(job, &mut trace).await;
+        let outcome = executor.execute(job, &mut trace, &NoRestore).await;
         trace.finish().await;
         (outcome, trace.text())
     }
@@ -1160,7 +1218,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
             cancel.update(state);
         });
-        let outcome = executor.execute(job, &mut trace).await;
+        let outcome = executor.execute(job, &mut trace, &NoRestore).await;
         trigger.await.unwrap();
         trace.finish().await;
         (outcome, trace.text())
@@ -1196,6 +1254,79 @@ mod tests {
 
         assert_eq!(outcome.unwrap_err().reason, FailureReason::JobCanceled);
         assert!(!log.contains("cleanup-ran"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn after_script_sees_job_status() {
+        for (script, expected) in [("true", "status=success"), ("exit 1", "status=failed")] {
+            let dir = tempfile::tempdir().unwrap();
+            let j = job(serde_json::json!({
+                "id": 7, "token": "t",
+                "steps": steps(&[script], &["echo status=$CI_JOB_STATUS"])
+            }));
+
+            let (_, log) = run_shell(&j, dir.path()).await;
+
+            assert!(log.contains(expected), "{}", log);
+        }
+    }
+
+    /// Writes a new VERSION into the project, like an artifact from an earlier job
+    struct BumpVersion(PathBuf);
+
+    #[async_trait]
+    impl Restore for BumpVersion {
+        async fn restore(&self, _job: &Job, _trace: &mut TraceWriter<'_>) -> JobOutcome {
+            std::fs::write(self.0.join("project/VERSION"), "2.0.0\n").map_err(JobFailure::system)
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_runs_after_checkout_and_is_not_reverted() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&origin)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("VERSION"), "1.0.0\n").unwrap();
+        git(&["add", "VERSION"]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+
+        let work = dir.path().join("work");
+        let executor = ShellExecutor::new(Some(work.to_string_lossy().into_owned()));
+        let j = job(serde_json::json!({
+            "id": 8, "token": "t",
+            "git_info": {
+                "repo_url": format!("file://{}", origin.display()), "ref": "main",
+                "ref_type": "branch", "sha": sha, "before_sha": "",
+                "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]
+            },
+            "steps": steps(&["echo version=$(cat VERSION)"], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, 8, "t", &scrubber);
+
+        let outcome = executor
+            .execute(&j, &mut trace, &BumpVersion(executor.job_dir(8)))
+            .await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("version=2.0.0"), "{}", log);
     }
 
     #[tokio::test]
@@ -1244,7 +1375,7 @@ mod tests {
         let scrubber = SecretScrubber::new(vec![]).with_job_secrets(&j);
         let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
 
-        let outcome = executor.execute(&j, &mut trace).await;
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
         trace.finish().await;
         let log = trace.text();
 
@@ -1306,7 +1437,7 @@ mod tests {
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
 
-        let outcome = executor.execute(&j, &mut trace).await;
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
         trace.finish().await;
         let log = trace.text();
 
@@ -1401,7 +1532,7 @@ mod tests {
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
 
-        let outcome = executor.execute(&j, &mut trace).await;
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
         trace.finish().await;
         let log = trace.text();
 
@@ -1441,10 +1572,12 @@ mod tests {
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
 
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(90), executor.execute(&j, &mut trace))
-                .await
-                .expect("cleanup hung on the job's /bin/sh");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(90),
+            executor.execute(&j, &mut trace, &NoRestore),
+        )
+        .await
+        .expect("cleanup hung on the job's /bin/sh");
         trace.finish().await;
 
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, trace.text());
@@ -1478,7 +1611,7 @@ mod tests {
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
 
-        let outcome = executor.execute(&j, &mut trace).await;
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
         trace.finish().await;
         let log = trace.text();
 

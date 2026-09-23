@@ -22,6 +22,16 @@ pub mod script;
 pub mod system_id;
 pub mod trace;
 
+/// Restores into the workspace once the executor has checked out sources
+struct WorkspaceRestore<'a>(&'a RunnerDaemon);
+
+#[async_trait::async_trait]
+impl executor::Restore for WorkspaceRestore<'_> {
+    async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
+        self.0.restore_workspace(job, trace).await
+    }
+}
+
 /// Values of the job's variables, for expanding cache keys
 fn job_variables(job: &Job) -> std::collections::HashMap<String, String> {
     script::job_env(job, "", std::path::Path::new(""))
@@ -232,9 +242,15 @@ impl RunnerDaemon {
             ))
             .await;
 
-        let mut outcome = self.prepare_workspace(&job, &mut trace).await;
+        let project_dir = self.executor.job_dir(job.id).join("project");
+        let mut outcome = tokio::fs::create_dir_all(&project_dir)
+            .await
+            .map_err(|e| JobFailure::system(format!("Failed to create workspace: {}", e)));
         if outcome.is_ok() {
-            outcome = self.executor.execute(&job, &mut trace).await;
+            outcome = self
+                .executor
+                .execute(&job, &mut trace, &WorkspaceRestore(self))
+                .await;
         }
         self.upload_artifacts(&job, &mut trace, outcome.is_ok())
             .await;
@@ -303,12 +319,9 @@ impl RunnerDaemon {
         })
     }
 
-    /// Create the workspace and restore cache and dependency artifacts into it
-    async fn prepare_workspace(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
+    /// Restore cache and dependency artifacts into the checked-out project
+    async fn restore_workspace(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
         let project_dir = self.executor.job_dir(job.id).join("project");
-        tokio::fs::create_dir_all(&project_dir)
-            .await
-            .map_err(|e| JobFailure::system(format!("Failed to create workspace: {}", e)))?;
         let workspace = project_dir.to_string_lossy();
 
         if self.config.cache_enabled {
