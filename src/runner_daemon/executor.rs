@@ -770,6 +770,25 @@ impl DockerExecutor {
         }
     }
 
+    /// Pull a runner-internal image (no job credentials) when it is not present
+    async fn pull_if_missing(&self, image: &str) -> Result<()> {
+        use bollard::image::CreateImageOptions;
+
+        let reference = image::with_default_tag(image);
+        if self.docker.inspect_image(&reference).await.is_ok() {
+            return Ok(());
+        }
+        let options = Some(CreateImageOptions {
+            from_image: reference.as_str(),
+            ..Default::default()
+        });
+        let mut stream = self.docker.create_image(options, None, None);
+        while let Some(progress) = stream.next().await {
+            progress.with_context(|| format!("Failed to pull {}", image))?;
+        }
+        Ok(())
+    }
+
     async fn force_remove(&self, id: &str) -> Result<()> {
         use bollard::container::RemoveContainerOptions;
 
@@ -795,6 +814,8 @@ impl DockerExecutor {
             use std::os::unix::fs::MetadataExt;
 
             let meta = std::fs::metadata(job_dir)?;
+            // Jobs without sources to check out never pulled the helper image
+            self.pull_if_missing(&self.config.helper_image).await?;
             let config = ContainerCreateBody {
                 image: Some(self.config.helper_image.clone()),
                 user: Some("0".to_string()),
