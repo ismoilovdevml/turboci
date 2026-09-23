@@ -12,6 +12,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use super::git::{self, GitStrategy};
 use crate::gitlab::{GitLabClient, Job};
 
 /// Executor type enum
@@ -261,69 +262,7 @@ impl DockerExecutor {
         Ok(response.id)
     }
 
-    /// Clone Git repository inside container
-    #[allow(dead_code)]
-    async fn clone_repository(&self, job: &Job, container_id: &str) -> Result<String> {
-        if let Some(ref git_info) = job.git_info {
-            // First, create the builds directory and cd into it
-            let clone_cmd = format!(
-                "cd /builds && git clone --depth 1 --branch {} {} project",
-                git_info.ref_name, git_info.repo_url
-            );
-
-            // Execute git clone command from /builds directory (not /builds/project)
-            let exec = self
-                .docker
-                .create_exec(
-                    container_id,
-                    CreateExecOptions {
-                        cmd: Some(vec!["sh", "-c", &clone_cmd]),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        working_dir: Some("/builds"), // Start from /builds, not /builds/project
-                        ..Default::default()
-                    },
-                )
-                .await
-                .context("Failed to create exec for git clone")?;
-
-            let mut output = String::new();
-
-            if let StartExecResults::Attached {
-                output: mut stream, ..
-            } = self.docker.start_exec(&exec.id, None).await?
-            {
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(msg) => {
-                            let text = msg.to_string();
-                            print!("{}", text);
-                            output.push_str(&text);
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-            }
-
-            // Check exit code
-            let inspect = self.docker.inspect_exec(&exec.id).await?;
-            if let Some(exit_code) = inspect.exit_code {
-                if exit_code != 0 {
-                    return Err(anyhow::anyhow!(
-                        "Git clone failed with exit code {}",
-                        exit_code
-                    ));
-                }
-            }
-
-            Ok(output)
-        } else {
-            Ok("No git repository to clone".to_string())
-        }
-    }
-
-    /// Clone Git repository inside container with real-time streaming to GitLab
-    #[allow(dead_code)]
+    /// Check out the job's commit inside the container with real-time streaming to GitLab
     async fn clone_repository_with_streaming(
         &self,
         job: &Job,
@@ -331,96 +270,120 @@ impl DockerExecutor {
         gitlab_params: Option<(&GitLabClient, u64, &str)>,
         mut trace_offset: usize,
     ) -> Result<String> {
-        if let Some(ref git_info) = job.git_info {
-            let clone_cmd = format!(
-                "cd /builds && git clone --depth 1 --branch {} {} project",
-                git_info.ref_name, git_info.repo_url
-            );
+        let Some(ref git_info) = job.git_info else {
+            return Ok("No git repository to clone".to_string());
+        };
 
-            let exec = self
-                .docker
-                .create_exec(
-                    container_id,
-                    CreateExecOptions {
-                        cmd: Some(vec!["sh", "-c", &clone_cmd]),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        working_dir: Some("/builds"),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .context("Failed to create exec for git clone")?;
+        let dest = "/builds/project";
+        let commands = match git::strategy(&job.variables) {
+            GitStrategy::None => return Ok("Skipping Git repository setup".to_string()),
+            GitStrategy::Empty => vec![vec![
+                "mkdir".to_string(),
+                "-p".to_string(),
+                dest.to_string(),
+            ]],
+            GitStrategy::Fetch => git::checkout_commands(git_info, &job.variables, dest)?,
+        };
 
-            let mut output = String::new();
-            let mut buffer = String::new();
-            let mut last_flush = std::time::Instant::now();
-            const BUFFER_SIZE: usize = 10 * 1024; // 10KB
-            const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+        let mut output = String::new();
+        for argv in &commands {
+            let (step_output, new_offset) = self
+                .exec_argv_with_streaming(container_id, argv, gitlab_params, trace_offset)
+                .await?;
+            output.push_str(&step_output);
+            trace_offset = new_offset;
+        }
 
-            if let StartExecResults::Attached {
-                output: mut stream, ..
-            } = self.docker.start_exec(&exec.id, None).await?
-            {
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(msg) => {
-                            let text = msg.to_string();
-                            print!("{}", text);
-                            output.push_str(&text);
-                            buffer.push_str(&text);
+        Ok(output)
+    }
 
-                            // Stream to GitLab with batching
-                            if let Some((client, job_id, token)) = gitlab_params {
-                                let should_flush = buffer.len() >= BUFFER_SIZE
-                                    || last_flush.elapsed() >= FLUSH_INTERVAL;
+    /// Run an argv (no shell) in the container, streaming output to GitLab in batches.
+    /// Returns the output and the trace offset after it.
+    async fn exec_argv_with_streaming(
+        &self,
+        container_id: &str,
+        argv: &[String],
+        gitlab_params: Option<(&GitLabClient, u64, &str)>,
+        mut trace_offset: usize,
+    ) -> Result<(String, usize)> {
+        let exec = self
+            .docker
+            .create_exec(
+                container_id,
+                CreateExecOptions {
+                    cmd: Some(argv.iter().map(String::as_str).collect()),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    working_dir: Some("/builds"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| format!("Failed to create exec for {}", argv[0]))?;
 
-                                if should_flush && !buffer.is_empty() {
-                                    let new_offset = trace_offset + buffer.len();
-                                    if let Err(e) = client
-                                        .patch_trace(job_id, token, &buffer, trace_offset)
-                                        .await
-                                    {
-                                        warn!("Failed to stream clone output: {}", e);
-                                    }
-                                    trace_offset = new_offset;
-                                    buffer.clear();
-                                    last_flush = std::time::Instant::now();
-                                }
-                            }
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
+        let mut output = String::new();
+        let mut buffer = String::new();
+        let mut last_flush = std::time::Instant::now();
+        const BUFFER_SIZE: usize = 10 * 1024; // 10KB
+        const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
-                // Flush remaining buffer
+        if let StartExecResults::Attached {
+            output: mut stream, ..
+        } = self.docker.start_exec(&exec.id, None).await?
+        {
+            while let Some(chunk) = stream.next().await {
+                let text = chunk?.to_string();
+                output.push_str(&text);
+                buffer.push_str(&text);
+
+                // Stream to GitLab with batching
                 if let Some((client, job_id, token)) = gitlab_params {
-                    if !buffer.is_empty() {
+                    let should_flush =
+                        buffer.len() >= BUFFER_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL;
+
+                    if should_flush && !buffer.is_empty() {
+                        let new_offset = trace_offset + buffer.len();
                         if let Err(e) = client
                             .patch_trace(job_id, token, &buffer, trace_offset)
                             .await
                         {
-                            warn!("Failed to stream final clone output: {}", e);
+                            warn!("Failed to stream clone output: {}", e);
                         }
+                        trace_offset = new_offset;
+                        buffer.clear();
+                        last_flush = std::time::Instant::now();
                     }
                 }
             }
 
-            // Check exit code
-            let inspect = self.docker.inspect_exec(&exec.id).await?;
-            if let Some(exit_code) = inspect.exit_code {
-                if exit_code != 0 {
-                    return Err(anyhow::anyhow!(
-                        "Git clone failed with exit code {}",
-                        exit_code
-                    ));
+            // Flush remaining buffer
+            if let Some((client, job_id, token)) = gitlab_params {
+                if !buffer.is_empty() {
+                    let new_offset = trace_offset + buffer.len();
+                    if let Err(e) = client
+                        .patch_trace(job_id, token, &buffer, trace_offset)
+                        .await
+                    {
+                        warn!("Failed to stream final clone output: {}", e);
+                    }
+                    trace_offset = new_offset;
                 }
             }
-
-            Ok(output)
-        } else {
-            Ok("No git repository to clone".to_string())
         }
+
+        // Check exit code
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        if let Some(exit_code) = inspect.exit_code {
+            if exit_code != 0 {
+                return Err(anyhow::anyhow!(
+                    "{} failed with exit code {}",
+                    argv[..argv.len().min(4)].join(" "),
+                    exit_code
+                ));
+            }
+        }
+
+        Ok((output, trace_offset))
     }
 
     /// Execute command in container
@@ -623,38 +586,45 @@ impl ShellExecutor {
         Ok(output)
     }
 
-    /// Clone Git repository
+    /// Check out the job's commit into `{job_dir}/project`
     async fn clone_repository(&self, job: &Job, job_dir: &str) -> Result<String> {
-        if let Some(ref git_info) = job.git_info {
-            info!("📥 Cloning repository...");
+        let Some(ref git_info) = job.git_info else {
+            info!("No git repository configured, skipping clone");
+            return Ok("No git repository to clone".to_string());
+        };
 
-            let clone_output = Command::new("git")
-                .arg("clone")
-                .arg("--depth")
-                .arg("1")
-                .arg("--branch")
-                .arg(&git_info.ref_name)
-                .arg(&git_info.repo_url)
-                .arg(format!("{}/project", job_dir))
+        let dest = format!("{}/project", job_dir);
+        match git::strategy(&job.variables) {
+            GitStrategy::None => return Ok("Skipping Git repository setup".to_string()),
+            GitStrategy::Empty => {
+                tokio::fs::create_dir_all(&dest).await?;
+                return Ok(String::new());
+            }
+            GitStrategy::Fetch => {}
+        }
+
+        info!("📥 Fetching repository...");
+        let mut output = String::new();
+        for argv in git::checkout_commands(git_info, &job.variables, &dest)? {
+            let result = Command::new(&argv[0])
+                .args(&argv[1..])
                 .output()
                 .await
-                .context("Failed to clone repository")?;
+                .with_context(|| format!("Failed to run {}", argv[0]))?;
 
-            let output = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&clone_output.stdout),
-                String::from_utf8_lossy(&clone_output.stderr)
-            );
+            output.push_str(&String::from_utf8_lossy(&result.stdout));
+            output.push_str(&String::from_utf8_lossy(&result.stderr));
 
-            if !clone_output.status.success() {
-                return Err(anyhow::anyhow!("Git clone failed: {}", output));
+            if !result.status.success() {
+                return Err(anyhow::anyhow!(
+                    "{} failed: {}",
+                    argv[..argv.len().min(4)].join(" "),
+                    output
+                ));
             }
-
-            Ok(output)
-        } else {
-            info!("No git repository configured, skipping clone");
-            Ok("No git repository to clone".to_string())
         }
+
+        Ok(output)
     }
 
     /// Execute command via shell

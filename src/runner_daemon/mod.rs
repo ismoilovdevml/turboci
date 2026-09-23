@@ -12,6 +12,7 @@ use crate::storage::{HybridStorage, StorageBackend};
 pub mod artifacts;
 pub mod config;
 pub mod executor;
+pub mod git;
 
 #[derive(Clone)]
 pub struct RunnerDaemon {
