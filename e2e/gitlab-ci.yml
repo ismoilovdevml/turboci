@@ -80,3 +80,14 @@ test:cancel:
     - echo "never printed"
   after_script:
     - echo "after_script after cancel"
+
+test:timeout:
+  stage: test
+  rules:
+    - if: $E2E_TIMEOUT
+  timeout: 1m
+  script:
+    - echo "sleeping past the timeout"
+    - sleep 300
+  after_script:
+    - echo "after_script after timeout"

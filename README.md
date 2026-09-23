@@ -36,14 +36,33 @@ to runners that advertise them, so such jobs are not routed to TurboCI.
 
 ### Automated (Recommended)
 
+Create a runner in GitLab (project or group **Settings → CI/CD → Runners →
+New runner**, add a tag such as `turboci`), then install, register and start it
+with one command:
+
 ```bash
-curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh \
+  | sudo bash -s -- --url https://gitlab.example.com --token glrt-XXXX
 ```
 
-This script installs:
-- ✅ TurboCI latest version
-- ✅ Systemd service
-- ✅ Auto-start on boot
+The installer verifies the binary against the release's `SHA256SUMS`, installs
+Docker if it is missing (docker executor), creates an unprivileged `turboci`
+user, writes `/etc/turboci-runner.toml`, starts the systemd service and waits
+until the runner has reached GitLab.
+
+| Option | Default | |
+|---|---|---|
+| `--url URL` | `https://gitlab.com` | GitLab URL |
+| `--token TOKEN` | – | runner token; without it the runner is installed but not started |
+| `--executor docker\|shell` | `docker` | `shell` runs jobs on the host without isolation |
+| `--concurrent N` | `4` | jobs run in parallel |
+| `--version vX.Y.Z` | latest | release to install |
+| `--binary PATH` | – | install a local binary instead of downloading one |
+| `--no-start` | – | configure but do not start |
+
+Each option can also be given as an environment variable (`TURBOCI_URL`,
+`TURBOCI_TOKEN`, ...). Running the command again upgrades the runner and
+replaces the config, keeping a backup.
 
 ### Manual Installation
 

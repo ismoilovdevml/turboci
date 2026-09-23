@@ -2,14 +2,18 @@
 set -e
 
 # TurboCI Uninstaller
-# Removes: TurboCI + Systemd Service + Config
-# Option: Remove Redis (if not used by other apps)
+# Removes: service, binary, config (a root-only backup is kept), work and state
+# directories, the turboci user, and leftover job containers/networks.
+# Docker is left installed.
 
 SERVICE_NAME="turboci"
 BIN_NAME="turboci"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_FILE="/etc/turboci-runner.toml"
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+TMPFILES_FILE="/etc/tmpfiles.d/turboci.conf"
+SERVICE_USER="turboci"
+STATE_DIR="/var/lib/turboci"
 
 # Colors
 RED='\033[0;31m'
@@ -71,88 +75,66 @@ remove_binary() {
     fi
 }
 
-# Remove config
+# Remove config, keeping a root-only backup (it contains the runner token)
 remove_config() {
     echo -e "\n${YELLOW}📝 Removing configuration...${NC}"
 
     if [ -f "$CONFIG_FILE" ]; then
-        # Backup config before removing
         BACKUP_FILE="${CONFIG_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "$CONFIG_FILE" "$BACKUP_FILE"
-        echo -e "${BLUE}ℹ️  Config backed up to: $BACKUP_FILE${NC}"
+        install -m 0600 -o root -g root "$CONFIG_FILE" "$BACKUP_FILE"
+        echo -e "${BLUE}ℹ️  Config backed up to: $BACKUP_FILE (root only)${NC}"
 
         rm -f "$CONFIG_FILE"
         echo -e "${GREEN}✓${NC} Config removed: $CONFIG_FILE"
     else
         echo -e "${BLUE}ℹ️  Config not found${NC}"
     fi
+    # Backups made by install.sh when replacing the config also hold tokens
+    for old in "$CONFIG_FILE".bak.*; do
+        [ -e "$old" ] || continue
+        chown root:root "$old" && chmod 0600 "$old"
+    done
 }
 
-# Remove work directory
+# Remove job containers and networks left by a crash
+remove_job_containers() {
+    command -v docker > /dev/null 2>&1 || return 0
+    echo -e "\n${YELLOW}🐳 Removing leftover job containers...${NC}"
+
+    CONTAINERS=$(docker ps -aq --filter "name=^turboci-job-" 2>/dev/null || true)
+    if [ -n "$CONTAINERS" ]; then
+        echo "$CONTAINERS" | xargs docker rm -f > /dev/null
+        echo -e "${GREEN}✓${NC} Removed $(echo "$CONTAINERS" | wc -l) container(s)"
+    fi
+    NETWORKS=$(docker network ls -q --filter "name=^turboci-job-" 2>/dev/null || true)
+    if [ -n "$NETWORKS" ]; then
+        echo "$NETWORKS" | xargs docker network rm > /dev/null
+        echo -e "${GREEN}✓${NC} Removed $(echo "$NETWORKS" | wc -l) network(s)"
+    fi
+}
+
+# Remove work and state directories (job workspaces and the local cache)
 remove_workdir() {
-    echo -e "\n${YELLOW}📁 Removing work directory...${NC}"
+    echo -e "\n${YELLOW}📁 Removing work directories...${NC}"
 
-    WORK_DIR="/tmp/turboci-builds"
-    if [ -d "$WORK_DIR" ]; then
-        rm -rf "$WORK_DIR"
-        echo -e "${GREEN}✓${NC} Work directory removed: $WORK_DIR"
-    else
-        echo -e "${BLUE}ℹ️  Work directory not found${NC}"
+    for dir in /tmp/turboci-builds /tmp/turboci "$STATE_DIR"; do
+        if [ -d "$dir" ]; then
+            rm -rf "$dir"
+            echo -e "${GREEN}✓${NC} Removed: $dir"
+        fi
+    done
+    if [ -f "$TMPFILES_FILE" ]; then
+        rm -f "$TMPFILES_FILE"
+        echo -e "${GREEN}✓${NC} Removed: $TMPFILES_FILE"
     fi
 }
 
-# Ask about Redis
-ask_remove_redis() {
-    echo -e "\n${YELLOW}❓ Remove Redis?${NC}"
-    echo -e "${BLUE}Redis might be used by other applications.${NC}"
-    read -p "Remove Redis? (y/N): " -n 1 -r
-    echo
-
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        remove_redis
-    else
-        echo -e "${BLUE}ℹ️  Keeping Redis${NC}"
+# Remove the service user
+remove_user() {
+    if id -u "$SERVICE_USER" > /dev/null 2>&1; then
+        userdel "$SERVICE_USER"
+        echo -e "\n${GREEN}✓${NC} User removed: $SERVICE_USER"
     fi
-}
-
-# Remove Redis
-remove_redis() {
-    echo -e "\n${YELLOW}🗑️  Removing Redis...${NC}"
-
-    # Detect OS
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_ID=$ID
-    else
-        echo -e "${YELLOW}⚠️  Cannot detect OS, skipping Redis removal${NC}"
-        return
-    fi
-
-    case "$OS_ID" in
-        ubuntu|debian)
-            REDIS_SERVICE="redis-server"
-            systemctl stop $REDIS_SERVICE 2>/dev/null || true
-            systemctl disable $REDIS_SERVICE 2>/dev/null || true
-            apt-get remove -y redis-server redis-tools 2>/dev/null || true
-            apt-get autoremove -y 2>/dev/null || true
-            ;;
-        rhel|rocky|almalinux|fedora|centos)
-            REDIS_SERVICE="redis"
-            systemctl stop $REDIS_SERVICE 2>/dev/null || true
-            systemctl disable $REDIS_SERVICE 2>/dev/null || true
-            if command -v dnf &> /dev/null; then
-                dnf remove -y redis 2>/dev/null || true
-            else
-                yum remove -y redis 2>/dev/null || true
-            fi
-            ;;
-        *)
-            echo -e "${YELLOW}⚠️  Unsupported OS for Redis removal: $OS_ID${NC}"
-            return
-            ;;
-    esac
-
-    echo -e "${GREEN}✓${NC} Redis removed"
 }
 
 # Print summary
@@ -164,8 +146,10 @@ print_summary() {
     echo -e "\n${BLUE}📋 Removed:${NC}"
     echo -e "   ✓ TurboCI service"
     echo -e "   ✓ TurboCI binary"
-    echo -e "   ✓ Configuration (backed up)"
-    echo -e "   ✓ Work directory"
+    echo -e "   ✓ Configuration (root-only backup kept)"
+    echo -e "   ✓ Work directories, local cache and leftover job containers"
+    echo -e "   ✓ User $SERVICE_USER"
+    echo -e "\n${BLUE}ℹ️  Docker was left installed.${NC}"
 
     echo -e "\n${BLUE}📚 To reinstall:${NC}"
     echo -e "   ${BLUE}curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh | sudo bash${NC}"
@@ -180,8 +164,9 @@ main() {
     remove_service
     remove_binary
     remove_config
+    remove_job_containers
     remove_workdir
-    ask_remove_redis
+    remove_user
     print_summary
 }
 
