@@ -2,7 +2,7 @@
 set -e
 
 # TurboCI Automated Installer
-# Installs: Redis + TurboCI + Systemd Service
+# Installs: TurboCI + Systemd Service
 # Supports: Ubuntu, Debian, RHEL, Rocky, AlmaLinux, Fedora
 
 REPO="ismoilovdevml/turboci"
@@ -59,13 +59,9 @@ detect_os() {
     case "$OS_ID" in
         ubuntu|debian)
             PKG_MANAGER="apt-get"
-            REDIS_PKG="redis-server"
-            REDIS_SERVICE="redis-server"
             ;;
         rhel|rocky|almalinux|fedora|centos)
             PKG_MANAGER="dnf"
-            REDIS_PKG="redis"
-            REDIS_SERVICE="redis"
             # Fallback to yum if dnf not available
             if ! command -v dnf &> /dev/null; then
                 PKG_MANAGER="yum"
@@ -99,45 +95,6 @@ detect_arch() {
     esac
 
     echo -e "${GREEN}✓${NC} Architecture: ${BLUE}$DISPLAY_ARCH${NC}"
-}
-
-# Install Redis
-install_redis() {
-    echo -e "\n${YELLOW}📦 Installing Redis...${NC}"
-
-    # Check if already installed
-    if systemctl is-active --quiet $REDIS_SERVICE 2>/dev/null; then
-        echo -e "${GREEN}✓${NC} Redis already running"
-        return
-    fi
-
-    if command -v redis-server &> /dev/null; then
-        echo -e "${GREEN}✓${NC} Redis already installed"
-    else
-        echo -e "${YELLOW}⏳ Installing $REDIS_PKG...${NC}"
-        $PKG_MANAGER update -y > /dev/null 2>&1 || true
-        $PKG_MANAGER install -y $REDIS_PKG
-        echo -e "${GREEN}✓${NC} Redis installed"
-    fi
-
-    # Enable and start Redis
-    systemctl enable $REDIS_SERVICE
-    systemctl start $REDIS_SERVICE
-
-    # Verify
-    if systemctl is-active --quiet $REDIS_SERVICE; then
-        echo -e "${GREEN}✓${NC} Redis service running"
-
-        # Test connection
-        if redis-cli ping > /dev/null 2>&1; then
-            echo -e "${GREEN}✓${NC} Redis connection test: OK"
-        else
-            echo -e "${YELLOW}⚠️  Redis installed but not responding${NC}"
-        fi
-    else
-        echo -e "${RED}❌ Failed to start Redis${NC}"
-        exit 1
-    fi
 }
 
 # Get latest TurboCI release
@@ -291,10 +248,8 @@ concurrent = 4
 check_interval = 3
 runner_token = ""
 gitlab_url = "https://gitlab.com"
-redis_url = "redis://127.0.0.1:6379"
 cache_enabled = true
-s3_prefix = "turboci"
-storage_threshold = 10485760
+cache_dir = "$STATE_DIR/cache"
 
 [executor]
 # "docker" isolates each job in a container. "shell" runs job scripts
@@ -334,8 +289,7 @@ create_service() {
 [Unit]
 Description=TurboCI Runner
 Documentation=https://github.com/$REPO
-After=network.target docker.service $REDIS_SERVICE.service
-Requires=$REDIS_SERVICE.service
+After=network.target docker.service
 
 [Service]
 Type=simple
@@ -411,7 +365,6 @@ print_next_steps() {
     echo -e "   ${BLUE}journalctl -u turboci -f${NC}"
 
     echo -e "\n${BLUE}📊 Installed Components:${NC}"
-    echo -e "   ✓ Redis Server:  ${GREEN}Running${NC}"
     echo -e "   ✓ TurboCI:       ${GREEN}$LATEST_VERSION${NC}"
     echo -e "   ✓ Config:        ${BLUE}$CONFIG_DIR/turboci-runner.toml${NC} (executor: $EXECUTOR)"
     echo -e "   ✓ Runs as:       ${BLUE}$SERVICE_USER${NC} (work dir $STATE_DIR)"
@@ -439,7 +392,6 @@ main() {
     validate_executor
     detect_os
     detect_arch
-    install_redis
     get_latest_version
     install_turboci
     create_service_user

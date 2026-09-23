@@ -7,7 +7,6 @@ use tracing::{error, info, warn};
 
 use crate::gitlab::{ArtifactUpload, GitLabClient, Job, JobState};
 use crate::security::secret_scrubber::SecretScrubber;
-use crate::storage::{HybridStorage, StorageBackend};
 use executor::{JobFailure, JobOutcome};
 use trace::TraceWriter;
 
@@ -53,7 +52,6 @@ pub struct RunnerDaemon {
     cache: job_cache::LocalCache,
     config: Arc<config::RunnerConfig>,
     gitlab: Arc<GitLabClient>,
-    storage: Arc<HybridStorage>,
     executor: Arc<executor::ExecutorType>,
     semaphore: Arc<Semaphore>,
     scrubber: Arc<SecretScrubber>,
@@ -63,7 +61,6 @@ impl RunnerDaemon {
     pub fn new(
         config: config::RunnerConfig,
         gitlab: GitLabClient,
-        storage: HybridStorage,
         executor: executor::ExecutorType,
     ) -> Self {
         let concurrent = config.concurrent as usize;
@@ -80,7 +77,6 @@ impl RunnerDaemon {
             cache: job_cache::LocalCache::new(&config.cache_dir),
             config: Arc::new(config),
             gitlab: Arc::new(gitlab),
-            storage: Arc::new(storage),
             executor: Arc::new(executor),
             semaphore: Arc::new(Semaphore::new(concurrent)),
             scrubber: Arc::new(scrubber),
@@ -94,22 +90,7 @@ impl RunnerDaemon {
         info!("   Check interval: {}s", self.config.check_interval);
         info!("   Cache enabled: {}", self.config.cache_enabled);
 
-        // Log cache statistics every 100 jobs
-        let mut job_counter = 0;
-
         loop {
-            // Print cache stats every 100 jobs
-            if job_counter > 0 && job_counter % 100 == 0 {
-                if let Ok(stats) = self.stats().await {
-                    info!("📊 Cache Statistics (after {} jobs):", job_counter);
-                    info!("   Hit rate: {:.1}%", stats.cache_hit_rate);
-                    info!("   Cached items: {}", stats.cached_items);
-                    info!(
-                        "   Total size: {:.2} MB",
-                        stats.total_cached_size as f64 / 1_048_576.0
-                    );
-                }
-            }
             // Request a job only when a slot is free
             match claim_job(&self.semaphore, &self.gitlab, &self.config.runner_token).await {
                 Ok(Some((job, permit))) => {
@@ -119,8 +100,6 @@ impl RunnerDaemon {
                         .map(|ji| ji.name.as_str())
                         .unwrap_or("unknown");
                     info!("📦 Received job #{} ({})", job.id, job_name);
-
-                    job_counter += 1;
 
                     // Execute job concurrently
                     let daemon = self.clone();
@@ -371,30 +350,6 @@ impl RunnerDaemon {
             }
         }
     }
-
-    /// Get runner statistics
-    pub async fn stats(&self) -> Result<RunnerStats> {
-        let storage_stats = self.storage.stats().await?;
-
-        Ok(RunnerStats {
-            cache_hit_rate: if storage_stats.hit_count + storage_stats.miss_count > 0 {
-                (storage_stats.hit_count as f64
-                    / (storage_stats.hit_count + storage_stats.miss_count) as f64)
-                    * 100.0
-            } else {
-                0.0
-            },
-            total_cached_size: storage_stats.total_size,
-            cached_items: storage_stats.item_count,
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct RunnerStats {
-    pub cache_hit_rate: f64,
-    pub total_cached_size: u64,
-    pub cached_items: u64,
 }
 
 #[cfg(test)]

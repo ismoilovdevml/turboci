@@ -35,29 +35,13 @@ curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.s
 ```
 
 This script installs:
-- ✅ Redis server
 - ✅ TurboCI latest version
 - ✅ Systemd service
 - ✅ Auto-start on boot
 
 ### Manual Installation
 
-#### 1. Install Redis
-
-**Ubuntu/Debian:**
-```bash
-sudo apt-get update
-sudo apt-get install -y redis-server
-sudo systemctl enable --now redis-server
-```
-
-**RHEL/Rocky/AlmaLinux:**
-```bash
-sudo dnf install -y redis
-sudo systemctl enable --now redis
-```
-
-#### 2. Install TurboCI
+#### 1. Install TurboCI
 
 ```bash
 VERSION=$(curl -s https://api.github.com/repos/ismoilovdevml/turboci/releases/latest | grep tag_name | cut -d'"' -f4)
@@ -85,7 +69,6 @@ sudo nano /etc/turboci-runner.toml
 concurrent = 4
 runner_token = "glrt-YOUR_RUNNER_TOKEN_HERE"
 gitlab_url = "https://gitlab.com"
-redis_url = "redis://127.0.0.1:6379"
 
 [executor]
 executor_type = "docker"
@@ -135,7 +118,7 @@ sudo chmod 0640 /etc/turboci-runner.toml
 sudo tee /etc/systemd/system/turboci.service > /dev/null <<EOF
 [Unit]
 Description=TurboCI Runner
-After=network.target docker.service redis.service
+After=network.target docker.service
 
 [Service]
 Type=simple
@@ -247,13 +230,6 @@ curl http://localhost:8080/metrics
 grep runner_token /etc/turboci-runner.toml
 grep gitlab_url /etc/turboci-runner.toml
 sudo journalctl -u turboci -n 50
-```
-
-### Redis connection error
-
-```bash
-sudo systemctl status redis
-redis-cli ping
 ```
 
 ### Permission denied

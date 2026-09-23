@@ -18,10 +18,6 @@ mod gitlab;
 mod runner_daemon;
 #[cfg(feature = "runner")]
 mod security;
-#[cfg(feature = "runner")]
-// Only runner statistics use it until the S3 cache backend lands (#14)
-#[allow(dead_code)]
-mod storage;
 
 use cache::CacheManager;
 use config::Config;
@@ -127,7 +123,6 @@ async fn main() -> Result<()> {
             use gitlab::GitLabClient;
             use runner_daemon::executor::{DockerExecutor, ExecutorType, ShellExecutor};
             use runner_daemon::RunnerDaemon;
-            use storage::{redis_storage::RedisStorage, s3_storage::S3Storage, HybridStorage};
 
             info!("🚀 Starting TurboCI Runner Daemon...");
             let runner_config = runner_daemon::config::RunnerConfig::load(&config)?;
@@ -142,29 +137,6 @@ async fn main() -> Result<()> {
                 runner_config.runner_token.clone(),
             )
             .with_system_id(system_id);
-
-            // Initialize storage
-            let redis = RedisStorage::new(&runner_config.redis_url, 3600).await?;
-
-            let storage = if let Some(bucket) = &runner_config.s3_bucket {
-                // S3 is configured - use hybrid storage
-                info!("💾 Using Hybrid storage (Redis + S3)");
-                let s3 = if let Some(endpoint) = &runner_config.s3_endpoint {
-                    S3Storage::new_with_endpoint(
-                        bucket.clone(),
-                        runner_config.s3_prefix.clone(),
-                        endpoint.clone(),
-                    )
-                    .await?
-                } else {
-                    S3Storage::new(bucket.clone(), runner_config.s3_prefix.clone()).await?
-                };
-                HybridStorage::new(redis, s3, runner_config.storage_threshold)
-            } else {
-                // S3 not configured - use Redis-only storage (faster!)
-                info!("⚡ Using Redis-only storage for maximum speed!");
-                HybridStorage::redis_only(redis)
-            };
 
             // Initialize executor based on config
             let executor = match runner_config.executor.executor_type.as_str() {
@@ -194,7 +166,7 @@ async fn main() -> Result<()> {
             };
 
             // Start daemon with graceful shutdown
-            let daemon = RunnerDaemon::new(runner_config, gitlab, storage, executor);
+            let daemon = RunnerDaemon::new(runner_config, gitlab, executor);
 
             // Handle shutdown signals (SIGTERM, SIGINT)
             tokio::select! {
@@ -249,61 +221,19 @@ async fn main() -> Result<()> {
             info!("✅ Configuration created at: {}", output);
             println!("\n💡 Next steps:");
             println!("  1. Edit {} and configure your GitLab token", output);
-            println!("  2. Set up Redis and S3/MinIO storage");
+            println!("  2. Make sure Docker is installed (default executor)");
             println!("  3. Run: turboci runner-start -c {}", output);
         }
         #[cfg(feature = "runner")]
         Commands::RunnerStats { config } => {
-            use gitlab::GitLabClient;
-            use runner_daemon::executor::{DockerExecutor, ExecutorType, ShellExecutor};
-            use runner_daemon::RunnerDaemon;
-            use storage::{redis_storage::RedisStorage, s3_storage::S3Storage, HybridStorage};
-
             let runner_config = runner_daemon::config::RunnerConfig::load(&config)?;
-
-            let gitlab = GitLabClient::new(
-                runner_config.gitlab_url.clone(),
-                runner_config.runner_token.clone(),
-            );
-
-            let redis = RedisStorage::new(&runner_config.redis_url, 3600).await?;
-
-            let storage = if let Some(bucket) = &runner_config.s3_bucket {
-                let s3 = if let Some(endpoint) = &runner_config.s3_endpoint {
-                    S3Storage::new_with_endpoint(
-                        bucket.clone(),
-                        runner_config.s3_prefix.clone(),
-                        endpoint.clone(),
-                    )
-                    .await?
-                } else {
-                    S3Storage::new(bucket.clone(), runner_config.s3_prefix.clone()).await?
-                };
-                HybridStorage::new(redis, s3, runner_config.storage_threshold)
-            } else {
-                HybridStorage::redis_only(redis)
-            };
-
-            let executor = match runner_config.executor.executor_type.as_str() {
-                "shell" => ExecutorType::Shell(ShellExecutor::new(Some(
-                    runner_config.executor.shell.work_dir.clone(),
-                ))),
-                "docker" => ExecutorType::Docker(DockerExecutor::new(
-                    runner_config.executor.docker.default_image.clone(),
-                )?),
-                _ => ExecutorType::Shell(ShellExecutor::new(None)),
-            };
-
-            let daemon = RunnerDaemon::new(runner_config, gitlab, storage, executor);
-            let stats = daemon.stats().await?;
+            let cache = runner_daemon::job_cache::LocalCache::new(&runner_config.cache_dir);
+            let (archives, bytes) = cache.stats();
 
             println!("\n📊 TurboCI Runner Statistics:");
-            println!("  Cache Hit Rate: {:.2}%", stats.cache_hit_rate);
-            println!(
-                "  Total Cached Size: {} MB",
-                stats.total_cached_size / 1024 / 1024
-            );
-            println!("  Cached Items: {}", stats.cached_items);
+            println!("  Cache directory: {}", runner_config.cache_dir);
+            println!("  Cache archives:  {}", archives);
+            println!("  Cache size:      {:.1} MB", bytes as f64 / 1_048_576.0);
         }
         Commands::Upgrade => {
             info!("🔄 Checking for updates...");

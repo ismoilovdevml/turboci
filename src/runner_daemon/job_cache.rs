@@ -46,6 +46,18 @@ impl LocalCache {
             .join(format!("{}.zip", encode_key(key)))
     }
 
+    /// Number of cache archives and their total size in bytes
+    pub fn stats(&self) -> (usize, u64) {
+        walkdir::WalkDir::new(&self.root)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "zip"))
+            .fold((0, 0), |(count, size), entry| {
+                (count + 1, size + entry.metadata().map_or(0, |m| m.len()))
+            })
+    }
+
     /// Extract the first key that has an archive; returns that key
     pub async fn restore(
         &self,
@@ -139,6 +151,7 @@ mod tests {
             .await
             .unwrap();
         assert!(miss.is_none(), "caches must not leak between projects");
+        assert_eq!(cache.stats().0, 1);
     }
 
     #[tokio::test]

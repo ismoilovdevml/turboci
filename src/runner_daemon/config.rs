@@ -25,14 +25,6 @@ pub struct RunnerConfig {
     /// Directory of the local job cache (`cache:` in .gitlab-ci.yml)
     #[serde(default = "default_cache_dir")]
     pub cache_dir: String,
-    pub redis_url: String,
-    pub s3_bucket: Option<String>,
-    pub s3_endpoint: Option<String>,
-    pub s3_prefix: String,
-
-    /// Storage threshold (bytes)
-    /// Files larger than this go to S3, smaller to Redis
-    pub storage_threshold: usize,
 
     /// Executor configuration
     pub executor: ExecutorConfig,
@@ -110,11 +102,6 @@ impl Default for RunnerConfig {
             gitlab_url: "https://gitlab.com".to_string(),
             cache_enabled: true,
             cache_dir: default_cache_dir(),
-            redis_url: "redis://127.0.0.1:6379".to_string(),
-            s3_bucket: None,
-            s3_endpoint: None,
-            s3_prefix: "turboci".to_string(),
-            storage_threshold: 10 * 1024 * 1024, // 10MB
             executor: ExecutorConfig::default(),
         }
     }
