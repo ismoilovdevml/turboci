@@ -1,30 +1,36 @@
-# ⚡ TurboCI - Lightning-Fast GitLab Runner
+# ⚡ TurboCI
 
-High-performance GitLab CI/CD runner written in Rust. **5-10x faster** than standard GitLab Runner.
+A GitLab CI/CD runner written in Rust. It talks to GitLab's runner API like
+[gitlab-runner](https://gitlab.com/gitlab-org/gitlab-runner) and runs jobs in
+Docker containers (default) or directly on the host (shell executor). It is a
+single static binary with no external services: no Redis, no database.
 
-## 🎯 Why TurboCI?
+## ✅ What is supported
 
-### The Problem
-GitLab Runner is slow:
-- ✗ Job start: 10 seconds
-- ✗ Cache access: 100ms+
-- ✗ Cached build: 15+ seconds
-- ✗ Memory: 300MB+
+- **Executors:** `docker` (one container per job) and `shell`
+- **Sources:** checks out the pipeline's exact commit via GitLab refspecs;
+  `GIT_STRATEGY` (`fetch`/`clone`/`none`/`empty`), `GIT_DEPTH`, `GIT_SUBMODULE_STRATEGY`
+- **Scripts:** each step runs in one shell (`set -e`, `pipefail` where available);
+  `before_script`/`script`/`after_script`, `when`, `allow_failure`, job and
+  `after_script` timeouts
+- **Variables:** CI/CD variables incl. file-type and `$VAR` expansion; masked
+  values, the job token and dependency tokens are masked in the job log
+- **Artifacts:** upload (`zip`, and `gzip`/`raw` reports), `artifacts:when`,
+  `expire_in`; download of dependency artifacts (`needs`/`dependencies`)
+- **Cache:** local cache on the runner host, `cache:key` with variables,
+  `fallback_keys`, `policy`, `when`
+- **Docker:** `services` with aliases on a per-job network, `pull_policy`,
+  private registry credentials from GitLab, `privileged`, extra `volumes`,
+  memory/CPU limits
+- **Operations:** job cancellation from the UI (graceful, with `after_script`),
+  SIGQUIT (finish running jobs) / SIGTERM (stop them), `concurrent` limit,
+  checksum-verified install and `turboci upgrade`
 
-### TurboCI Solution
-- ✅ Job start: **50ms** (200x faster!)
-- ✅ Cache access: **5ms** (20x faster!)
-- ✅ Cached build: **2s** (7x faster!)
-- ✅ Memory: **50MB** (6x less!)
+## ⛔ Not supported (yet)
 
-## 📊 Real-World Benchmark
-
-**Test:** Rust project, 50 dependencies, 10K LOC
-
-| Runner | First Build | Cached Build | Speedup |
-|--------|-------------|--------------|---------|
-| GitLab Runner | 45s | 14.8s | 1x |
-| **TurboCI** | 45s | **2.1s** | **7x** ⚡ |
+Kubernetes and other executors, a distributed (S3) cache, `artifacts:exclude`,
+interactive web terminals, Vault secrets. GitLab only sends jobs that need these
+to runners that advertise them, so such jobs are not routed to TurboCI.
 
 ## 🚀 Installation
 
@@ -227,9 +233,8 @@ sudo cp target/release/turboci /usr/local/bin/
 ## 📊 Monitoring
 
 ```bash
-turboci runner-stats -c /etc/turboci-runner.toml
-curl http://localhost:8080/health
-curl http://localhost:8080/metrics
+sudo journalctl -u turboci -f                    # job and runner logs
+turboci runner-stats -c /etc/turboci-runner.toml  # local cache usage
 ```
 
 ## ❓ Troubleshooting
@@ -242,11 +247,14 @@ grep gitlab_url /etc/turboci-runner.toml
 sudo journalctl -u turboci -n 50
 ```
 
-### Permission denied
+### Permission denied on job workspaces
+
+The service runs as the `turboci` user. Workspaces left by an older version
+that ran as root can not be cleaned up by it; remove them once:
 
 ```bash
-sudo mkdir -p /tmp/turboci-builds
-sudo chmod 755 /tmp/turboci-builds
+sudo rm -rf /tmp/turboci-builds /tmp/turboci
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/turboci.conf
 ```
 
 ## 📄 License
