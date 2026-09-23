@@ -20,6 +20,36 @@ where
 
 use uuid::Uuid;
 
+/// Deserialize `null` as the type's default (GitLab sends null for some string fields)
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn default_cache_policy() -> String {
+    "pull-push".to_string()
+}
+
+/// Describe a JSON parse error without echoing payload values (they may be secrets)
+fn describe_parse_error(e: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {} column {}",
+        e.classify(),
+        e.line(),
+        e.column()
+    )
+}
+
+/// The minimum needed to report a job we could not parse as failed
+#[derive(Deserialize)]
+struct JobIdentity {
+    id: u64,
+    token: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct GitLabClient {
     client: Client,
@@ -115,12 +145,32 @@ impl GitLabClient {
                     .context("Failed to read response text")?;
 
                 // The payload carries the job token and secret variables: never log it
-                let job: Job = serde_json::from_str(&response_text).with_context(|| {
-                    format!(
-                        "Failed to parse job response ({} bytes)",
-                        response_text.len()
-                    )
-                })?;
+                let job: Job = match serde_json::from_str(&response_text) {
+                    Ok(job) => job,
+                    Err(e) => {
+                        let reason = describe_parse_error(&e);
+                        // The job is already assigned to us; fail it instead of leaving it running
+                        if let Ok(identity) = serde_json::from_str::<JobIdentity>(&response_text) {
+                            let trace =
+                                format!("TurboCI could not parse the job payload: {}\n", reason);
+                            if let Err(update_err) = self
+                                .update_job(
+                                    identity.id,
+                                    &identity.token,
+                                    JobState::Failed,
+                                    Some(&trace),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Failed to fail unparseable job #{}: {}",
+                                    identity.id, update_err
+                                );
+                            }
+                        }
+                        return Err(anyhow::anyhow!("Failed to parse job response: {}", reason));
+                    }
+                };
                 info!("Received job #{}", job.id);
                 Ok(Some(job))
             }
@@ -500,6 +550,18 @@ pub struct Job {
     pub features: Option<serde_json::Value>,
 }
 
+impl Job {
+    /// Job timeout in seconds as configured in GitLab (sent in `runner_info.timeout`)
+    pub fn timeout_secs(&self) -> Option<u64> {
+        self.runner_info
+            .as_ref()
+            .and_then(|info| info.timeout)
+            .map(u64::from)
+            .or(Some(u64::from(self.timeout)))
+            .filter(|&secs| secs > 0)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JobInfo {
     #[serde(default)]
@@ -509,7 +571,7 @@ pub struct JobInfo {
     pub project_id: u64,
     pub project_name: String,
     #[serde(default)]
-    pub time_in_queue_seconds: Option<u64>,
+    pub time_in_queue_seconds: Option<f64>,
     #[serde(default)]
     pub project_jobs_running_on_instance_runners_count: Option<String>,
     #[serde(default)]
@@ -525,6 +587,7 @@ pub struct GitInfo {
     pub ref_name: String,
     pub ref_type: String,
     pub sha: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub before_sha: String,
     #[serde(default)]
     pub depth: Option<u32>,
@@ -611,6 +674,7 @@ pub struct Artifact {
     pub name: Option<String>,
     #[serde(default)]
     pub untracked: bool,
+    #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
     pub when: Option<String>,
@@ -627,7 +691,9 @@ pub struct Cache {
     pub key: String,
     #[serde(default)]
     pub untracked: Option<bool>,
+    #[serde(default)]
     pub paths: Vec<String>,
+    #[serde(default = "default_cache_policy")]
     pub policy: String,
     #[serde(default)]
     pub when: Option<String>,
@@ -648,6 +714,7 @@ pub struct Credential {
 pub struct Dependency {
     pub id: u64,
     pub name: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub token: String,
 }
 
@@ -674,6 +741,68 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Job payload from gitlab-runner's network tests (JobResponse fixture)
+    fn upstream_job() -> serde_json::Value {
+        serde_json::from_str(include_str!("testdata/job_response.json")).unwrap()
+    }
+
+    fn parse(v: serde_json::Value) -> Job {
+        serde_json::from_value(v).expect("valid GitLab job payload must parse")
+    }
+
+    #[test]
+    fn parses_upstream_job_payload() {
+        let job = parse(upstream_job());
+
+        assert_eq!(job.id, 10);
+        assert_eq!(job.timeout_secs(), Some(3600));
+        assert_eq!(job.steps.len(), 2);
+        assert_eq!(job.dependencies[0].token, "other-job-token");
+    }
+
+    #[test]
+    fn parses_payload_variants_gitlab_sends() {
+        let mut v = upstream_job();
+        v["job_info"]["time_in_queue_seconds"] = serde_json::json!(12.5);
+        parse(v);
+
+        let mut v = upstream_job();
+        v["cache"][0].as_object_mut().unwrap().remove("policy");
+        parse(v);
+
+        let mut v = upstream_job();
+        v["git_info"]["before_sha"] = serde_json::Value::Null;
+        parse(v);
+
+        let mut v = upstream_job();
+        v["dependencies"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("token");
+        parse(v);
+
+        let mut v = upstream_job();
+        v["image"] = serde_json::Value::Null;
+        v["services"] = serde_json::json!([{"name": "redis:7"}]);
+        parse(v);
+
+        let mut v = upstream_job();
+        v["artifacts"] = serde_json::json!([{"artifact_type": "junit", "artifact_format": "gzip",
+            "paths": ["r.xml"], "when": "always", "exclude": ["a"]}]);
+        parse(v);
+    }
+
+    #[test]
+    fn timeout_comes_from_runner_info() {
+        let mut v = upstream_job();
+        v["runner_info"]["timeout"] = serde_json::json!(10800);
+        assert_eq!(parse(v).timeout_secs(), Some(10800));
+
+        let mut v = upstream_job();
+        v.as_object_mut().unwrap().remove("runner_info");
+        assert_eq!(parse(v).timeout_secs(), None);
+    }
 
     fn client(server: &MockServer) -> GitLabClient {
         GitLabClient::new(server.uri(), "runner-token".to_string())
@@ -738,6 +867,44 @@ mod tests {
 
         client.request_job("runner-token").await.unwrap();
         client.request_job("runner-token").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unparseable_job_is_reported_failed_without_echoing_values() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 77, "token": "job-token", "steps": "super-secret-value"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/jobs/77"))
+            .and(body_partial_json(
+                serde_json::json!({"token": "job-token", "state": "failed"}),
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .request_job("runner-token")
+            .await
+            .unwrap_err();
+
+        assert!(
+            !format!("{:#}", err).contains("super-secret-value"),
+            "{:#}",
+            err
+        );
+        let requests = server.received_requests().await.unwrap();
+        let update = requests
+            .iter()
+            .find(|r| r.method.as_str() == "PUT")
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&update.body).contains("super-secret-value"));
     }
 
     #[tokio::test]

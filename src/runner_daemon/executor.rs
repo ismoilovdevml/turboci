@@ -38,11 +38,7 @@ impl ExecutorType {
         scrubber: &SecretScrubber,
     ) -> Result<String> {
         // Default timeout: 1 hour per job
-        let job_timeout = if job.timeout > 0 {
-            Duration::from_secs(job.timeout as u64)
-        } else {
-            Duration::from_secs(3600) // 1 hour default
-        };
+        let job_timeout = Duration::from_secs(job.timeout_secs().unwrap_or(3600));
 
         // Execute with timeout
         match timeout(job_timeout, async {
