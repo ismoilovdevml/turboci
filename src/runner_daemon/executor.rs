@@ -33,6 +33,12 @@ use crate::gitlab::{FailureReason, Job, RemoteState};
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
 /// GitLab's default after_script timeout
 const DEFAULT_AFTER_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Runs the script (passed as `$1`) with bash when the image or host has it, else
+/// sh, like gitlab-runner: on Debian-based images `sh` is dash, which lacks
+/// `[[ ]]`, `source` and arrays
+const SHELL_DETECT: &str =
+    r#"if command -v bash >/dev/null 2>&1; then exec bash -c "$1"; fi; exec sh -c "$1""#;
+
 /// Upper bound for resetting workspace ownership after a job
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Host directory holding Docker job workspaces (bind-mounted as /builds)
@@ -419,8 +425,13 @@ impl DockerExecutor {
         trace: &mut TraceWriter<'_>,
         containers: &mut JobContainers,
     ) -> JobOutcome {
+        let env = script::job_env(job, "/builds", job_dir);
+        // Image and service names may use variables, e.g. $CI_REGISTRY_IMAGE/ci
+        let values: std::collections::HashMap<String, String> = env.vars.iter().cloned().collect();
+        let expand = |name: &str| script::expand(name, &values);
+
         let (image, policies) = match &job.image {
-            Some(img) => (img.name.clone(), img.pull_policy.clone()),
+            Some(img) => (expand(&img.name), img.pull_policy.clone()),
             None => (self.config.default_image.clone(), Vec::new()),
         };
         trace
@@ -430,7 +441,6 @@ impl DockerExecutor {
         self.ensure_image(&image, Some(&policies), job, trace)
             .await?;
 
-        let env = script::job_env(job, "/builds", job_dir);
         write_variable_files(&env)
             .await
             .map_err(JobFailure::system)?;
@@ -457,13 +467,21 @@ impl DockerExecutor {
             containers.network = Some(network);
         }
         for (index, service) in job.services.iter().enumerate() {
+            let service_image = expand(&service.name);
             trace
-                .write(&format!("Starting service {} ...\n", service.name))
+                .write(&format!("Starting service {} ...\n", service_image))
                 .await;
-            self.ensure_image(&service.name, Some(&service.pull_policy), job, trace)
+            self.ensure_image(&service_image, Some(&service.pull_policy), job, trace)
                 .await?;
             let id = self
-                .start_service(job, index, service, &env, containers.network.as_deref())
+                .start_service(
+                    job,
+                    index,
+                    &service_image,
+                    service,
+                    &env,
+                    containers.network.as_deref(),
+                )
                 .await
                 .map_err(|e| JobFailure::system(format!("service {}: {:#}", service.name, e)))?;
             containers.services.push(id);
@@ -656,13 +674,14 @@ impl DockerExecutor {
         &self,
         job: &Job,
         index: usize,
+        image: &str,
         service: &crate::gitlab::Service,
         env: &JobEnv,
         network: Option<&str>,
     ) -> Result<String> {
         use bollard::models::{EndpointSettings, NetworkingConfig};
 
-        let aliases = image::service_aliases(&service.name, service.alias.as_deref());
+        let aliases = image::service_aliases(image, service.alias.as_deref());
         let networking_config = network.map(|network| NetworkingConfig {
             endpoints_config: Some(std::collections::HashMap::from([(
                 network.to_string(),
@@ -673,7 +692,7 @@ impl DockerExecutor {
             )])),
         });
         let config = ContainerCreateBody {
-            image: Some(service.name.clone()),
+            image: Some(image.to_string()),
             env: Some(env.to_docker()),
             entrypoint: service.entrypoint.clone(),
             cmd: service.command.clone(),
@@ -839,7 +858,7 @@ impl ScriptRunner for DockerRunner<'_> {
             .create_exec(
                 self.container_id,
                 CreateExecOptions {
-                    cmd: Some(vec!["sh", "-c", script]),
+                    cmd: Some(vec!["sh", "-c", SHELL_DETECT, "sh", script]),
                     env: Some(self.env.iter().map(String::as_str).collect()),
                     working_dir: Some(workdir),
                     attach_stdout: Some(true),
@@ -939,8 +958,7 @@ impl ScriptRunner for ShellRunner {
     ) -> Result<RunStatus> {
         let mut command = Command::new("sh");
         command
-            .arg("-c")
-            .arg(script)
+            .args(["-c", SHELL_DETECT, "sh", script])
             .current_dir(workdir)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::null())
@@ -1414,6 +1432,40 @@ mod tests {
             !executor.job_dir(job_id).exists(),
             "workspace not removable"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_uses_bash_and_expands_image_variables() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 940_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "${BASE_IMAGE}"},
+            "variables": [{"key": "BASE_IMAGE", "value": "debian:bookworm-slim"}],
+            "steps": steps(
+                &["[[ 1 == 1 ]] && echo \"bash-syntax-ok\"", "arr=(a b); echo \"array=${arr[1]}\""],
+                &[]
+            )
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("image debian:bookworm-slim"), "{}", log);
+        assert!(log.contains("bash-syntax-ok"), "{}", log);
+        assert!(log.contains("array=b"), "{}", log);
+        executor.cleanup(job_id).await;
     }
 
     #[test]
