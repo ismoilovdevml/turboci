@@ -5,6 +5,9 @@ use crate::gitlab::Job;
 
 /// Longest run of token-like characters held back while streaming
 const MAX_HOLDBACK: usize = 256;
+/// Most output ever held back: an unbounded pattern (e.g. `password=` followed by
+/// megabytes without spaces) must not stop the log or grow memory without limit
+const MAX_PENDING: usize = 16 * 1024;
 
 /// Characters that can be part of a token, key or password matched by the patterns
 fn is_token_char(c: char) -> bool {
@@ -135,6 +138,10 @@ impl SecretScrubber {
         ranges
     }
 
+    fn longest_secret(&self) -> usize {
+        self.secrets.iter().map(String::len).max().unwrap_or(0)
+    }
+
     /// Add a custom pattern to the scrubber
     #[allow(dead_code)]
     pub fn add_pattern(&mut self, pattern: Regex) {
@@ -161,6 +168,8 @@ fn percent_encode(value: &str) -> String {
 pub struct StreamScrubber<'a> {
     scrubber: &'a SecretScrubber,
     pending: String,
+    /// Inside an over-long match that was already masked: drop output until whitespace
+    swallowing: bool,
 }
 
 impl<'a> StreamScrubber<'a> {
@@ -168,11 +177,23 @@ impl<'a> StreamScrubber<'a> {
         Self {
             scrubber,
             pending: String::new(),
+            swallowing: false,
         }
     }
 
     /// Feed a chunk; returns scrubbed output that is safe to emit now
     pub fn push(&mut self, chunk: &str) -> String {
+        let mut chunk = chunk;
+        if self.swallowing {
+            // Unbounded patterns end at whitespace
+            match chunk.find(char::is_whitespace) {
+                Some(end) => {
+                    chunk = &chunk[end..];
+                    self.swallowing = false;
+                }
+                None => return String::new(),
+            }
+        }
         self.pending.push_str(chunk);
         let len = self.pending.len();
 
@@ -196,9 +217,31 @@ impl<'a> StreamScrubber<'a> {
             boundary -= 1;
         }
         // Never cut through a match, and keep matches touching the end (they may grow)
-        for (start, end) in self.scrubber.match_ranges(&self.pending) {
+        let matches = self.scrubber.match_ranges(&self.pending);
+        for &(start, end) in &matches {
             if start < boundary && (end > boundary || end == len) {
                 boundary = start;
+            }
+        }
+        // ...unless that holds back too much. Exact secrets are never split (the
+        // limit is longer than the longest one); a pattern match still growing at
+        // the limit is masked as a whole and its continuation dropped
+        let limit = MAX_PENDING.max(self.scrubber.longest_secret() + MAX_HOLDBACK);
+        if len - boundary > limit {
+            if let Some(start) = matches
+                .iter()
+                .filter(|&&(_, end)| end == len)
+                .map(|&(start, _)| start)
+                .min()
+            {
+                let head = self.pending[..start].to_string();
+                self.pending.clear();
+                self.swallowing = true;
+                return self.scrubber.scrub(&head) + "[MASKED]";
+            }
+            boundary = len - limit;
+            while !self.pending.is_char_boundary(boundary) {
+                boundary += 1;
             }
         }
 
@@ -209,6 +252,7 @@ impl<'a> StreamScrubber<'a> {
 
     /// Flush everything still held back
     pub fn finish(&mut self) -> String {
+        self.swallowing = false;
         let rest = std::mem::take(&mut self.pending);
         self.scrubber.scrub(&rest)
     }
@@ -289,6 +333,26 @@ mod tests {
         assert_eq!(stream.push("Preparing...\n"), "Preparing...\n");
         assert_eq!(stream.push("value: some-long"), "value: ");
         assert_eq!(stream.push("-secret-value\n"), "[MASKED]\n");
+    }
+
+    #[test]
+    fn stream_scrubber_holds_back_a_bounded_amount_and_stays_fast() {
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut stream = StreamScrubber::new(&scrubber);
+        let chunk = "a".repeat(8 * 1024);
+        let started = std::time::Instant::now();
+
+        let mut out = stream.push("log: password=");
+        for _ in 0..256 {
+            out.push_str(&stream.push(&chunk));
+            assert!(stream.pending.len() <= MAX_PENDING + chunk.len());
+        }
+        out.push_str(&stream.push(" next line\n"));
+        out.push_str(&stream.finish());
+
+        // The over-long "password" is masked as a whole, output resumes after it
+        assert_eq!(out, "log: [MASKED] next line\n");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
