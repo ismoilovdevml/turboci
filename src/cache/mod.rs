@@ -75,26 +75,7 @@ impl CacheManager {
 
     /// Compute hash of file or directory
     pub async fn compute_hash(&self, path: &Path) -> Result<String> {
-        use walkdir::WalkDir;
-
-        let mut hasher = blake3::Hasher::new();
-
-        if path.is_file() {
-            let content = tokio::fs::read(path).await?;
-            hasher.update(&content);
-        } else if path.is_dir() {
-            // Hash all files in directory
-            for entry in WalkDir::new(path).sort_by_file_name() {
-                let entry = entry?;
-                if entry.file_type().is_file() {
-                    let content = std::fs::read(entry.path())?;
-                    hasher.update(entry.path().to_string_lossy().as_bytes());
-                    hasher.update(&content);
-                }
-            }
-        }
-
-        Ok(hasher.finalize().to_hex().to_string())
+        hash_path(path).await
     }
 
     /// Get cached build result
@@ -177,20 +158,65 @@ impl CacheManager {
     }
 }
 
+/// Compute BLAKE3 hash of a file, or of all files in a directory (sorted by name)
+pub async fn hash_path(path: &Path) -> Result<String> {
+    use walkdir::WalkDir;
+
+    let mut hasher = blake3::Hasher::new();
+
+    if path.is_file() {
+        let content = tokio::fs::read(path).await?;
+        hasher.update(&content);
+    } else if path.is_dir() {
+        // Hash all files in directory
+        for entry in WalkDir::new(path).sort_by_file_name() {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                let content = std::fs::read(entry.path())?;
+                hasher.update(entry.path().to_string_lossy().as_bytes());
+                hasher.update(&content);
+            }
+        }
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::hash_path;
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_compute_hash() {
+    async fn test_hash_file_matches_blake3_of_content() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
         tokio::fs::write(&file_path, b"test content").await.unwrap();
 
-        // Create a mock cache manager without Redis connection
-        let hash = blake3::hash(b"test content").to_hex().to_string();
+        let hash = hash_path(&file_path).await.unwrap();
 
-        assert!(!hash.is_empty());
-        assert_eq!(hash.len(), 64); // BLAKE3 hash length
+        assert_eq!(hash, blake3::hash(b"test content").to_hex().to_string());
+    }
+
+    #[tokio::test]
+    async fn test_hash_dir_is_deterministic_and_content_sensitive() {
+        let dir = tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), b"a")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(dir.path().join("sub")).await.unwrap();
+        tokio::fs::write(dir.path().join("sub/b.txt"), b"b")
+            .await
+            .unwrap();
+
+        let first = hash_path(dir.path()).await.unwrap();
+        let second = hash_path(dir.path()).await.unwrap();
+        assert_eq!(first, second);
+
+        tokio::fs::write(dir.path().join("sub/b.txt"), b"changed")
+            .await
+            .unwrap();
+        let changed = hash_path(dir.path()).await.unwrap();
+        assert_ne!(first, changed);
     }
 }

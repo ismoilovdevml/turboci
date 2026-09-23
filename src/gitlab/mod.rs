@@ -201,8 +201,12 @@ impl GitLabClient {
                         // Parse "0-123" format - take end offset
                         if let Some((_start, end)) = range_str.split_once('-') {
                             if let Ok(server_offset) = end.parse::<usize>() {
-                                debug!("Range mismatch: server at {}, we sent {}-{}",
-                                      server_offset, offset, end_offset - 1);
+                                debug!(
+                                    "Range mismatch: server at {}, we sent {}-{}",
+                                    server_offset,
+                                    offset,
+                                    end_offset - 1
+                                );
                                 return Ok(server_offset);
                             }
                         }
@@ -657,4 +661,126 @@ pub enum JobState {
     Success,
     Failed,
     Canceled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn client(server: &MockServer) -> GitLabClient {
+        GitLabClient::new(server.uri(), "runner-token".to_string())
+    }
+
+    #[tokio::test]
+    async fn request_job_returns_none_when_no_job() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .and(body_partial_json(
+                serde_json::json!({"token": "runner-token"}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let job = client(&server).request_job("runner-token").await.unwrap();
+
+        assert!(job.is_none());
+    }
+
+    #[tokio::test]
+    async fn request_job_parses_assigned_job() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 42,
+                "token": "job-token",
+                "steps": [{"name": "script", "script": ["echo hi"], "timeout": 3600,
+                           "when": "on_success", "allow_failure": false}]
+            })))
+            .mount(&server)
+            .await;
+
+        let job = client(&server)
+            .request_job("runner-token")
+            .await
+            .unwrap()
+            .expect("job expected");
+
+        assert_eq!(job.id, 42);
+        assert_eq!(job.token, "job-token");
+        assert_eq!(job.steps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_job_fails_on_forbidden() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        assert!(client(&server).request_job("bad-token").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn patch_trace_sends_inclusive_content_range_and_job_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v4/jobs/7/trace"))
+            .and(header("JOB-TOKEN", "job-token"))
+            .and(header("Content-Range", "10-14"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let next = client(&server)
+            .patch_trace(7, "job-token", "hello", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(next, 15);
+    }
+
+    #[tokio::test]
+    async fn patch_trace_returns_server_offset_on_range_mismatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v4/jobs/7/trace"))
+            .respond_with(ResponseTemplate::new(416).insert_header("Range", "0-3"))
+            .mount(&server)
+            .await;
+
+        let next = client(&server)
+            .patch_trace(7, "job-token", "hello", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(next, 3);
+    }
+
+    #[tokio::test]
+    async fn update_job_sends_token_and_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/jobs/7"))
+            .and(body_partial_json(
+                serde_json::json!({"token": "job-token", "state": "success"}),
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .update_job(7, "job-token", JobState::Success, None)
+            .await
+            .unwrap();
+    }
 }
