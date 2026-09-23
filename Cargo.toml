@@ -1,6 +1,6 @@
 [package]
 name = "turboci"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["TurboCI Team"]
 description = "Super fast CI/CD runner with distributed caching and parallel execution"
@@ -32,6 +32,7 @@ bollard = { version = "0.19", optional = true }
 futures-util = { version = "0.3", optional = true }
 toml = { version = "0.9", optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
+dns-lookup = "2"
 
 [features]
 default = []

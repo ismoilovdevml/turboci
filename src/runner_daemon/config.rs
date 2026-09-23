@@ -303,6 +303,9 @@ mod tests {
         let body = &install[start..];
         let body = &body[body.find('\n').unwrap() + 1..body.find("\nEOF\n").unwrap()];
         let rendered = body
+            .replace("$CONCURRENT", "4")
+            .replace("$RUNNER_TOKEN", "")
+            .replace("$GITLAB_URL", "https://gitlab.com")
             .replace("$EXECUTOR", "docker")
             .replace("$STATE_DIR", "/var/lib/turboci")
             .replace("$SERVICE_USER", "turboci");

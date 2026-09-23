@@ -4,6 +4,7 @@ use tracing::info;
 
 mod cache;
 mod config;
+mod net;
 mod optimizer;
 mod runner;
 
@@ -269,7 +270,7 @@ async fn upgrade() -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION");
     println!("Current version: {}", current_version);
 
-    let client = reqwest::Client::builder()
+    let client = net::client_builder()
         .user_agent("TurboCI")
         .timeout(std::time::Duration::from_secs(300))
         .build()?;

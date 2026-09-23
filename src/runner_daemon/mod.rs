@@ -156,6 +156,7 @@ impl RunnerDaemon {
         info!("   Check interval: {}s", self.config.check_interval);
         info!("   Cache enabled: {}", self.config.cache_enabled);
 
+        let mut connected = false;
         loop {
             // Wait for a free slot; a shutdown interrupts only this wait and the
             // sleeps, never a job request GitLab may already have answered
@@ -164,6 +165,13 @@ impl RunnerDaemon {
                 _ = self.shutdown_requested() => break,
             };
             let claimed = claim_with_permit(permit, &self.gitlab, &self.config.runner_token).await;
+            if claimed.is_ok() && !connected {
+                connected = true;
+                info!(
+                    "✅ Connected to GitLab at {}, waiting for jobs",
+                    self.config.gitlab_url
+                );
+            }
             let idle = match claimed {
                 Ok(Some((job, permit))) => {
                     let job_name = job
@@ -184,7 +192,7 @@ impl RunnerDaemon {
                 }
                 Ok(None) => true,
                 Err(e) => {
-                    warn!("Failed to request job: {}", e);
+                    warn!("Failed to request job: {:#}", e);
                     true
                 }
             };

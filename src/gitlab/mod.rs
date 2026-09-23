@@ -83,7 +83,7 @@ pub struct GitLabClient {
 impl GitLabClient {
     pub fn new(url: String, token: String) -> Self {
         Self {
-            client: Client::builder()
+            client: crate::net::client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),

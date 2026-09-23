@@ -52,8 +52,13 @@ pub fn load_or_create(state_file: &Path) -> String {
     let id = generate();
     match write_state(state_file, &id) {
         Ok(()) => info!("Created runner system ID {} in {:?}", id, state_file),
+        // A machine-derived ID is the same after a restart, so not saving it is harmless
+        Err(e) if id.starts_with("s_") => info!(
+            "Using machine-derived runner system ID {} (not saved to {:?}: {})",
+            id, state_file, e
+        ),
         Err(e) => warn!(
-            "Could not save runner system ID {} to {:?}: {}",
+            "Could not save runner system ID {} to {:?}: {}; it will change on restart",
             id, state_file, e
         ),
     }

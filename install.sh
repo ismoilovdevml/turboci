@@ -2,8 +2,12 @@
 set -e
 
 # TurboCI Automated Installer
-# Installs: TurboCI + Systemd Service
+# Installs: TurboCI (+ Docker for the docker executor) + Systemd Service
 # Supports: Ubuntu, Debian, RHEL, Rocky, AlmaLinux, Fedora
+#
+# One command, registered and running:
+#   curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh \
+#     | sudo bash -s -- --url https://gitlab.example.com --token glrt-XXXX
 
 REPO="ismoilovdevml/turboci"
 INSTALL_DIR="/usr/local/bin"
@@ -14,9 +18,47 @@ SERVICE_USER="turboci"
 STATE_DIR="/var/lib/turboci"
 # The Docker executor currently uses this fixed host path for job workspaces.
 DOCKER_BUILDS_DIR="/tmp/turboci-builds"
-# Executor for the generated config: "docker" (default) or "shell".
-# Select shell explicitly with: sudo TURBOCI_EXECUTOR=shell bash install.sh
+# Settings: command line options, or the TURBOCI_* environment variables
 EXECUTOR="${TURBOCI_EXECUTOR:-docker}"
+GITLAB_URL="${TURBOCI_URL:-https://gitlab.com}"
+RUNNER_TOKEN="${TURBOCI_TOKEN:-}"
+CONCURRENT="${TURBOCI_CONCURRENT:-4}"
+VERSION="${TURBOCI_VERSION:-}"
+LOCAL_BINARY=""
+START_SERVICE=1
+
+usage() {
+    cat << USAGE
+Usage: install.sh [options]
+
+  --url URL          GitLab URL (default: https://gitlab.com)
+  --token TOKEN      Runner authentication token (glrt-...); with it the runner
+                     is configured and started, without it only installed
+  --executor NAME    docker (default) or shell (no isolation: trusted projects only)
+  --concurrent N     Jobs run in parallel (default: 4)
+  --version vX.Y.Z   Release to install (default: latest)
+  --binary PATH      Install this binary instead of downloading a release
+  --no-start         Configure but do not start the service
+  -h, --help         Show this help
+
+Environment: TURBOCI_URL, TURBOCI_TOKEN, TURBOCI_EXECUTOR, TURBOCI_CONCURRENT,
+TURBOCI_VERSION.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --url) GITLAB_URL="${2:?--url needs a value}"; shift 2 ;;
+        --token) RUNNER_TOKEN="${2:?--token needs a value}"; shift 2 ;;
+        --executor) EXECUTOR="${2:?--executor needs a value}"; shift 2 ;;
+        --concurrent) CONCURRENT="${2:?--concurrent needs a value}"; shift 2 ;;
+        --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
+        --binary) LOCAL_BINARY="${2:?--binary needs a value}"; shift 2 ;;
+        --no-start) START_SERVICE=0; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
 
 # Colors
 RED='\033[0;31m'
@@ -97,11 +139,54 @@ detect_arch() {
     echo -e "${GREEN}✓${NC} Architecture: ${BLUE}$DISPLAY_ARCH${NC}"
 }
 
+# Check option values before changing anything on the host
+validate_options() {
+    case "$GITLAB_URL" in
+        http://*|https://*) GITLAB_URL="${GITLAB_URL%/}" ;;
+        *) echo -e "${RED}❌ --url must start with https:// or http://${NC}"; exit 1 ;;
+    esac
+    if ! [[ "$CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}❌ --concurrent must be a positive number${NC}"
+        exit 1
+    fi
+    if [ -n "$LOCAL_BINARY" ] && [ ! -f "$LOCAL_BINARY" ]; then
+        echo -e "${RED}❌ --binary: $LOCAL_BINARY not found${NC}"
+        exit 1
+    fi
+}
+
+# Install Docker for the docker executor when it is missing
+install_docker() {
+    [ "$EXECUTOR" = "docker" ] || return 0
+    echo -e "\n${YELLOW}🐳 Checking Docker...${NC}"
+
+    if ! command -v docker > /dev/null 2>&1; then
+        echo -e "${YELLOW}⏳ Installing Docker (get.docker.com)...${NC}"
+        curl -fsSL https://get.docker.com | sh
+    fi
+    systemctl enable --now docker > /dev/null 2>&1 || true
+    if docker info > /dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Docker: ${BLUE}$(docker version --format '{{.Server.Version}}')${NC}"
+    else
+        echo -e "${RED}❌ Docker is installed but not running${NC}"
+        exit 1
+    fi
+}
+
 # Get latest TurboCI release
 get_latest_version() {
+    if [ -n "$LOCAL_BINARY" ]; then
+        LATEST_VERSION="local binary"
+        return
+    fi
+    if [ -n "$VERSION" ]; then
+        LATEST_VERSION="$VERSION"
+        echo -e "${GREEN}✓${NC} Version: ${BLUE}$LATEST_VERSION${NC}"
+        return
+    fi
     echo -e "\n${YELLOW}📡 Fetching latest TurboCI release...${NC}"
 
-    LATEST_VERSION=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | \
+    LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | \
                      grep '"tag_name":' | \
                      sed -E 's/.*"([^"]+)".*/\1/')
 
@@ -115,6 +200,12 @@ get_latest_version() {
 
 # Download and install TurboCI
 install_turboci() {
+    if [ -n "$LOCAL_BINARY" ]; then
+        echo -e "\n${YELLOW}📦 Installing $LOCAL_BINARY...${NC}"
+        install -m 0755 "$LOCAL_BINARY" "$INSTALL_DIR/$BIN_NAME"
+        verify_binary
+        return
+    fi
     echo -e "\n${YELLOW}📥 Downloading TurboCI $LATEST_VERSION...${NC}"
 
     RELEASE_URL="https://github.com/$REPO/releases/download/$LATEST_VERSION"
@@ -149,10 +240,12 @@ install_turboci() {
     mv "$TEMP_FILE" "$INSTALL_DIR/$BIN_NAME"
 
     echo -e "${GREEN}✓${NC} TurboCI installed: ${BLUE}$INSTALL_DIR/$BIN_NAME${NC}"
+    verify_binary
+}
 
-    # Verify
-    if VERSION=$($INSTALL_DIR/$BIN_NAME --version 2>&1); then
-        echo -e "${GREEN}✓${NC} Binary verified: ${BLUE}$VERSION${NC}"
+verify_binary() {
+    if INSTALLED_VERSION=$($INSTALL_DIR/$BIN_NAME --version 2>&1); then
+        echo -e "${GREEN}✓${NC} Binary verified: ${BLUE}$INSTALLED_VERSION${NC}"
     else
         echo -e "${RED}❌ Binary verification failed${NC}"
         exit 1
@@ -239,7 +332,12 @@ create_config() {
 
     CONFIG_FILE="$CONFIG_DIR/turboci-runner.toml"
 
-    if [ -f "$CONFIG_FILE" ]; then
+    if [ -f "$CONFIG_FILE" ] && [ -n "$RUNNER_TOKEN" ]; then
+        # A token on the command line replaces the config; keep the old one
+        BACKUP="$CONFIG_FILE.bak.$(date +%Y-%m-%d-%H%M%S)"
+        cp -p "$CONFIG_FILE" "$BACKUP"
+        echo -e "${YELLOW}⚠️  Replacing existing config (backup: $BACKUP)${NC}"
+    elif [ -f "$CONFIG_FILE" ]; then
         echo -e "${YELLOW}⚠️  Config already exists: $CONFIG_FILE${NC}"
         # stdin is the script itself under `curl | bash`: ask on the terminal
         REPLY=""
@@ -262,10 +360,10 @@ create_config() {
 
     cat > "$CONFIG_FILE" << EOF
 # TurboCI Runner Configuration
-concurrent = 4
+concurrent = $CONCURRENT
 check_interval = 3
-runner_token = ""
-gitlab_url = "https://gitlab.com"
+runner_token = "$RUNNER_TOKEN"
+gitlab_url = "$GITLAB_URL"
 cache_enabled = true
 cache_dir = "$STATE_DIR/cache"
 
@@ -287,7 +385,9 @@ EOF
     secure_config
 
     echo -e "${GREEN}✓${NC} Config created: ${BLUE}$CONFIG_FILE${NC} (executor: $EXECUTOR)"
-    echo -e "${YELLOW}⚠️  You must edit this file and set your runner_token${NC}"
+    if [ -z "$RUNNER_TOKEN" ]; then
+        echo -e "${YELLOW}⚠️  You must edit this file and set your runner_token${NC}"
+    fi
 }
 
 # The config holds the runner token: readable by the service group only
@@ -325,7 +425,6 @@ NoNewPrivileges=true
 # PrivateTmp must stay off: the Docker executor bind-mounts job workspaces
 # from $DOCKER_BUILDS_DIR, and dockerd resolves that path in the host's /tmp.
 # A private /tmp would hand every job container an empty workspace.
-# Revisit once workspaces move out of /tmp (issue #21).
 PrivateTmp=false
 ProtectSystem=strict
 ProtectHome=true
@@ -348,13 +447,46 @@ EOF
     echo -e "${GREEN}✓${NC} Systemd reloaded"
 }
 
-# Enable service (but don't start yet - needs config)
+# Enable the service; start it when a token was given
 enable_service() {
     echo -e "\n${YELLOW}🎬 Enabling service...${NC}"
 
-    systemctl enable $SERVICE_NAME
+    systemctl enable $SERVICE_NAME > /dev/null 2>&1
     echo -e "${GREEN}✓${NC} Service enabled (auto-start on boot)"
-    echo -e "${YELLOW}ℹ️  Service NOT started yet - configure token first${NC}"
+
+    if [ -z "$RUNNER_TOKEN" ] || [ "$START_SERVICE" -eq 0 ]; then
+        STARTED=0
+        echo -e "${YELLOW}ℹ️  Service NOT started${NC}"
+        return
+    fi
+
+    STARTED_AT=$(date '+%Y-%m-%d %H:%M:%S')
+    systemctl restart $SERVICE_NAME
+
+    # Wait until the runner reports its first successful request to GitLab
+    for _ in $(seq 1 20); do
+        sleep 1
+        if ! systemctl is-active --quiet $SERVICE_NAME; then
+            echo -e "${RED}❌ Service failed to start:${NC}"
+            journalctl -u $SERVICE_NAME -n 20 --no-pager
+            exit 1
+        fi
+        LOG=$(journalctl -u $SERVICE_NAME --since "$STARTED_AT" --no-pager -o cat 2>/dev/null)
+        if echo "$LOG" | grep -q "Connected to GitLab"; then
+            break
+        fi
+        if echo "$LOG" | grep -q "Invalid runner token"; then
+            echo -e "${RED}❌ GitLab rejected the runner token (check --url and --token)${NC}"
+            exit 1
+        fi
+    done
+    if ! echo "$LOG" | grep -q "Connected to GitLab"; then
+        echo -e "${RED}❌ The runner could not reach $GITLAB_URL:${NC}"
+        echo "$LOG" | grep -E "WARN|ERROR" | tail -5
+        exit 1
+    fi
+    STARTED=1
+    echo -e "${GREEN}✓${NC} Service running and polling ${BLUE}$GITLAB_URL${NC} for jobs"
 }
 
 # Print next steps
@@ -362,6 +494,12 @@ print_next_steps() {
     echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}✨ Installation Complete!${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    if [ "$STARTED" -eq 1 ]; then
+        echo -e "\n${GREEN}🚀 TurboCI is running.${NC} Jobs for this runner will start automatically."
+        echo -e "   Logs: ${BLUE}journalctl -u turboci -f${NC}\n"
+        return
+    fi
 
     echo -e "\n${BLUE}📋 Next Steps:${NC}"
     echo -e "\n${YELLOW}1. Get GitLab Runner Token:${NC}"
@@ -408,8 +546,10 @@ main() {
     echo -e "${BLUE}Starting automated installation...${NC}\n"
 
     validate_executor
+    validate_options
     detect_os
     detect_arch
+    install_docker
     get_latest_version
     install_turboci
     create_service_user
