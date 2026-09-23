@@ -204,7 +204,7 @@ pub async fn create_archive(
             "zip" => build_zip(Path::new(&workspace), &files),
             "gzip" => build_gzip(&files),
             "raw" => match files.as_slice() {
-                [file] => Ok(std::fs::read(file)?),
+                [file] => read_regular_file(file, MAX_RAW_ARTIFACT_BYTES),
                 _ => anyhow::bail!("raw artifacts need exactly one file, got {}", files.len()),
             },
             other => anyhow::bail!("Unsupported artifact format {:?}", other),
@@ -212,6 +212,35 @@ pub async fn create_archive(
     })
     .await
     .context("Archive task panicked")?
+}
+
+/// Largest `raw` report artifact read into memory
+const MAX_RAW_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read a regular file (never a symlink, FIFO or device) of at most `max` bytes
+fn read_regular_file(path: &Path, max: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    let file = std::fs::File::open(path)?;
+    // The path must still be the file checked above, not something swapped in
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        if opened.dev() != before.dev() || opened.ino() != before.ino() {
+            anyhow::bail!("{} changed while it was being read", path.display());
+        }
+    }
+    let mut data = Vec::new();
+    file.take(max + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > max {
+        anyhow::bail!("{} is larger than {} bytes", path.display(), max);
+    }
+    Ok(data)
 }
 
 /// Files matching `patterns` inside the workspace.
@@ -538,6 +567,38 @@ mod tests {
             .read_to_string(&mut decoded)
             .unwrap();
         assert_eq!(decoded, "<a/><b/>");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_archive_refuses_symlinks_and_special_files() {
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("turboci-runner.toml");
+        std::fs::write(&secret, b"runner_token = \"glrt-SECRET\"").unwrap();
+        std::os::unix::fs::symlink(&secret, ws.path().join("gl-sast-report.json")).unwrap();
+        let ws_path = ws.path().to_str().unwrap();
+
+        let leaked = create_archive(ws_path, &["gl-sast-report.json".to_string()], "raw").await;
+        assert!(
+            leaked.is_err(),
+            "symlink target was read: {:?}",
+            leaked.map(String::from_utf8)
+        );
+
+        let fifo = ws.path().join("report.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            create_archive(ws_path, &["report.json".to_string()], "raw"),
+        )
+        .await
+        .expect("reading a FIFO must not block");
+        assert!(blocked.is_err());
     }
 
     #[tokio::test]
