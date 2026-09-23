@@ -390,6 +390,185 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 1);
     }
 
+    /// A daemon with the shell executor talking to a mock GitLab
+    async fn daemon(server: &MockServer, dir: &std::path::Path) -> RunnerDaemon {
+        for (verb, route, status) in [
+            ("PATCH", r"^/api/v4/jobs/\d+/trace$", 202),
+            ("PUT", r"^/api/v4/jobs/\d+$", 200),
+            ("POST", r"^/api/v4/jobs/\d+/artifacts$", 201),
+        ] {
+            Mock::given(method(verb))
+                .and(wiremock::matchers::path_regex(route))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(server)
+                .await;
+        }
+        let config = config::RunnerConfig {
+            runner_token: "glrt-test".to_string(),
+            gitlab_url: server.uri(),
+            cache_dir: dir.join("cache").to_string_lossy().into_owned(),
+            ..config::RunnerConfig::default()
+        };
+        let executor = executor::ExecutorType::Shell(executor::ShellExecutor::new(Some(
+            dir.join("builds").to_string_lossy().into_owned(),
+        )));
+        RunnerDaemon::new(
+            config,
+            GitLabClient::new(server.uri(), "glrt-test".to_string()),
+            executor,
+        )
+    }
+
+    fn lifecycle_job(id: u64, script: &[&str], artifacts_when: &str) -> Job {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "token": format!("job-token-{}", id),
+            "job_info": {"name": "build", "stage": "test", "project_id": 5, "project_name": "app"},
+            "variables": [{"key": "SECRET", "value": "s3cr3t-value", "masked": true}],
+            "steps": [{"name": "script", "script": script, "when": "on_success", "timeout": 60}],
+            "artifacts": [{"name": "dist", "paths": ["out/"], "when": artifacts_when}],
+            "cache": [{"key": "deps", "paths": ["vendor/"], "policy": "pull-push"}]
+        }))
+        .unwrap()
+    }
+
+    async fn requests(server: &MockServer, verb: &str, job_id: u64) -> Vec<wiremock::Request> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == verb && r.url.path().contains(&format!("/jobs/{}", job_id))
+            })
+            .collect()
+    }
+
+    async fn trace_of(server: &MockServer, job_id: u64) -> String {
+        requests(server, "PATCH", job_id)
+            .await
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    async fn final_update(server: &MockServer, job_id: u64) -> serde_json::Value {
+        let updates = requests(server, "PUT", job_id).await;
+        assert_eq!(updates.len(), 1, "exactly one final update expected");
+        serde_json::from_slice(&updates[0].body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn successful_job_streams_trace_uploads_artifacts_saves_cache_and_cleans_up() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let job = lifecycle_job(
+            11,
+            &[
+                "mkdir -p out vendor",
+                "echo built > out/app.txt",
+                "echo dep > vendor/lib.txt",
+                "echo secret=$SECRET",
+            ],
+            "on_success",
+        );
+
+        daemon.execute_job(job).await.unwrap();
+
+        let update = final_update(&server, 11).await;
+        assert_eq!(update["state"], "success");
+        assert!(update.get("failure_reason").is_none());
+
+        let trace = trace_of(&server, 11).await;
+        assert!(trace.contains("$ echo built > out/app.txt"), "{}", trace);
+        assert!(trace.contains("secret=[MASKED]"), "{}", trace);
+        assert!(!trace.contains("s3cr3t-value"));
+        assert!(trace.ends_with("Job succeeded\n"), "{}", trace);
+
+        let uploads = requests(&server, "POST", 11).await;
+        assert_eq!(uploads.len(), 1);
+        assert!(String::from_utf8_lossy(&uploads[0].body).contains("filename=\"dist.zip\""));
+
+        assert_eq!(daemon.cache.stats().0, 1, "cache archive saved");
+        assert!(
+            !dir.path().join("builds/job-11").exists(),
+            "workspace removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_job_reports_reason_and_only_uploads_on_failure_artifacts() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+
+        daemon
+            .execute_job(lifecycle_job(
+                21,
+                &["mkdir -p out", "echo log > out/log.txt", "exit 2"],
+                "on_success",
+            ))
+            .await
+            .unwrap();
+        daemon
+            .execute_job(lifecycle_job(
+                22,
+                &["mkdir -p out", "echo log > out/log.txt", "exit 2"],
+                "on_failure",
+            ))
+            .await
+            .unwrap();
+
+        for id in [21, 22] {
+            let update = final_update(&server, id).await;
+            assert_eq!(update["state"], "failed");
+            assert_eq!(update["failure_reason"], "script_failure");
+            assert_eq!(update["exit_code"], 2);
+            assert!(trace_of(&server, id)
+                .await
+                .contains("ERROR: Job failed: exit code 2"));
+        }
+        assert!(
+            requests(&server, "POST", 21).await.is_empty(),
+            "on_success artifacts skipped"
+        );
+        assert_eq!(
+            requests(&server, "POST", 22).await.len(),
+            1,
+            "on_failure artifacts uploaded"
+        );
+        assert_eq!(daemon.cache.stats().0, 0, "no cache saved for failed jobs");
+    }
+
+    #[tokio::test]
+    async fn next_job_restores_cache_of_previous_job() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+
+        daemon
+            .execute_job(lifecycle_job(
+                31,
+                &["mkdir -p vendor", "echo cached-dep > vendor/lib.txt"],
+                "on_success",
+            ))
+            .await
+            .unwrap();
+        daemon
+            .execute_job(lifecycle_job(32, &["cat vendor/lib.txt"], "on_success"))
+            .await
+            .unwrap();
+
+        assert_eq!(final_update(&server, 32).await["state"], "success");
+        let trace = trace_of(&server, 32).await;
+        assert!(
+            trace.contains("Successfully restored cache deps"),
+            "{}",
+            trace
+        );
+        assert!(trace.contains("cached-dep"), "{}", trace);
+    }
+
     #[tokio::test]
     async fn claim_job_releases_slot_when_no_job_is_available() {
         let server = MockServer::start().await;
