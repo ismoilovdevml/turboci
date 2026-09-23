@@ -8,12 +8,16 @@ use tracing::{error, info, warn};
 use crate::gitlab::{GitLabClient, Job, JobState};
 use crate::security::secret_scrubber::SecretScrubber;
 use crate::storage::{HybridStorage, StorageBackend};
+use executor::{JobFailure, JobOutcome};
+use trace::TraceWriter;
 
 pub mod artifacts;
 pub mod config;
 pub mod executor;
 pub mod git;
+pub mod script;
 pub mod system_id;
+pub mod trace;
 
 /// Wait for a free job slot, then ask GitLab for a job.
 ///
@@ -124,7 +128,7 @@ impl RunnerDaemon {
         }
     }
 
-    /// Execute a single job
+    /// Run a job end to end and always report a final state to GitLab
     async fn execute_job(&self, job: Job) -> Result<()> {
         let job_name = job
             .job_info
@@ -133,116 +137,92 @@ impl RunnerDaemon {
             .unwrap_or("unknown");
         info!("▶️  Starting job #{}: {}", job.id, job_name);
 
-        // Update job state to running
-        self.gitlab
-            .update_job(job.id, &job.token, JobState::Running, None)
-            .await?;
+        // Mask the job token, dependency tokens and masked variables
+        let scrubber = self.scrubber.with_job_secrets(&job);
+        let mut trace = TraceWriter::new(Some(&self.gitlab), job.id, &job.token, &scrubber);
+        trace
+            .write(&format!(
+                "Running with TurboCI {}\n",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .await;
 
-        // STAGE 1: Prepare execution environment
-        info!("📋 Stage: Preparing execution environment");
-        let prepare_trace = "Preparing execution environment...\n";
-        let mut trace_offset = 0;
-        trace_offset = self
-            .gitlab
-            .patch_trace(job.id, &job.token, prepare_trace, trace_offset)
-            .await
-            .unwrap_or(0);
-
-        // STAGE 2: Get sources (git clone/fetch)
-        if let Some(ref git_info) = job.git_info {
-            // repo_url embeds the job token, so it is never logged or traced
-            info!(
-                "📥 Stage: Getting sources for {} ({})",
-                git_info.ref_name, git_info.sha
-            );
-            let git_trace = format!(
-                "Fetching changes...\nRef: {}\nSHA: {}\n",
-                git_info.ref_name, git_info.sha
-            );
-            trace_offset = self
-                .gitlab
-                .patch_trace(job.id, &job.token, &git_trace, trace_offset)
-                .await
-                .unwrap_or(trace_offset);
+        let mut outcome = self.prepare_workspace(&job, &mut trace).await;
+        if outcome.is_ok() {
+            outcome = self.executor.execute(&job, &mut trace).await;
         }
+        self.upload_artifacts(&job, &mut trace, outcome.is_ok())
+            .await;
+        if outcome.is_ok() {
+            self.upload_cache(&job, &mut trace).await;
+        }
+        self.executor.cleanup(job.id).await;
 
-        // STAGE 3: Restore cache
-        info!("📦 Stage: Restoring cache");
+        let (state, reason, exit_code) = match &outcome {
+            Ok(()) => {
+                info!("✅ Job #{} succeeded", job.id);
+                trace.write("\nJob succeeded\n").await;
+                (JobState::Success, None, None)
+            }
+            Err(failure) => {
+                let message = scrubber.scrub(&failure.message);
+                error!("❌ Job #{} failed: {}", job.id, message);
+                trace
+                    .write(&format!("\nERROR: Job failed: {}\n", message))
+                    .await;
+                (JobState::Failed, Some(failure.reason), failure.exit_code)
+            }
+        };
+        trace.finish().await;
+
+        self.gitlab
+            .update_job(job.id, &job.token, state, reason, exit_code)
+            .await
+    }
+
+    /// Create the workspace and restore cache and dependency artifacts into it
+    async fn prepare_workspace(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
+        let project_dir = self.executor.job_dir(job.id).join("project");
+        tokio::fs::create_dir_all(&project_dir)
+            .await
+            .map_err(|e| JobFailure::system(format!("Failed to create workspace: {}", e)))?;
+        let workspace = project_dir.to_string_lossy();
+
         for cache_entry in &job.cache {
             if cache_entry.policy == "pull" || cache_entry.policy == "pull-push" {
-                if let Ok(Some(cache_data)) = self
-                    .gitlab
-                    .download_cache(job.id, &job.token, &cache_entry.key)
-                    .await
+                trace
+                    .write(&format!("Restoring cache {}...\n", cache_entry.key))
+                    .await;
+                if let Err(e) = artifacts::download_and_extract_cache(
+                    &self.config.gitlab_url,
+                    job.id,
+                    &job.token,
+                    &workspace,
+                    &cache_entry.key,
+                )
+                .await
                 {
-                    let cache_trace = format!(
-                        "✓ Restored cache: {} ({} bytes)\n",
-                        cache_entry.key,
-                        cache_data.len()
-                    );
-                    trace_offset = self
-                        .gitlab
-                        .patch_trace(job.id, &job.token, &cache_trace, trace_offset)
-                        .await
-                        .unwrap_or(trace_offset);
-
-                    // Extract cache to workspace
-                    let workspace_path = match &*self.executor {
-                        executor::ExecutorType::Docker(_) => {
-                            format!("/tmp/turboci-builds/job-{}/project", job.id)
-                        }
-                        executor::ExecutorType::Shell(_) => {
-                            format!("/tmp/turboci/job-{}/project", job.id)
-                        }
-                    };
-
-                    if let Err(e) = artifacts::download_and_extract_cache(
-                        &self.config.gitlab_url,
-                        job.id,
-                        &job.token,
-                        &workspace_path,
-                        &cache_entry.key,
-                    )
-                    .await
-                    {
-                        warn!("Failed to extract cache {}: {}", cache_entry.key, e);
-                    }
+                    warn!("Failed to restore cache {}: {}", cache_entry.key, e);
+                    trace
+                        .write(&format!("WARNING: Failed to restore cache: {}\n", e))
+                        .await;
                 }
             }
         }
 
-        // STAGE 4: Download artifacts from dependencies
-        info!("📥 Stage: Downloading artifacts");
-
-        // Determine workspace path based on executor type
-        let workspace_path = match &*self.executor {
-            executor::ExecutorType::Docker(_) => {
-                format!("/tmp/turboci-builds/job-{}/project", job.id)
-            }
-            executor::ExecutorType::Shell(_) => {
-                format!("/tmp/turboci/job-{}/project", job.id)
-            }
-        };
-
         for dependency in &job.dependencies {
-            let dep_trace = format!(
-                "Downloading artifacts from job #{} ({})\n",
-                dependency.id, dependency.name
-            );
-            trace_offset = self
-                .gitlab
-                .patch_trace(job.id, &job.token, &dep_trace, trace_offset)
-                .await
-                .unwrap_or(trace_offset);
-
-            // Download and extract artifacts
-            let artifact_names = vec!["artifact".to_string()]; // Default name, should come from job config
+            trace
+                .write(&format!(
+                    "Downloading artifacts from job #{} ({})...\n",
+                    dependency.id, dependency.name
+                ))
+                .await;
             if let Err(e) = artifacts::download_and_extract_artifacts(
                 &self.config.gitlab_url,
                 dependency.id,
                 &dependency.token,
-                &workspace_path,
-                &artifact_names,
+                &workspace,
+                &["artifact".to_string()],
             )
             .await
             {
@@ -250,163 +230,97 @@ impl RunnerDaemon {
                     "Failed to download artifacts from job #{}: {}",
                     dependency.id, e
                 );
+                trace
+                    .write(&format!("WARNING: Failed to download artifacts: {}\n", e))
+                    .await;
             }
         }
-
-        // Mask the job token, dependency tokens and masked variables
-        let scrubber = self.scrubber.with_job_secrets(&job);
-
-        // Execute job with real-time trace streaming to GitLab
-        let result = self
-            .executor
-            .execute_with_streaming(&job, Some(&self.gitlab), &scrubber)
-            .await;
-
-        match result {
-            Ok(trace) => {
-                info!("✅ Job #{} completed successfully", job.id);
-
-                // Scrub secrets from trace
-                let scrubbed_trace = scrubber.scrub(&trace);
-
-                // Stream trace to GitLab (GitLab 17.x)
-                let _final_offset = match self
-                    .gitlab
-                    .patch_trace(job.id, &job.token, &scrubbed_trace, 0)
-                    .await
-                {
-                    Ok(offset) => offset,
-                    Err(e) => {
-                        warn!("Failed to stream trace: {}", e);
-                        0
-                    }
-                };
-
-                // Upload artifacts in parallel if available (GitLab 17.x)
-                if let Some(ref artifacts) = job.artifacts {
-                    let mut upload_futures = Vec::new();
-
-                    for artifact in artifacts {
-                        let artifact_name = artifact.name.as_deref().unwrap_or("artifact");
-
-                        // Collect and ZIP artifacts from workspace
-                        let workspace_path = format!("/tmp/turboci-builds/job-{}/project", job.id);
-                        let artifact_data = match artifacts::create_zip_from_paths(
-                            &workspace_path,
-                            &artifact.paths,
-                        )
-                        .await
-                        {
-                            Ok(data) => data,
-                            Err(e) => {
-                                warn!("Failed to create artifact ZIP: {}", e);
-                                continue;
-                            }
-                        };
-
-                        info!(
-                            "📦 Created artifact ZIP: {} ({} bytes)",
-                            artifact_name,
-                            artifact_data.len()
-                        );
-
-                        // Spawn parallel upload task
-                        let gitlab = self.gitlab.clone();
-                        let job_id = job.id;
-                        let job_token = job.token.clone();
-                        let artifact_name_owned = artifact_name.to_string();
-                        let expire_in_owned = artifact.expire_in.clone();
-
-                        let upload_task = tokio::spawn(async move {
-                            gitlab
-                                .upload_artifacts(
-                                    job_id,
-                                    &job_token,
-                                    artifact_data,
-                                    &artifact_name_owned,
-                                    expire_in_owned.as_deref(),
-                                )
-                                .await
-                        });
-
-                        upload_futures.push((artifact_name.to_string(), upload_task));
-                    }
-
-                    // Wait for all uploads to complete in parallel
-                    for (artifact_name, upload_task) in upload_futures {
-                        match upload_task.await {
-                            Ok(Ok(())) => {
-                                info!("✅ Uploaded artifact: {}", artifact_name);
-                            }
-                            Ok(Err(e)) => {
-                                warn!("Failed to upload artifact {}: {}", artifact_name, e);
-                            }
-                            Err(e) => {
-                                warn!("Upload task panicked for {}: {}", artifact_name, e);
-                            }
-                        }
-                    }
-                }
-
-                // Upload cache after execution (GitLab 17.x)
-                for cache_entry in &job.cache {
-                    if cache_entry.policy == "push" || cache_entry.policy == "pull-push" {
-                        // Create ZIP from cache paths
-                        let workspace_path = format!("/tmp/turboci-builds/job-{}/project", job.id);
-                        let cache_data = match artifacts::create_zip_from_paths(
-                            &workspace_path,
-                            &cache_entry.paths,
-                        )
-                        .await
-                        {
-                            Ok(data) => data,
-                            Err(e) => {
-                                warn!("Failed to create cache ZIP: {}", e);
-                                continue;
-                            }
-                        };
-
-                        info!(
-                            "📦 Created cache ZIP: {} ({} bytes)",
-                            cache_entry.key,
-                            cache_data.len()
-                        );
-
-                        if let Err(e) = self
-                            .gitlab
-                            .upload_cache(job.id, &job.token, &cache_entry.key, cache_data)
-                            .await
-                        {
-                            warn!("Failed to upload cache {}: {}", cache_entry.key, e);
-                        }
-                    }
-                }
-
-                self.gitlab
-                    .update_job(job.id, &job.token, JobState::Success, Some(&scrubbed_trace))
-                    .await?;
-            }
-            Err(e) => {
-                let error_msg = format!("{}", e);
-                let scrubbed_error = scrubber.scrub(&error_msg);
-                error!("❌ Job #{} failed: {}", job.id, scrubbed_error);
-
-                let trace = format!("Job failed: {}", scrubbed_error);
-
-                // Stream failure trace to GitLab
-                let _ = self
-                    .gitlab
-                    .patch_trace(job.id, &job.token, &trace, 0)
-                    .await
-                    .map_err(|e| warn!("Failed to stream failure trace: {}", e));
-
-                self.gitlab
-                    .update_job(job.id, &job.token, JobState::Failed, Some(&trace))
-                    .await?;
-            }
-        }
-
         Ok(())
+    }
+
+    /// Upload artifacts whose `when` matches the job result (default: on_success)
+    async fn upload_artifacts(&self, job: &Job, trace: &mut TraceWriter<'_>, succeeded: bool) {
+        let Some(ref job_artifacts) = job.artifacts else {
+            return;
+        };
+        let workspace = self.executor.job_dir(job.id).join("project");
+
+        for artifact in job_artifacts {
+            let wanted = match artifact.when.as_deref() {
+                Some("always") => true,
+                Some("on_failure") => !succeeded,
+                _ => succeeded,
+            };
+            if !wanted || artifact.paths.is_empty() {
+                continue;
+            }
+            let name = artifact.name.as_deref().unwrap_or("artifact");
+            trace
+                .write(&format!("Uploading artifacts ({})...\n", name))
+                .await;
+
+            let result = match artifacts::create_zip_from_paths(
+                &workspace.to_string_lossy(),
+                &artifact.paths,
+            )
+            .await
+            {
+                Ok(data) => {
+                    self.gitlab
+                        .upload_artifacts(
+                            job.id,
+                            &job.token,
+                            data,
+                            name,
+                            artifact.expire_in.as_deref(),
+                        )
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(()) => info!("✅ Uploaded artifact: {}", name),
+                Err(e) => {
+                    warn!("Failed to upload artifact {}: {}", name, e);
+                    trace
+                        .write(&format!("WARNING: Uploading artifacts failed: {}\n", e))
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Save cache entries whose policy pushes (after a successful job)
+    async fn upload_cache(&self, job: &Job, trace: &mut TraceWriter<'_>) {
+        let workspace = self.executor.job_dir(job.id).join("project");
+
+        for cache_entry in &job.cache {
+            if cache_entry.policy != "push" && cache_entry.policy != "pull-push" {
+                continue;
+            }
+            trace
+                .write(&format!("Saving cache {}...\n", cache_entry.key))
+                .await;
+            let result = match artifacts::create_zip_from_paths(
+                &workspace.to_string_lossy(),
+                &cache_entry.paths,
+            )
+            .await
+            {
+                Ok(data) => {
+                    self.gitlab
+                        .upload_cache(job.id, &job.token, &cache_entry.key, data)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = result {
+                warn!("Failed to save cache {}: {}", cache_entry.key, e);
+                trace
+                    .write(&format!("WARNING: Failed to save cache: {}\n", e))
+                    .await;
+            }
+        }
     }
 
     /// Get runner statistics

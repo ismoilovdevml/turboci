@@ -3,8 +3,21 @@ use std::sync::OnceLock;
 
 use crate::gitlab::Job;
 
-/// Output kept back while streaming so a pattern match is not cut in half
-const MIN_HOLDBACK: usize = 64;
+/// Longest run of token-like characters held back while streaming
+const MAX_HOLDBACK: usize = 256;
+
+/// Characters that can be part of a token, key or password matched by the patterns
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-_+/=.:@%~".contains(c)
+}
+
+/// Length of the longest proper prefix of `secret` that `text` ends with
+fn suffix_prefix_len(text: &str, secret: &str) -> usize {
+    (1..secret.len())
+        .rev()
+        .find(|&k| secret.is_char_boundary(k) && text.ends_with(&secret[..k]))
+        .unwrap_or(0)
+}
 
 /// Secret scrubber for masking sensitive information in logs and traces
 #[derive(Clone)]
@@ -122,10 +135,6 @@ impl SecretScrubber {
         ranges
     }
 
-    fn longest_secret(&self) -> usize {
-        self.secrets.iter().map(String::len).max().unwrap_or(0)
-    }
-
     /// Add a custom pattern to the scrubber
     #[allow(dead_code)]
     pub fn add_pattern(&mut self, pattern: Regex) {
@@ -146,12 +155,12 @@ fn percent_encode(value: &str) -> String {
         .collect()
 }
 
-/// Scrubs a stream of output chunks. The tail of each chunk is held back until the
-/// next one arrives, so a secret split across chunks is still masked.
+/// Scrubs a stream of output chunks. Only a tail that could be the start of a
+/// secret is held back until the next chunk, so a secret split across chunks is
+/// still masked while ordinary output (e.g. a finished line) goes out right away.
 pub struct StreamScrubber<'a> {
     scrubber: &'a SecretScrubber,
     pending: String,
-    holdback: usize,
 }
 
 impl<'a> StreamScrubber<'a> {
@@ -159,7 +168,6 @@ impl<'a> StreamScrubber<'a> {
         Self {
             scrubber,
             pending: String::new(),
-            holdback: scrubber.longest_secret().max(MIN_HOLDBACK),
         }
     }
 
@@ -168,7 +176,22 @@ impl<'a> StreamScrubber<'a> {
         self.pending.push_str(chunk);
         let len = self.pending.len();
 
-        let mut boundary = len.saturating_sub(self.holdback);
+        // The start of an exact secret, or a token still being written
+        let secret_start = self
+            .scrubber
+            .secrets
+            .iter()
+            .map(|secret| suffix_prefix_len(&self.pending, secret))
+            .max()
+            .unwrap_or(0);
+        let token_run: usize = self
+            .pending
+            .chars()
+            .rev()
+            .take_while(|&c| is_token_char(c))
+            .map(char::len_utf8)
+            .sum();
+        let mut boundary = len - secret_start.max(token_run.min(MAX_HOLDBACK));
         while !self.pending.is_char_boundary(boundary) {
             boundary -= 1;
         }
@@ -256,6 +279,16 @@ mod tests {
         out.push_str(&stream.finish());
 
         assert_eq!(out, "ok ✓ ".repeat(100) + "[MASKED] ✓");
+    }
+
+    #[test]
+    fn stream_scrubber_emits_finished_lines_immediately() {
+        let scrubber = SecretScrubber::new(vec!["some-long-secret-value".to_string()]);
+        let mut stream = StreamScrubber::new(&scrubber);
+
+        assert_eq!(stream.push("Preparing...\n"), "Preparing...\n");
+        assert_eq!(stream.push("value: some-long"), "value: ");
+        assert_eq!(stream.push("-secret-value\n"), "[MASKED]\n");
     }
 
     #[test]

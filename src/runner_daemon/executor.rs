@@ -1,22 +1,57 @@
+//! Executors run a job's sources checkout and steps: Docker (one container per job)
+//! or shell (directly on the host). The step semantics are shared; executors only
+//! differ in how a script is run.
+
 // Bollard 0.19 has deprecated old API, but new API is complex
 // We'll migrate to new API in future version
 #![allow(deprecated)]
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
 use futures_util::StreamExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tokio::time::Instant;
+use tracing::{info, warn};
 
 use super::git::{self, GitStrategy};
-use crate::gitlab::{GitLabClient, Job};
-use crate::security::secret_scrubber::{SecretScrubber, StreamScrubber};
+use super::script::{self, JobEnv};
+use super::trace::TraceWriter;
+use crate::gitlab::{FailureReason, Job};
 
-/// Executor type enum
+/// Used when GitLab sends no job timeout
+const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
+/// GitLab's default after_script timeout
+const DEFAULT_AFTER_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Host directory holding Docker job workspaces (bind-mounted as /builds)
+const DOCKER_BUILDS_ROOT: &str = "/tmp/turboci-builds";
+
+/// Why a job did not succeed
+#[derive(Debug, Clone)]
+pub struct JobFailure {
+    pub reason: FailureReason,
+    pub exit_code: Option<i32>,
+    pub message: String,
+}
+
+impl JobFailure {
+    pub fn system(message: impl std::fmt::Display) -> Self {
+        Self {
+            reason: FailureReason::RunnerSystemFailure,
+            exit_code: None,
+            message: message.to_string(),
+        }
+    }
+}
+
+pub type JobOutcome = std::result::Result<(), JobFailure>;
+
 #[derive(Debug, Clone)]
 pub enum ExecutorType {
     Docker(DockerExecutor),
@@ -24,44 +59,268 @@ pub enum ExecutorType {
 }
 
 impl ExecutorType {
-    #[allow(dead_code)]
-    pub async fn execute(&self, job: &Job) -> Result<String> {
-        let scrubber = SecretScrubber::new(vec![]).with_job_secrets(job);
-        self.execute_with_streaming(job, None, &scrubber).await
+    /// Host directory of the job; the project is checked out in `<job_dir>/project`
+    pub fn job_dir(&self, job_id: u64) -> PathBuf {
+        match self {
+            ExecutorType::Docker(_) => {
+                Path::new(DOCKER_BUILDS_ROOT).join(format!("job-{}", job_id))
+            }
+            ExecutorType::Shell(executor) => executor.job_dir(job_id),
+        }
     }
 
-    /// `scrubber` masks secrets in output before it is streamed to GitLab
-    pub async fn execute_with_streaming(
-        &self,
-        job: &Job,
-        gitlab_client: Option<&GitLabClient>,
-        scrubber: &SecretScrubber,
-    ) -> Result<String> {
-        // Default timeout: 1 hour per job
-        let job_timeout = Duration::from_secs(job.timeout_secs().unwrap_or(3600));
-
-        // Execute with timeout
-        match timeout(job_timeout, async {
-            match self {
-                ExecutorType::Docker(executor) => {
-                    executor
-                        .execute_with_streaming(job, gitlab_client, scrubber)
-                        .await
-                }
-                ExecutorType::Shell(executor) => executor.execute(job).await,
+    /// Check out sources and run the job's steps, writing output to `trace`
+    pub async fn execute(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
+        match self {
+            ExecutorType::Docker(executor) => {
+                executor.execute(job, &self.job_dir(job.id), trace).await
             }
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                warn!("Job #{} timed out after {:?}", job.id, job_timeout);
-                Err(anyhow::anyhow!(
-                    "Job execution timed out after {} seconds",
-                    job_timeout.as_secs()
+            ExecutorType::Shell(executor) => executor.execute(job, trace).await,
+        }
+    }
+
+    /// Remove the job's host directory
+    pub async fn cleanup(&self, job_id: u64) {
+        let dir = self.job_dir(job_id);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => info!("💾 Removed workspace {}", dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("Failed to remove workspace {}: {}", dir.display(), e),
+        }
+    }
+}
+
+/// Result of running one script
+#[derive(Debug, PartialEq, Eq)]
+enum RunStatus {
+    Exited(i32),
+    TimedOut,
+}
+
+/// How an executor runs a shell script in a directory, streaming output to the trace
+#[async_trait]
+trait ScriptRunner: Send + Sync {
+    async fn run(
+        &self,
+        script: &str,
+        workdir: &str,
+        trace: &mut TraceWriter<'_>,
+        deadline: Instant,
+    ) -> Result<RunStatus>;
+}
+
+/// Directories as the job sees them
+struct JobDirs {
+    builds: String,
+    project: String,
+}
+
+/// Get sources, then run the steps GitLab sent, honouring `when`, `allow_failure`
+/// and timeouts. The job timeout covers sources and script steps; `after_script`
+/// has its own timeout and never changes the job result.
+async fn run_job_steps(
+    job: &Job,
+    runner: &dyn ScriptRunner,
+    trace: &mut TraceWriter<'_>,
+    dirs: &JobDirs,
+) -> JobOutcome {
+    let timeout = job
+        .timeout_secs()
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_JOB_TIMEOUT);
+    let deadline = Instant::now() + timeout;
+    let timed_out = || JobFailure {
+        reason: FailureReason::JobExecutionTimeout,
+        exit_code: None,
+        message: format!("execution took longer than {}s", timeout.as_secs()),
+    };
+
+    let mut failure = match get_sources(job, runner, trace, dirs, deadline).await {
+        Ok(()) => None,
+        Err(RunError::TimedOut) => Some(timed_out()),
+        Err(RunError::Failed(f)) => Some(f),
+    };
+
+    for step in &job.steps {
+        let is_after_script = step.name == "after_script";
+        let should_run = match step.when.as_str() {
+            "always" => true,
+            "on_failure" => failure.is_some(),
+            _ => failure.is_none(),
+        };
+        let lines: Vec<String> = step
+            .before_script
+            .iter()
+            .chain(&step.script)
+            .cloned()
+            .collect();
+        if !should_run || lines.is_empty() {
+            continue;
+        }
+
+        let step_deadline = if is_after_script {
+            trace.write("\nRunning after_script\n").await;
+            let secs = u64::from(step.timeout);
+            Instant::now()
+                + if secs > 0 {
+                    Duration::from_secs(secs)
+                } else {
+                    DEFAULT_AFTER_SCRIPT_TIMEOUT
+                }
+        } else {
+            trace
+                .write(&format!(
+                    "\nExecuting \"step_{}\" stage of the job script\n",
+                    step.name
                 ))
+                .await;
+            deadline
+        };
+
+        let result = runner
+            .run(
+                &script::step_script(&lines),
+                &dirs.project,
+                trace,
+                step_deadline,
+            )
+            .await;
+        match result {
+            Ok(RunStatus::Exited(0)) => {}
+            Ok(RunStatus::Exited(code)) if step.allow_failure || is_after_script => {
+                trace
+                    .write(&format!(
+                        "WARNING: {} failed with exit code {}\n",
+                        step.name, code
+                    ))
+                    .await;
+            }
+            Ok(RunStatus::Exited(code)) => {
+                failure.get_or_insert(JobFailure {
+                    reason: FailureReason::ScriptFailure,
+                    exit_code: Some(code),
+                    message: format!("exit code {}", code),
+                });
+            }
+            Ok(RunStatus::TimedOut) if is_after_script => {
+                trace.write("WARNING: after_script timed out\n").await;
+            }
+            Ok(RunStatus::TimedOut) => {
+                failure.get_or_insert_with(timed_out);
+            }
+            Err(e) if is_after_script => {
+                trace
+                    .write(&format!("WARNING: after_script could not run: {}\n", e))
+                    .await;
+            }
+            Err(e) => {
+                failure.get_or_insert(JobFailure::system(format!("{:#}", e)));
             }
         }
+    }
+
+    failure.map_or(Ok(()), Err)
+}
+
+enum RunError {
+    TimedOut,
+    Failed(JobFailure),
+}
+
+async fn get_sources(
+    job: &Job,
+    runner: &dyn ScriptRunner,
+    trace: &mut TraceWriter<'_>,
+    dirs: &JobDirs,
+    deadline: Instant,
+) -> std::result::Result<(), RunError> {
+    let Some(ref git_info) = job.git_info else {
+        return Ok(());
+    };
+
+    let commands = match git::strategy(&job.variables) {
+        GitStrategy::None => {
+            trace.write("Skipping Git repository setup\n").await;
+            return Ok(());
+        }
+        GitStrategy::Empty => vec![vec![
+            "mkdir".to_string(),
+            "-p".to_string(),
+            dirs.project.clone(),
+        ]],
+        GitStrategy::Fetch => git::checkout_commands(git_info, &job.variables, &dirs.project)
+            .map_err(|e| RunError::Failed(JobFailure::system(e)))?,
+    };
+
+    // repo_url embeds the job token, so only the ref and SHA are shown
+    trace
+        .write(&format!(
+            "Fetching changes...\nChecking out {} as detached HEAD (ref is {})...\n",
+            &git_info.sha[..git_info.sha.len().min(8)],
+            git_info.ref_name
+        ))
+        .await;
+
+    match runner
+        .run(
+            &script::argv_script(&commands),
+            &dirs.builds,
+            trace,
+            deadline,
+        )
+        .await
+    {
+        Ok(RunStatus::Exited(0)) => Ok(()),
+        Ok(RunStatus::Exited(code)) => Err(RunError::Failed(JobFailure {
+            reason: FailureReason::ScriptFailure,
+            exit_code: Some(code),
+            message: format!("getting sources failed with exit code {}", code),
+        })),
+        Ok(RunStatus::TimedOut) => Err(RunError::TimedOut),
+        Err(e) => Err(RunError::Failed(JobFailure::system(format!("{:#}", e)))),
+    }
+}
+
+/// Write the files backing `file`-type variables
+async fn write_variable_files(env: &JobEnv) -> Result<()> {
+    for (path, content) in &env.files {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(path, content)
+            .await
+            .with_context(|| format!("Failed to write variable file {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Decodes a byte stream to UTF-8 without breaking characters split across chunks
+#[derive(Default)]
+struct Utf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8Decoder {
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let valid = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            // Incomplete character at the end: keep it for the next chunk
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => {
+                let text = String::from_utf8_lossy(&self.pending).into_owned();
+                self.pending.clear();
+                return text;
+            }
+        };
+        let rest = self.pending.split_off(valid);
+        String::from_utf8(std::mem::replace(&mut self.pending, rest)).unwrap_or_default()
+    }
+
+    fn finish(&mut self) -> String {
+        let text = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        text
     }
 }
 
@@ -90,122 +349,64 @@ impl DockerExecutor {
         })
     }
 
-    /// Execute a GitLab job in Docker container with real-time trace streaming
-    pub async fn execute_with_streaming(
-        &self,
-        job: &Job,
-        gitlab_client: Option<&GitLabClient>,
-        scrubber: &SecretScrubber,
-    ) -> Result<String> {
+    async fn execute(&self, job: &Job, job_dir: &Path, trace: &mut TraceWriter<'_>) -> JobOutcome {
         let image = job
             .image
             .as_ref()
             .map(|img| img.name.clone())
             .unwrap_or_else(|| self.default_image.clone());
 
+        trace
+            .write(&format!("Using Docker executor with image {} ...\n", image))
+            .await;
         info!("🐳 Using Docker image: {}", image);
 
-        // Pull image if not exists
-        self.pull_image(&image).await?;
-
-        // Create container
-        let container_id = self.create_container(job, &image).await?;
-        info!("📦 Created container: {}", container_id);
-
-        // Start container
-        use bollard::container::StartContainerOptions;
-        self.docker
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
-            .await
-            .context("Failed to start container")?;
-
-        let mut output = String::new();
-        let mut trace_offset = 0;
-
-        // Prepare streaming parameters
-        let streaming_params = gitlab_client.map(|client| (client, job.id, job.token.as_str()));
-
-        // Clone repository with streaming
-        let clone_output = self
-            .clone_repository_with_streaming(
-                job,
-                &container_id,
-                streaming_params,
-                trace_offset,
-                scrubber,
-            )
-            .await?;
-        output.push_str(&clone_output);
-        trace_offset += clone_output.len();
-
-        // Execute job steps with before_script/after_script
-        for step in &job.steps {
-            info!("  ▶️  Step: {}", step.name);
-
-            // Execute before_script
-            if !step.before_script.is_empty() {
-                info!("    📋 Running before_script...");
-                for script_line in &step.before_script {
-                    let step_output = self
-                        .exec_in_container_with_streaming(
-                            &container_id,
-                            script_line,
-                            streaming_params,
-                            trace_offset,
-                            scrubber,
-                        )
-                        .await?;
-                    trace_offset += step_output.len();
-                    output.push_str(&step_output);
-                    output.push('\n');
-                    trace_offset += 1;
-                }
-            }
-
-            // Execute main script
-            for script_line in &step.script {
-                let step_output = self
-                    .exec_in_container_with_streaming(
-                        &container_id,
-                        script_line,
-                        streaming_params,
-                        trace_offset,
-                        scrubber,
-                    )
-                    .await?;
-                trace_offset += step_output.len();
-                output.push_str(&step_output);
-                output.push('\n');
-                trace_offset += 1;
-            }
-
-            // Execute after_script (always run, even on failure)
-            if !step.after_script.is_empty() {
-                info!("    📋 Running after_script...");
-                for script_line in &step.after_script {
-                    if let Ok(step_output) = self
-                        .exec_in_container_with_streaming(
-                            &container_id,
-                            script_line,
-                            streaming_params,
-                            trace_offset,
-                            scrubber,
-                        )
-                        .await
-                    {
-                        trace_offset += step_output.len();
-                        output.push_str(&step_output);
-                        output.push('\n');
-                        trace_offset += 1;
-                    }
-                }
-            }
+        if let Err(e) = self.pull_image(&image).await {
+            return Err(JobFailure {
+                reason: FailureReason::ImagePullFailure,
+                exit_code: None,
+                message: format!("failed to pull image {}: {}", image, e),
+            });
         }
 
-        // Cleanup
-        self.cleanup_container(&container_id, job.id).await?;
+        let env = script::job_env(job, "/builds", job_dir);
+        write_variable_files(&env)
+            .await
+            .map_err(JobFailure::system)?;
 
-        Ok(output)
+        let container_id = self
+            .create_container(job, &image, job_dir, &env)
+            .await
+            .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+        info!("📦 Created container: {}", container_id);
+
+        use bollard::container::StartContainerOptions;
+        let outcome = match self
+            .docker
+            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .await
+        {
+            Ok(()) => {
+                let runner = DockerRunner {
+                    docker: &self.docker,
+                    container_id: &container_id,
+                    env: env.to_docker(),
+                };
+                let dirs = JobDirs {
+                    builds: "/builds".to_string(),
+                    project: "/builds/project".to_string(),
+                };
+                run_job_steps(job, &runner, trace, &dirs).await
+            }
+            Err(e) => Err(JobFailure::system(format!(
+                "Failed to start container: {}",
+                e
+            ))),
+        };
+
+        // Always runs, including after failures and timeouts
+        self.release_container(&container_id, job_dir).await;
+        outcome
     }
 
     /// Pull Docker image
@@ -220,17 +421,20 @@ impl DockerExecutor {
         let mut stream = self.docker.create_image(options, None, None);
 
         while let Some(info) = stream.next().await {
-            match info {
-                Ok(_) => {}
-                Err(e) => return Err(e.into()),
-            }
+            info?;
         }
 
         Ok(())
     }
 
-    /// Create Docker container
-    async fn create_container(&self, job: &Job, image: &str) -> Result<String> {
+    /// Create the job container with the workspace mounted at /builds
+    async fn create_container(
+        &self,
+        job: &Job,
+        image: &str,
+        job_dir: &Path,
+        env: &JobEnv,
+    ) -> Result<String> {
         use bollard::container::CreateContainerOptions;
         use bollard::models::{ContainerCreateBody, HostConfig};
 
@@ -239,20 +443,22 @@ impl DockerExecutor {
             ..Default::default()
         };
 
-        // Create workspace directory on host for volume mount
-        let host_workspace = format!("/tmp/turboci-builds/job-{}", job.id);
-        tokio::fs::create_dir_all(&host_workspace)
+        tokio::fs::create_dir_all(job_dir.join("project"))
             .await
             .context("Failed to create host workspace")?;
 
         let config = ContainerCreateBody {
             image: Some(image.to_string()),
             working_dir: Some("/builds".to_string()),
-            cmd: Some(vec!["sleep".to_string(), "3600".to_string()]),
+            env: Some(env.to_docker()),
+            // Keep the container alive for the whole job; steps run as execs
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "while :; do sleep 3600; done".to_string(),
+            ]),
             host_config: Some(HostConfig {
-                binds: Some(vec![
-                    format!("{}:/builds", host_workspace), // ✅ Mount workspace
-                ]),
+                binds: Some(vec![format!("{}:/builds", job_dir.display())]),
                 ..Default::default()
             }),
             ..Default::default()
@@ -264,204 +470,127 @@ impl DockerExecutor {
             .await
             .context("Failed to create container")?;
 
-        info!("📁 Mounted host workspace: {} -> /builds", host_workspace);
         Ok(response.id)
     }
 
-    /// Check out the job's commit inside the container with real-time streaming to GitLab
-    async fn clone_repository_with_streaming(
-        &self,
-        job: &Job,
-        container_id: &str,
-        gitlab_params: Option<(&GitLabClient, u64, &str)>,
-        mut trace_offset: usize,
-        scrubber: &SecretScrubber,
-    ) -> Result<String> {
-        let Some(ref git_info) = job.git_info else {
-            return Ok("No git repository to clone".to_string());
-        };
+    /// Hand the workspace back to the runner's user (files created in the
+    /// container belong to root) and remove the container
+    async fn release_container(&self, container_id: &str, job_dir: &Path) {
+        use bollard::container::RemoveContainerOptions;
 
-        let dest = "/builds/project";
-        let commands = match git::strategy(&job.variables) {
-            GitStrategy::None => return Ok("Skipping Git repository setup".to_string()),
-            GitStrategy::Empty => vec![vec![
-                "mkdir".to_string(),
-                "-p".to_string(),
-                dest.to_string(),
-            ]],
-            GitStrategy::Fetch => git::checkout_commands(git_info, &job.variables, dest)?,
-        };
-
-        let mut output = String::new();
-        for argv in &commands {
-            let (step_output, new_offset) = self
-                .exec_argv_with_streaming(
-                    container_id,
-                    argv,
-                    "/builds",
-                    gitlab_params,
-                    trace_offset,
-                    scrubber,
-                )
-                .await?;
-            output.push_str(&step_output);
-            trace_offset = new_offset;
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(job_dir) {
+            use std::os::unix::fs::MetadataExt;
+            let chown = format!("chown -R {}:{} /builds", meta.uid(), meta.gid());
+            if let Err(e) = self.exec_as_root(container_id, &chown).await {
+                warn!("Failed to reset workspace ownership: {}", e);
+            }
         }
 
-        Ok(output)
+        if let Err(e) = self
+            .docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            warn!("Failed to remove container {}: {}", container_id, e);
+        } else {
+            info!("🗑️  Removed container: {}", container_id);
+        }
     }
 
-    /// Run an argv (no shell) in the container, streaming scrubbed output to GitLab in batches.
-    /// Returns the scrubbed output and the trace offset after it.
-    async fn exec_argv_with_streaming(
-        &self,
-        container_id: &str,
-        argv: &[String],
-        working_dir: &str,
-        gitlab_params: Option<(&GitLabClient, u64, &str)>,
-        mut trace_offset: usize,
-        scrubber: &SecretScrubber,
-    ) -> Result<(String, usize)> {
+    async fn exec_as_root(&self, container_id: &str, command: &str) -> Result<()> {
         let exec = self
             .docker
             .create_exec(
                 container_id,
                 CreateExecOptions {
-                    cmd: Some(argv.iter().map(String::as_str).collect()),
+                    cmd: Some(vec!["sh", "-c", command]),
+                    user: Some("0"),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
-                    working_dir: Some(working_dir),
                     ..Default::default()
                 },
             )
-            .await
-            .with_context(|| format!("Failed to create exec for {}", argv[0]))?;
-
-        let mut output = String::new();
-        let mut buffer = String::new();
-        let mut stream_scrubber = StreamScrubber::new(scrubber);
-        let mut last_flush = std::time::Instant::now();
-        const BUFFER_SIZE: usize = 10 * 1024; // 10KB
-        const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-
-        if let StartExecResults::Attached {
-            output: mut stream, ..
-        } = self.docker.start_exec(&exec.id, None).await?
-        {
-            while let Some(chunk) = stream.next().await {
-                let text = stream_scrubber.push(&chunk?.to_string());
-                output.push_str(&text);
-                buffer.push_str(&text);
-
-                // Stream to GitLab with batching
-                if let Some((client, job_id, token)) = gitlab_params {
-                    let should_flush =
-                        buffer.len() >= BUFFER_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL;
-
-                    if should_flush && !buffer.is_empty() {
-                        let new_offset = trace_offset + buffer.len();
-                        if let Err(e) = client
-                            .patch_trace(job_id, token, &buffer, trace_offset)
-                            .await
-                        {
-                            warn!("Failed to stream trace batch: {}", e);
-                        }
-                        trace_offset = new_offset;
-                        buffer.clear();
-                        last_flush = std::time::Instant::now();
-                    }
-                }
-            }
-
-            let rest = stream_scrubber.finish();
-            output.push_str(&rest);
-            buffer.push_str(&rest);
-
-            // Flush remaining buffer
-            if let Some((client, job_id, token)) = gitlab_params {
-                if !buffer.is_empty() {
-                    let new_offset = trace_offset + buffer.len();
-                    if let Err(e) = client
-                        .patch_trace(job_id, token, &buffer, trace_offset)
-                        .await
-                    {
-                        warn!("Failed to flush final trace: {}", e);
-                    }
-                    trace_offset = new_offset;
-                }
-            }
-        }
-
-        // Check exit code
-        let inspect = self.docker.inspect_exec(&exec.id).await?;
-        if let Some(exit_code) = inspect.exit_code {
-            if exit_code != 0 {
-                return Err(anyhow::anyhow!(
-                    "{} failed with exit code {}",
-                    argv[..argv.len().min(4)].join(" "),
-                    exit_code
-                ));
-            }
-        }
-
-        Ok((output, trace_offset))
-    }
-
-    /// Run a script line through `sh -c` in the project directory, streaming scrubbed output
-    async fn exec_in_container_with_streaming(
-        &self,
-        container_id: &str,
-        command: &str,
-        gitlab_client: Option<(&GitLabClient, u64, &str)>, // (client, job_id, token)
-        trace_offset: usize,
-        scrubber: &SecretScrubber,
-    ) -> Result<String> {
-        let argv = ["sh".to_string(), "-c".to_string(), command.to_string()];
-        let (output, _) = self
-            .exec_argv_with_streaming(
-                container_id,
-                &argv,
-                "/builds/project",
-                gitlab_client,
-                trace_offset,
-                scrubber,
-            )
             .await?;
-        Ok(output)
-    }
-
-    /// Cleanup container and workspace
-    async fn cleanup_container(&self, container_id: &str, job_id: u64) -> Result<()> {
-        use bollard::container::RemoveContainerOptions;
-
-        // Stop and remove container
-        self.docker
-            .remove_container(
-                container_id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true, // Remove volumes
-                    ..Default::default()
-                }),
-            )
-            .await
-            .context("Failed to remove container")?;
-
-        info!("🗑️  Removed container: {}", container_id);
-
-        // Clean up host workspace to free disk space
-        let workspace = format!("/tmp/turboci-builds/job-{}", job_id);
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
-            warn!("Failed to remove workspace {}: {}", workspace, e);
-        } else {
-            info!("💾 Freed disk space: {}", workspace);
+        if let StartExecResults::Attached { mut output, .. } =
+            self.docker.start_exec(&exec.id, None).await?
+        {
+            while output.next().await.is_some() {}
         }
-
         Ok(())
     }
 }
 
-/// Shell Executor - Runs jobs directly on host (FAST!)
+struct DockerRunner<'a> {
+    docker: &'a Docker,
+    container_id: &'a str,
+    env: Vec<String>,
+}
+
+#[async_trait]
+impl ScriptRunner for DockerRunner<'_> {
+    async fn run(
+        &self,
+        script: &str,
+        workdir: &str,
+        trace: &mut TraceWriter<'_>,
+        deadline: Instant,
+    ) -> Result<RunStatus> {
+        let exec = self
+            .docker
+            .create_exec(
+                self.container_id,
+                CreateExecOptions {
+                    cmd: Some(vec!["sh", "-c", script]),
+                    env: Some(self.env.iter().map(String::as_str).collect()),
+                    working_dir: Some(workdir),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Failed to create exec")?;
+
+        let mut stdout = Utf8Decoder::default();
+        let mut stderr = Utf8Decoder::default();
+        if let StartExecResults::Attached { mut output, .. } =
+            self.docker.start_exec(&exec.id, None).await?
+        {
+            loop {
+                let chunk = match tokio::time::timeout_at(deadline, output.next()).await {
+                    // The exec keeps running until the container is removed
+                    Err(_) => return Ok(RunStatus::TimedOut),
+                    Ok(None) => break,
+                    Ok(Some(chunk)) => chunk?,
+                };
+                let text = match chunk {
+                    LogOutput::StdErr { message } => stderr.decode(&message),
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        stdout.decode(&message)
+                    }
+                    LogOutput::StdIn { .. } => continue,
+                };
+                trace.write(&text).await;
+            }
+        }
+        trace.write(&stdout.finish()).await;
+        trace.write(&stderr.finish()).await;
+
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        let code = inspect.exit_code.unwrap_or(-1);
+        Ok(RunStatus::Exited(i32::try_from(code).unwrap_or(-1)))
+    }
+}
+
+/// Shell Executor - Runs jobs directly on host
 #[derive(Clone, Debug)]
 pub struct ShellExecutor {
     work_dir: String,
@@ -474,124 +603,229 @@ impl ShellExecutor {
         }
     }
 
-    /// Execute a GitLab job using shell (super fast!)
-    pub async fn execute(&self, job: &Job) -> Result<String> {
-        info!("⚡ Using Shell executor (direct execution)");
-
-        let job_dir = format!("{}/job-{}", self.work_dir, job.id);
-
-        // Create work directory
-        tokio::fs::create_dir_all(&job_dir).await?;
-
-        let mut output = String::new();
-
-        // Clone repository
-        output.push_str(&self.clone_repository(job, &job_dir).await?);
-
-        // Execute job steps with before_script/after_script
-        for step in &job.steps {
-            info!("  ⚡ Step: {}", step.name);
-
-            // Execute before_script
-            if !step.before_script.is_empty() {
-                info!("    📋 Running before_script...");
-                for script_line in &step.before_script {
-                    let step_output = self.exec_command(script_line, &job_dir).await?;
-                    output.push_str(&step_output);
-                    output.push('\n');
-                }
-            }
-
-            // Execute main script
-            for script_line in &step.script {
-                let step_output = self.exec_command(script_line, &job_dir).await?;
-                output.push_str(&step_output);
-                output.push('\n');
-            }
-
-            // Execute after_script (always run)
-            if !step.after_script.is_empty() {
-                info!("    📋 Running after_script...");
-                for script_line in &step.after_script {
-                    if let Ok(step_output) = self.exec_command(script_line, &job_dir).await {
-                        output.push_str(&step_output);
-                        output.push('\n');
-                    }
-                }
-            }
-        }
-
-        // Cleanup (optional - keep for debugging)
-        // tokio::fs::remove_dir_all(&job_dir).await?;
-
-        Ok(output)
+    fn job_dir(&self, job_id: u64) -> PathBuf {
+        Path::new(&self.work_dir).join(format!("job-{}", job_id))
     }
 
-    /// Check out the job's commit into `{job_dir}/project`
-    async fn clone_repository(&self, job: &Job, job_dir: &str) -> Result<String> {
-        let Some(ref git_info) = job.git_info else {
-            info!("No git repository configured, skipping clone");
-            return Ok("No git repository to clone".to_string());
+    async fn execute(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
+        trace.write("Using Shell executor...\n").await;
+
+        let job_dir = self.job_dir(job.id);
+        let dirs = JobDirs {
+            builds: job_dir.to_string_lossy().into_owned(),
+            project: job_dir.join("project").to_string_lossy().into_owned(),
         };
+        tokio::fs::create_dir_all(&dirs.project)
+            .await
+            .map_err(JobFailure::system)?;
 
-        let dest = format!("{}/project", job_dir);
-        match git::strategy(&job.variables) {
-            GitStrategy::None => return Ok("Skipping Git repository setup".to_string()),
-            GitStrategy::Empty => {
-                tokio::fs::create_dir_all(&dest).await?;
-                return Ok(String::new());
+        let env = script::job_env(job, &dirs.builds, &job_dir);
+        write_variable_files(&env)
+            .await
+            .map_err(JobFailure::system)?;
+
+        let runner = ShellRunner { env: env.vars };
+        run_job_steps(job, &runner, trace, &dirs).await
+    }
+}
+
+struct ShellRunner {
+    env: Vec<(String, String)>,
+}
+
+#[async_trait]
+impl ScriptRunner for ShellRunner {
+    async fn run(
+        &self,
+        script: &str,
+        workdir: &str,
+        trace: &mut TraceWriter<'_>,
+        deadline: Instant,
+    ) -> Result<RunStatus> {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .current_dir(workdir)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        // Own process group, so a timeout kills everything the script started
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = command.spawn().context("Failed to start sh")?;
+        let pid = child.id();
+        let mut out = child.stdout.take().context("stdout not captured")?;
+        let mut err = child.stderr.take().context("stderr not captured")?;
+        let (mut out_buf, mut err_buf) = ([0u8; 8192], [0u8; 8192]);
+        let (mut out_open, mut err_open) = (true, true);
+        let (mut stdout, mut stderr) = (Utf8Decoder::default(), Utf8Decoder::default());
+
+        while out_open || err_open {
+            tokio::select! {
+                n = out.read(&mut out_buf), if out_open => match n? {
+                    0 => out_open = false,
+                    n => trace.write(&stdout.decode(&out_buf[..n])).await,
+                },
+                n = err.read(&mut err_buf), if err_open => match n? {
+                    0 => err_open = false,
+                    n => trace.write(&stderr.decode(&err_buf[..n])).await,
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    kill_process_group(pid);
+                    let _ = child.wait().await;
+                    return Ok(RunStatus::TimedOut);
+                }
             }
-            GitStrategy::Fetch => {}
         }
+        trace.write(&stdout.finish()).await;
+        trace.write(&stderr.finish()).await;
 
-        info!("📥 Fetching repository...");
-        let mut output = String::new();
-        for argv in git::checkout_commands(git_info, &job.variables, &dest)? {
-            let result = Command::new(&argv[0])
-                .args(&argv[1..])
-                .output()
-                .await
-                .with_context(|| format!("Failed to run {}", argv[0]))?;
-
-            output.push_str(&String::from_utf8_lossy(&result.stdout));
-            output.push_str(&String::from_utf8_lossy(&result.stderr));
-
-            if !result.status.success() {
-                return Err(anyhow::anyhow!(
-                    "{} failed: {}",
-                    argv[..argv.len().min(4)].join(" "),
-                    output
-                ));
+        let status = tokio::select! {
+            status = child.wait() => status?,
+            _ = tokio::time::sleep_until(deadline) => {
+                kill_process_group(pid);
+                let _ = child.wait().await;
+                return Ok(RunStatus::TimedOut);
             }
-        }
+        };
+        Ok(RunStatus::Exited(status.code().unwrap_or(-1)))
+    }
+}
 
-        Ok(output)
+fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", pid)])
+            .status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::secret_scrubber::SecretScrubber;
+
+    fn job(value: serde_json::Value) -> Job {
+        serde_json::from_value(value).unwrap()
     }
 
-    /// Execute command via shell
-    async fn exec_command(&self, command: &str, job_dir: &str) -> Result<String> {
-        debug!("⚡ Executing: {}", command);
+    async fn run_shell(job: &Job, work_dir: &Path) -> (JobOutcome, String) {
+        let executor = ShellExecutor::new(Some(work_dir.to_string_lossy().into_owned()));
+        let scrubber = SecretScrubber::new(vec![]).with_job_secrets(job);
+        let mut trace = TraceWriter::new(None, job.id, &job.token, &scrubber);
+        let outcome = executor.execute(job, &mut trace).await;
+        trace.finish().await;
+        (outcome, trace.text())
+    }
 
-        let project_dir = format!("{}/project", job_dir);
+    fn steps(script: &[&str], after: &[&str]) -> serde_json::Value {
+        serde_json::json!([
+            {"name": "script", "script": script, "when": "on_success", "timeout": 3600},
+            {"name": "after_script", "script": after, "when": "always",
+             "allow_failure": true, "timeout": 5}
+        ])
+    }
 
-        let exec_output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&project_dir)
-            .output()
-            .await
-            .context("Failed to execute command")?;
+    #[tokio::test]
+    async fn runs_steps_with_variables_and_masks_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 1, "token": "t",
+            "variables": [
+                {"key": "GREETING", "value": "hello"},
+                {"key": "API_KEY", "value": "top-secret-key", "masked": true},
+                {"key": "CONFIG", "value": "file-content", "file": true}
+            ],
+            "steps": steps(
+                &["cd /", "echo \"$GREETING from $PWD\"", "echo key=$API_KEY", "cat \"$CONFIG\""],
+                &["echo cleanup"]
+            )
+        }));
 
-        let output = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&exec_output.stdout),
-            String::from_utf8_lossy(&exec_output.stderr)
+        let (outcome, log) = run_shell(&j, dir.path()).await;
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("hello from /"), "{}", log);
+        assert!(log.contains("key=[MASKED]"), "{}", log);
+        assert!(!log.contains("top-secret-key"));
+        assert!(log.contains("file-content"), "{}", log);
+        assert!(log.contains("cleanup"));
+    }
+
+    #[tokio::test]
+    async fn script_failure_reports_exit_code_and_still_runs_after_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 2, "token": "t",
+            "steps": steps(
+                &["echo before", "exit 3", "echo never-printed"],
+                &["echo after-ran", "exit 9"]
+            )
+        }));
+
+        let (outcome, log) = run_shell(&j, dir.path()).await;
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(failure.reason, FailureReason::ScriptFailure);
+        assert_eq!(failure.exit_code, Some(3));
+        assert!(log.contains("after-ran"), "{}", log);
+        assert!(!log.contains("\nnever-printed"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_script_and_reports_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let j = job(serde_json::json!({
+            "id": 3, "token": "t",
+            "runner_info": {"timeout": 1},
+            "steps": steps(
+                &[&format!("(sleep 3; touch {}) &", marker.display()), "sleep 30"],
+                &["echo after-timeout"]
+            )
+        }));
+
+        let started = std::time::Instant::now();
+        let (outcome, log) = run_shell(&j, dir.path()).await;
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::JobExecutionTimeout
         );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(log.contains("after-timeout"), "{}", log);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!marker.exists(), "background process outlived the timeout");
+    }
 
-        if !exec_output.status.success() {
-            return Err(anyhow::anyhow!("Command failed: {}", command));
-        }
+    #[tokio::test]
+    async fn allow_failure_step_does_not_fail_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 4, "token": "t",
+            "steps": [{"name": "script", "script": ["exit 1"], "when": "on_success", "allow_failure": true}]
+        }));
 
-        Ok(output)
+        let (outcome, _) = run_shell(&j, dir.path()).await;
+
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn utf8_decoder_keeps_characters_split_across_chunks() {
+        let text = "ok ✓ done";
+        let bytes = text.as_bytes();
+        let split = text.find('✓').unwrap() + 1;
+        let mut decoder = Utf8Decoder::default();
+
+        let mut out = decoder.decode(&bytes[..split]);
+        out.push_str(&decoder.decode(&bytes[split..]));
+        out.push_str(&decoder.finish());
+
+        assert_eq!(out, text);
     }
 }

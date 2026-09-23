@@ -153,12 +153,16 @@ impl GitLabClient {
                         if let Ok(identity) = serde_json::from_str::<JobIdentity>(&response_text) {
                             let trace =
                                 format!("TurboCI could not parse the job payload: {}\n", reason);
+                            let _ = self
+                                .patch_trace(identity.id, &identity.token, trace.as_bytes(), 0)
+                                .await;
                             if let Err(update_err) = self
                                 .update_job(
                                     identity.id,
                                     &identity.token,
                                     JobState::Failed,
-                                    Some(&trace),
+                                    Some(FailureReason::RunnerSystemFailure),
+                                    None,
                                 )
                                 .await
                             {
@@ -186,54 +190,76 @@ impl GitLabClient {
         }
     }
 
-    /// Update job status with trace streaming
+    /// Report the job state to GitLab. Retries while GitLab answers 202 (accepted,
+    /// not yet processed) or on server/network errors; gives up on 403/404, which
+    /// mean the job is gone or no longer ours.
     pub async fn update_job(
         &self,
         job_id: u64,
         token: &str,
         state: JobState,
-        trace: Option<&str>,
+        failure_reason: Option<FailureReason>,
+        exit_code: Option<i32>,
     ) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 8;
         let url = format!("{}/api/v4/jobs/{}", self.url, job_id);
 
-        let mut body = serde_json::json!({
-            "token": token,
-            "state": state,
-        });
-
-        if let Some(trace_data) = trace {
-            body["trace"] = serde_json::Value::String(trace_data.to_string());
+        let mut body = serde_json::json!({ "token": token, "state": state });
+        if let Some(reason) = failure_reason {
+            body["failure_reason"] = serde_json::to_value(reason)?;
+        }
+        if let Some(code) = exit_code {
+            body["exit_code"] = code.into();
         }
 
-        let response = self
-            .client
-            .put(&url)
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to update job status")?;
-
-        if !response.status().is_success() {
-            let error = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("Job update failed: {}", error));
+        let mut last_error = anyhow::anyhow!("Job update not attempted");
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                let delay = Duration::from_millis(250 * 2u64.pow((attempt - 1).min(4)));
+                tokio::time::sleep(delay).await;
+            }
+            let response = match self.client.put(&url).json(&body).send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    last_error = anyhow::Error::new(e).context("Failed to update job status");
+                    continue;
+                }
+            };
+            match response.status() {
+                StatusCode::OK => return Ok(()),
+                StatusCode::ACCEPTED => {
+                    last_error = anyhow::anyhow!("Job update accepted but not completed");
+                }
+                status @ (StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {
+                    return Err(anyhow::anyhow!("Job update rejected: {}", status));
+                }
+                status if status.is_server_error() => {
+                    last_error = anyhow::anyhow!("Job update failed: {}", status);
+                }
+                status => {
+                    let error = response.text().await.unwrap_or_default();
+                    return Err(anyhow::anyhow!("Job update failed: {} {}", status, error));
+                }
+            }
         }
-
-        Ok(())
+        Err(last_error)
     }
 
-    /// Stream job trace (real-time logs) - GitLab 17.x with retry
-    /// GitLab expects Content-Range format: "0-{size}" for total trace size
+    /// Append to the job trace at `offset` (Content-Range is inclusive: offset-(end-1)).
+    /// Returns the new end offset, or on 416 the length GitLab already has.
     pub async fn patch_trace(
         &self,
         job_id: u64,
         token: &str,
-        trace: &str,
+        trace: &[u8],
         offset: usize,
     ) -> Result<usize> {
+        if trace.is_empty() {
+            return Ok(offset);
+        }
         let url = format!("{}/api/v4/jobs/{}/trace", self.url, job_id);
-        let trace_bytes = trace.as_bytes();
-        let end_offset = offset + trace_bytes.len();
-        let trace_owned = trace.to_string();
+        let end_offset = offset + trace.len();
+        let trace_owned = trace.to_vec();
         let token_owned = token.to_string();
 
         self.retry_with_backoff(|| async {
@@ -393,40 +419,6 @@ impl GitLabClient {
 
         info!("Cache uploaded: {}", key);
         Ok(())
-    }
-
-    /// Download cache archive (GitLab 17.x)
-    pub async fn download_cache(
-        &self,
-        job_id: u64,
-        token: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        let url = format!("{}/api/v4/jobs/{}/cache?key={}", self.url, job_id, key);
-
-        let response = self
-            .client
-            .get(&url)
-            .header("JOB-TOKEN", token)
-            .send()
-            .await
-            .context("Failed to download cache")?;
-
-        match response.status() {
-            StatusCode::OK => {
-                let bytes = response.bytes().await?.to_vec();
-                info!("Cache downloaded: {}", key);
-                Ok(Some(bytes))
-            }
-            StatusCode::NOT_FOUND => {
-                debug!("Cache not found: {}", key);
-                Ok(None)
-            }
-            _ => {
-                warn!("Cache download failed: {}", response.status());
-                Ok(None)
-            }
-        }
     }
 }
 
@@ -726,6 +718,16 @@ pub struct RetryConfig {
     pub when: Vec<String>,
 }
 
+/// Why a job failed, as GitLab expects it in `failure_reason`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    ScriptFailure,
+    RunnerSystemFailure,
+    JobExecutionTimeout,
+    ImagePullFailure,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
@@ -932,7 +934,7 @@ mod tests {
             .await;
 
         let next = client(&server)
-            .patch_trace(7, "job-token", "hello", 10)
+            .patch_trace(7, "job-token", b"hello", 10)
             .await
             .unwrap();
 
@@ -949,7 +951,7 @@ mod tests {
             .await;
 
         let next = client(&server)
-            .patch_trace(7, "job-token", "hello", 10)
+            .patch_trace(7, "job-token", b"hello", 10)
             .await
             .unwrap();
 
@@ -970,8 +972,74 @@ mod tests {
             .await;
 
         client(&server)
-            .update_job(7, "job-token", JobState::Success, None)
+            .update_job(7, "job-token", JobState::Success, None, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_job_sends_failure_reason_and_exit_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/jobs/7"))
+            .and(body_partial_json(serde_json::json!({
+                "state": "failed", "failure_reason": "script_failure", "exit_code": 3
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .update_job(
+                7,
+                "job-token",
+                JobState::Failed,
+                Some(FailureReason::ScriptFailure),
+                Some(3),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_job_retries_while_accepted_and_on_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(202))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .update_job(7, "job-token", JobState::Success, None, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_job_gives_up_when_job_is_gone() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client(&server)
+            .update_job(7, "job-token", JobState::Success, None, None)
+            .await;
+
+        assert!(result.is_err());
     }
 }
