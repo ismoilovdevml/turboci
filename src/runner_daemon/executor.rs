@@ -33,6 +33,8 @@ use crate::gitlab::{FailureReason, Job, RemoteState};
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
 /// GitLab's default after_script timeout
 const DEFAULT_AFTER_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Upper bound for resetting workspace ownership after a job
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Host directory holding Docker job workspaces (bind-mounted as /builds)
 const DOCKER_BUILDS_ROOT: &str = "/tmp/turboci-builds";
 
@@ -406,7 +408,7 @@ impl DockerExecutor {
             .start_and_run(job, job_dir, trace, &mut containers)
             .await;
         // Always runs, including after failures, timeouts and cancellation
-        self.release(&containers, job_dir).await;
+        self.release(job.id, &containers, job_dir).await;
         outcome
     }
 
@@ -709,38 +711,18 @@ impl DockerExecutor {
         Ok(response.id)
     }
 
-    /// Hand the workspace back to the runner's user (files created in the
-    /// container belong to root), then remove containers and network
-    async fn release(&self, containers: &JobContainers, job_dir: &Path) {
-        use bollard::container::RemoveContainerOptions;
-
-        #[cfg(unix)]
-        if let (Some(job), Ok(meta)) = (&containers.job, std::fs::metadata(job_dir)) {
-            use std::os::unix::fs::MetadataExt;
-            let chown = format!("chown -R {}:{} /builds", meta.uid(), meta.gid());
-            if let Err(e) = self.exec_as_root(job, &chown).await {
-                warn!("Failed to reset workspace ownership: {}", e);
-            }
-        }
-
+    /// Remove the job's containers and network, then hand the workspace back to
+    /// the runner's user (files created in containers belong to root)
+    async fn release(&self, job_id: u64, containers: &JobContainers, job_dir: &Path) {
+        // Removing the containers first stops everything the job started, so
+        // nothing the job controls runs during cleanup
         for id in containers
             .job
             .iter()
             .chain(&containers.helper)
             .chain(&containers.services)
         {
-            match self
-                .docker
-                .remove_container(
-                    id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        v: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-            {
+            match self.force_remove(id).await {
                 Ok(()) => info!("🗑️  Removed container: {}", id),
                 Err(e) => warn!("Failed to remove container {}: {}", id, e),
             }
@@ -750,26 +732,77 @@ impl DockerExecutor {
                 warn!("Failed to remove network {}: {}", network, e);
             }
         }
+
+        if containers.job.is_some() || containers.helper.is_some() {
+            if let Err(e) = self.reset_ownership(job_id, job_dir).await {
+                warn!("Failed to reset workspace ownership: {:#}", e);
+            }
+        }
     }
 
-    async fn exec_as_root(&self, container_id: &str, command: &str) -> Result<()> {
-        let exec = self
-            .docker
-            .create_exec(
-                container_id,
-                CreateExecOptions {
-                    cmd: Some(vec!["sh", "-c", command]),
-                    user: Some("0"),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
+    async fn force_remove(&self, id: &str) -> Result<()> {
+        use bollard::container::RemoveContainerOptions;
+
+        self.docker
+            .remove_container(
+                id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
                     ..Default::default()
-                },
+                }),
             )
             .await?;
-        if let StartExecResults::Attached { mut output, .. } =
-            self.docker.start_exec(&exec.id, None).await?
+        Ok(())
+    }
+
+    /// `chown -R` the workspace to the runner's uid/gid from a fresh container of
+    /// the (trusted) helper image, never from the job's own image
+    async fn reset_ownership(&self, job_id: u64, job_dir: &Path) -> Result<()> {
+        #[cfg(unix)]
         {
-            while output.next().await.is_some() {}
+            use bollard::container::{StartContainerOptions, WaitContainerOptions};
+            use std::os::unix::fs::MetadataExt;
+
+            let meta = std::fs::metadata(job_dir)?;
+            let config = ContainerCreateBody {
+                image: Some(self.config.helper_image.clone()),
+                user: Some("0".to_string()),
+                entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+                cmd: Some(vec![format!(
+                    "chown -R {}:{} /builds",
+                    meta.uid(),
+                    meta.gid()
+                )]),
+                network_disabled: Some(true),
+                host_config: Some(HostConfig {
+                    binds: Some(vec![format!("{}:/builds", job_dir.display())]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let id = self
+                .create_named(&format!("turboci-job-{}-cleanup", job_id), config)
+                .await?;
+            let result = async {
+                self.docker
+                    .start_container(&id, None::<StartContainerOptions<String>>)
+                    .await?;
+                let mut wait = self
+                    .docker
+                    .wait_container(&id, None::<WaitContainerOptions<String>>);
+                tokio::time::timeout(CLEANUP_TIMEOUT, async {
+                    while let Some(status) = wait.next().await {
+                        status?;
+                    }
+                    anyhow::Ok(())
+                })
+                .await
+                .context("chown timed out")?
+            }
+            .await;
+            let _ = self.force_remove(&id).await;
+            result?;
         }
         Ok(())
     }
@@ -1334,6 +1367,42 @@ mod tests {
             .await
             .is_err());
         executor.cleanup(job_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_job_replacing_sh_cannot_hang_cleanup() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 930_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "alpine:3.20"},
+            "steps": [{"name": "script", "when": "on_success", "timeout": 60, "script": [
+                "mkdir -p out && echo x > out/root-owned",
+                "rm /bin/sh && printf '#!/bin/busybox ash\\nexec sleep 100000\\n' > /bin/sh && chmod +x /bin/sh"
+            ]}]
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(90), executor.execute(&j, &mut trace))
+                .await
+                .expect("cleanup hung on the job's /bin/sh");
+        trace.finish().await;
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, trace.text());
+        executor.cleanup(job_id).await;
+        assert!(
+            !executor.job_dir(job_id).exists(),
+            "workspace not removable"
+        );
     }
 
     #[test]
