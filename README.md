@@ -86,7 +86,6 @@ concurrent = 4
 runner_token = "glrt-YOUR_RUNNER_TOKEN_HERE"
 gitlab_url = "https://gitlab.com"
 redis_url = "redis://127.0.0.1:6379"
-cache_ttl_seconds = 604800
 
 [executor]
 executor_type = "docker"
