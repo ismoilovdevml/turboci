@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use super::git::{self, GitStrategy};
 use crate::gitlab::{GitLabClient, Job};
+use crate::security::secret_scrubber::{SecretScrubber, StreamScrubber};
 
 /// Executor type enum
 #[derive(Debug, Clone)]
@@ -25,13 +26,16 @@ pub enum ExecutorType {
 impl ExecutorType {
     #[allow(dead_code)]
     pub async fn execute(&self, job: &Job) -> Result<String> {
-        self.execute_with_streaming(job, None).await
+        let scrubber = SecretScrubber::new(vec![]).with_job_secrets(job);
+        self.execute_with_streaming(job, None, &scrubber).await
     }
 
+    /// `scrubber` masks secrets in output before it is streamed to GitLab
     pub async fn execute_with_streaming(
         &self,
         job: &Job,
         gitlab_client: Option<&GitLabClient>,
+        scrubber: &SecretScrubber,
     ) -> Result<String> {
         // Default timeout: 1 hour per job
         let job_timeout = if job.timeout > 0 {
@@ -44,7 +48,9 @@ impl ExecutorType {
         match timeout(job_timeout, async {
             match self {
                 ExecutorType::Docker(executor) => {
-                    executor.execute_with_streaming(job, gitlab_client).await
+                    executor
+                        .execute_with_streaming(job, gitlab_client, scrubber)
+                        .await
                 }
                 ExecutorType::Shell(executor) => executor.execute(job).await,
             }
@@ -88,17 +94,12 @@ impl DockerExecutor {
         })
     }
 
-    /// Execute a GitLab job in Docker container
-    #[allow(dead_code)]
-    pub async fn execute(&self, job: &Job) -> Result<String> {
-        self.execute_with_streaming(job, None).await
-    }
-
     /// Execute a GitLab job in Docker container with real-time trace streaming
     pub async fn execute_with_streaming(
         &self,
         job: &Job,
         gitlab_client: Option<&GitLabClient>,
+        scrubber: &SecretScrubber,
     ) -> Result<String> {
         let image = job
             .image
@@ -130,7 +131,13 @@ impl DockerExecutor {
 
         // Clone repository with streaming
         let clone_output = self
-            .clone_repository_with_streaming(job, &container_id, streaming_params, trace_offset)
+            .clone_repository_with_streaming(
+                job,
+                &container_id,
+                streaming_params,
+                trace_offset,
+                scrubber,
+            )
             .await?;
         output.push_str(&clone_output);
         trace_offset += clone_output.len();
@@ -149,6 +156,7 @@ impl DockerExecutor {
                             script_line,
                             streaming_params,
                             trace_offset,
+                            scrubber,
                         )
                         .await?;
                     trace_offset += step_output.len();
@@ -166,6 +174,7 @@ impl DockerExecutor {
                         script_line,
                         streaming_params,
                         trace_offset,
+                        scrubber,
                     )
                     .await?;
                 trace_offset += step_output.len();
@@ -184,6 +193,7 @@ impl DockerExecutor {
                             script_line,
                             streaming_params,
                             trace_offset,
+                            scrubber,
                         )
                         .await
                     {
@@ -269,6 +279,7 @@ impl DockerExecutor {
         container_id: &str,
         gitlab_params: Option<(&GitLabClient, u64, &str)>,
         mut trace_offset: usize,
+        scrubber: &SecretScrubber,
     ) -> Result<String> {
         let Some(ref git_info) = job.git_info else {
             return Ok("No git repository to clone".to_string());
@@ -288,7 +299,14 @@ impl DockerExecutor {
         let mut output = String::new();
         for argv in &commands {
             let (step_output, new_offset) = self
-                .exec_argv_with_streaming(container_id, argv, gitlab_params, trace_offset)
+                .exec_argv_with_streaming(
+                    container_id,
+                    argv,
+                    "/builds",
+                    gitlab_params,
+                    trace_offset,
+                    scrubber,
+                )
                 .await?;
             output.push_str(&step_output);
             trace_offset = new_offset;
@@ -297,14 +315,16 @@ impl DockerExecutor {
         Ok(output)
     }
 
-    /// Run an argv (no shell) in the container, streaming output to GitLab in batches.
-    /// Returns the output and the trace offset after it.
+    /// Run an argv (no shell) in the container, streaming scrubbed output to GitLab in batches.
+    /// Returns the scrubbed output and the trace offset after it.
     async fn exec_argv_with_streaming(
         &self,
         container_id: &str,
         argv: &[String],
+        working_dir: &str,
         gitlab_params: Option<(&GitLabClient, u64, &str)>,
         mut trace_offset: usize,
+        scrubber: &SecretScrubber,
     ) -> Result<(String, usize)> {
         let exec = self
             .docker
@@ -314,7 +334,7 @@ impl DockerExecutor {
                     cmd: Some(argv.iter().map(String::as_str).collect()),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
-                    working_dir: Some("/builds"),
+                    working_dir: Some(working_dir),
                     ..Default::default()
                 },
             )
@@ -323,6 +343,7 @@ impl DockerExecutor {
 
         let mut output = String::new();
         let mut buffer = String::new();
+        let mut stream_scrubber = StreamScrubber::new(scrubber);
         let mut last_flush = std::time::Instant::now();
         const BUFFER_SIZE: usize = 10 * 1024; // 10KB
         const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -332,7 +353,7 @@ impl DockerExecutor {
         } = self.docker.start_exec(&exec.id, None).await?
         {
             while let Some(chunk) = stream.next().await {
-                let text = chunk?.to_string();
+                let text = stream_scrubber.push(&chunk?.to_string());
                 output.push_str(&text);
                 buffer.push_str(&text);
 
@@ -347,7 +368,7 @@ impl DockerExecutor {
                             .patch_trace(job_id, token, &buffer, trace_offset)
                             .await
                         {
-                            warn!("Failed to stream clone output: {}", e);
+                            warn!("Failed to stream trace batch: {}", e);
                         }
                         trace_offset = new_offset;
                         buffer.clear();
@@ -355,6 +376,10 @@ impl DockerExecutor {
                     }
                 }
             }
+
+            let rest = stream_scrubber.finish();
+            output.push_str(&rest);
+            buffer.push_str(&rest);
 
             // Flush remaining buffer
             if let Some((client, job_id, token)) = gitlab_params {
@@ -364,7 +389,7 @@ impl DockerExecutor {
                         .patch_trace(job_id, token, &buffer, trace_offset)
                         .await
                     {
-                        warn!("Failed to stream final clone output: {}", e);
+                        warn!("Failed to flush final trace: {}", e);
                     }
                     trace_offset = new_offset;
                 }
@@ -386,106 +411,26 @@ impl DockerExecutor {
         Ok((output, trace_offset))
     }
 
-    /// Execute command in container
-    #[allow(dead_code)]
-    async fn exec_in_container(&self, container_id: &str, command: &str) -> Result<String> {
-        self.exec_in_container_with_streaming(container_id, command, None, 0)
-            .await
-    }
-
-    /// Execute command in container with optional real-time streaming
+    /// Run a script line through `sh -c` in the project directory, streaming scrubbed output
     async fn exec_in_container_with_streaming(
         &self,
         container_id: &str,
         command: &str,
         gitlab_client: Option<(&GitLabClient, u64, &str)>, // (client, job_id, token)
         trace_offset: usize,
+        scrubber: &SecretScrubber,
     ) -> Result<String> {
-        debug!("Executing: {}", command);
-
-        let exec = self
-            .docker
-            .create_exec(
+        let argv = ["sh".to_string(), "-c".to_string(), command.to_string()];
+        let (output, _) = self
+            .exec_argv_with_streaming(
                 container_id,
-                CreateExecOptions {
-                    cmd: Some(vec!["sh", "-c", command]),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    working_dir: Some("/builds/project"),
-                    ..Default::default()
-                },
+                &argv,
+                "/builds/project",
+                gitlab_client,
+                trace_offset,
+                scrubber,
             )
-            .await
-            .context("Failed to create exec")?;
-
-        let mut output = String::new();
-        let mut current_offset = trace_offset;
-        let mut buffer = String::new();
-        let mut last_flush = std::time::Instant::now();
-        const BUFFER_SIZE: usize = 10 * 1024; // 10KB batching
-        const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-
-        if let StartExecResults::Attached {
-            output: mut stream, ..
-        } = self.docker.start_exec(&exec.id, None).await?
-        {
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(msg) => {
-                        let text = msg.to_string();
-                        print!("{}", text);
-                        output.push_str(&text);
-                        buffer.push_str(&text);
-
-                        // Batched streaming: flush when buffer >= 10KB or 1s elapsed
-                        if let Some((client, job_id, token)) = gitlab_client {
-                            let should_flush = buffer.len() >= BUFFER_SIZE
-                                || last_flush.elapsed() >= FLUSH_INTERVAL;
-
-                            if should_flush && !buffer.is_empty() {
-                                let new_offset = current_offset + buffer.len();
-                                if let Err(e) = client
-                                    .patch_trace(job_id, token, &buffer, current_offset)
-                                    .await
-                                {
-                                    warn!("Failed to stream trace batch: {}", e);
-                                } else {
-                                    current_offset = new_offset;
-                                    buffer.clear();
-                                    last_flush = std::time::Instant::now();
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-
-        // Flush remaining buffer before checking exit code
-        if let Some((client, job_id, token)) = gitlab_client {
-            if !buffer.is_empty() {
-                if let Err(e) = client
-                    .patch_trace(job_id, token, &buffer, current_offset)
-                    .await
-                {
-                    warn!("Failed to flush final trace: {}", e);
-                }
-            }
-        }
-
-        // Check exec exit code
-        let inspect = self.docker.inspect_exec(&exec.id).await?;
-        if let Some(exit_code) = inspect.exit_code {
-            if exit_code != 0 {
-                return Err(anyhow::anyhow!(
-                    "Command failed with exit code {}: {}",
-                    exit_code,
-                    command
-                ));
-            }
-        }
-
+            .await?;
         Ok(output)
     }
 
@@ -646,8 +591,6 @@ impl ShellExecutor {
             String::from_utf8_lossy(&exec_output.stdout),
             String::from_utf8_lossy(&exec_output.stderr)
         );
-
-        print!("{}", output);
 
         if !exec_output.status.success() {
             return Err(anyhow::anyhow!("Command failed: {}", command));

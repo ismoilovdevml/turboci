@@ -135,10 +135,14 @@ impl RunnerDaemon {
 
         // STAGE 2: Get sources (git clone/fetch)
         if let Some(ref git_info) = job.git_info {
-            info!("📥 Stage: Getting sources from {}", git_info.repo_url);
+            // repo_url embeds the job token, so it is never logged or traced
+            info!(
+                "📥 Stage: Getting sources for {} ({})",
+                git_info.ref_name, git_info.sha
+            );
             let git_trace = format!(
-                "Cloning repository {}...\nRef: {}\nSHA: {}\n",
-                git_info.repo_url, git_info.ref_name, git_info.sha
+                "Fetching changes...\nRef: {}\nSHA: {}\n",
+                git_info.ref_name, git_info.sha
             );
             trace_offset = self
                 .gitlab
@@ -251,20 +255,13 @@ impl RunnerDaemon {
             return Ok(());
         }
 
-        // Add job secrets to scrubber
-        let mut scrubber = (*self.scrubber).clone();
-        for var in &job.variables {
-            if var.masked {
-                if let Some(ref value) = var.value {
-                    scrubber.add_secret(value.clone());
-                }
-            }
-        }
+        // Mask the job token, dependency tokens and masked variables
+        let scrubber = self.scrubber.with_job_secrets(&job);
 
         // Execute job with real-time trace streaming to GitLab
         let result = self
             .executor
-            .execute_with_streaming(&job, Some(&self.gitlab))
+            .execute_with_streaming(&job, Some(&self.gitlab), &scrubber)
             .await;
 
         match result {

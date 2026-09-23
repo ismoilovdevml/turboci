@@ -111,10 +111,13 @@ impl GitLabClient {
                     .await
                     .context("Failed to read response text")?;
 
-                debug!("Job response: {}", response_text);
-
-                let job: Job = serde_json::from_str(&response_text)
-                    .context(format!("Failed to parse job response: {}", response_text))?;
+                // The payload carries the job token and secret variables: never log it
+                let job: Job = serde_json::from_str(&response_text).with_context(|| {
+                    format!(
+                        "Failed to parse job response ({} bytes)",
+                        response_text.len()
+                    )
+                })?;
                 info!("Received job #{}", job.id);
                 Ok(Some(job))
             }
