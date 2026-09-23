@@ -5,7 +5,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::gitlab::{GitLabClient, Job, JobState};
+use crate::gitlab::{ArtifactUpload, GitLabClient, Job, JobState};
 use crate::security::secret_scrubber::SecretScrubber;
 use crate::storage::{HybridStorage, StorageBackend};
 use executor::{JobFailure, JobOutcome};
@@ -15,9 +15,22 @@ pub mod artifacts;
 pub mod config;
 pub mod executor;
 pub mod git;
+pub mod job_cache;
 pub mod script;
 pub mod system_id;
 pub mod trace;
+
+/// Values of the job's variables, for expanding cache keys
+fn job_variables(job: &Job) -> std::collections::HashMap<String, String> {
+    script::job_env(job, "", std::path::Path::new(""))
+        .vars
+        .into_iter()
+        .collect()
+}
+
+fn project_id(job: &Job) -> u64 {
+    job.job_info.as_ref().map_or(0, |info| info.project_id)
+}
 
 /// Wait for a free job slot, then ask GitLab for a job.
 ///
@@ -37,6 +50,7 @@ async fn claim_job(
 
 #[derive(Clone)]
 pub struct RunnerDaemon {
+    cache: job_cache::LocalCache,
     config: Arc<config::RunnerConfig>,
     gitlab: Arc<GitLabClient>,
     storage: Arc<HybridStorage>,
@@ -63,6 +77,7 @@ impl RunnerDaemon {
         }
 
         Self {
+            cache: job_cache::LocalCache::new(&config.cache_dir),
             config: Arc::new(config),
             gitlab: Arc::new(gitlab),
             storage: Arc::new(storage),
@@ -153,9 +168,7 @@ impl RunnerDaemon {
         }
         self.upload_artifacts(&job, &mut trace, outcome.is_ok())
             .await;
-        if outcome.is_ok() {
-            self.upload_cache(&job, &mut trace).await;
-        }
+        self.upload_cache(&job, &mut trace, outcome.is_ok()).await;
         self.executor.cleanup(job.id).await;
 
         let (state, reason, exit_code) = match &outcome {
@@ -188,24 +201,32 @@ impl RunnerDaemon {
             .map_err(|e| JobFailure::system(format!("Failed to create workspace: {}", e)))?;
         let workspace = project_dir.to_string_lossy();
 
-        for cache_entry in &job.cache {
-            if cache_entry.policy == "pull" || cache_entry.policy == "pull-push" {
+        if self.config.cache_enabled {
+            let variables = job_variables(job);
+            for cache_entry in &job.cache {
+                if cache_entry.policy != "pull" && cache_entry.policy != "pull-push" {
+                    continue;
+                }
+                let keys: Vec<String> = std::iter::once(&cache_entry.key)
+                    .chain(&cache_entry.fallback_keys)
+                    .map(|key| job_cache::resolve_key(key, &variables))
+                    .collect();
                 trace
-                    .write(&format!("Restoring cache {}...\n", cache_entry.key))
+                    .write(&format!("Restoring cache {}...\n", keys[0]))
                     .await;
-                if let Err(e) = artifacts::download_and_extract_cache(
-                    &self.config.gitlab_url,
-                    job.id,
-                    &job.token,
-                    &workspace,
-                    &cache_entry.key,
-                )
-                .await
-                {
-                    warn!("Failed to restore cache {}: {}", cache_entry.key, e);
-                    trace
-                        .write(&format!("WARNING: Failed to restore cache: {}\n", e))
-                        .await;
+                match self.cache.restore(project_id(job), &keys, &workspace).await {
+                    Ok(Some(key)) => {
+                        trace
+                            .write(&format!("Successfully restored cache {}\n", key))
+                            .await
+                    }
+                    Ok(None) => trace.write("No cache found\n").await,
+                    Err(e) => {
+                        warn!("Failed to restore cache {}: {}", keys[0], e);
+                        trace
+                            .write(&format!("WARNING: Failed to restore cache: {}\n", e))
+                            .await;
+                    }
                 }
             }
         }
@@ -218,11 +239,10 @@ impl RunnerDaemon {
                 ))
                 .await;
             if let Err(e) = artifacts::download_and_extract_artifacts(
-                &self.config.gitlab_url,
+                &self.gitlab,
                 dependency.id,
                 &dependency.token,
                 &workspace,
-                &["artifact".to_string()],
             )
             .await
             {
@@ -254,25 +274,40 @@ impl RunnerDaemon {
             if !wanted || artifact.paths.is_empty() {
                 continue;
             }
-            let name = artifact.name.as_deref().unwrap_or("artifact");
+            let name = artifact.name.as_deref().unwrap_or("artifacts");
+            let artifact_type = artifact.artifact_type.as_deref().unwrap_or("archive");
+            let format = artifact.artifact_format.as_deref().unwrap_or("zip");
             trace
-                .write(&format!("Uploading artifacts ({})...\n", name))
+                .write(&format!(
+                    "Uploading artifacts ({}, {})...\n",
+                    name, artifact_type
+                ))
                 .await;
 
-            let result = match artifacts::create_zip_from_paths(
+            let result = match artifacts::create_archive(
                 &workspace.to_string_lossy(),
                 &artifact.paths,
+                format,
             )
             .await
             {
                 Ok(data) => {
+                    let extension = match format {
+                        "gzip" => ".gz",
+                        "zip" => ".zip",
+                        _ => "",
+                    };
                     self.gitlab
                         .upload_artifacts(
                             job.id,
                             &job.token,
-                            data,
-                            name,
-                            artifact.expire_in.as_deref(),
+                            ArtifactUpload {
+                                data,
+                                file_name: format!("{}{}", name, extension),
+                                format: format.to_string(),
+                                artifact_type: artifact_type.to_string(),
+                                expire_in: artifact.expire_in.clone(),
+                            },
                         )
                         .await
                 }
@@ -290,35 +325,49 @@ impl RunnerDaemon {
         }
     }
 
-    /// Save cache entries whose policy pushes (after a successful job)
-    async fn upload_cache(&self, job: &Job, trace: &mut TraceWriter<'_>) {
+    /// Save cache entries whose policy pushes and whose `when` matches the result
+    async fn upload_cache(&self, job: &Job, trace: &mut TraceWriter<'_>, succeeded: bool) {
+        if !self.config.cache_enabled {
+            return;
+        }
         let workspace = self.executor.job_dir(job.id).join("project");
+        let variables = job_variables(job);
 
         for cache_entry in &job.cache {
-            if cache_entry.policy != "push" && cache_entry.policy != "pull-push" {
+            let wanted = match cache_entry.when.as_deref() {
+                Some("always") => true,
+                Some("on_failure") => !succeeded,
+                _ => succeeded,
+            };
+            if !wanted
+                || cache_entry.paths.is_empty()
+                || (cache_entry.policy != "push" && cache_entry.policy != "pull-push")
+            {
                 continue;
             }
-            trace
-                .write(&format!("Saving cache {}...\n", cache_entry.key))
-                .await;
-            let result = match artifacts::create_zip_from_paths(
-                &workspace.to_string_lossy(),
-                &cache_entry.paths,
-            )
-            .await
+            let key = job_cache::resolve_key(&cache_entry.key, &variables);
+            trace.write(&format!("Saving cache {}...\n", key)).await;
+            match self
+                .cache
+                .save(
+                    project_id(job),
+                    &key,
+                    &workspace.to_string_lossy(),
+                    &cache_entry.paths,
+                )
+                .await
             {
-                Ok(data) => {
-                    self.gitlab
-                        .upload_cache(job.id, &job.token, &cache_entry.key, data)
+                Ok(size) => {
+                    trace
+                        .write(&format!("Created cache {} ({} bytes)\n", key, size))
                         .await
                 }
-                Err(e) => Err(e),
-            };
-            if let Err(e) = result {
-                warn!("Failed to save cache {}: {}", cache_entry.key, e);
-                trace
-                    .write(&format!("WARNING: Failed to save cache: {}\n", e))
-                    .await;
+                Err(e) => {
+                    warn!("Failed to save cache {}: {}", key, e);
+                    trace
+                        .write(&format!("WARNING: Failed to save cache: {}\n", e))
+                        .await;
+                }
             }
         }
     }

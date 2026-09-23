@@ -1,97 +1,31 @@
 use anyhow::{Context, Result};
 use std::io::Write;
-use std::path::Path;
-use tracing::{info, warn};
+use std::path::{Path, PathBuf};
+use tracing::warn;
 use zip::{ZipArchive, ZipWriter};
 
-/// Download and extract artifacts for a job
+use crate::gitlab::GitLabClient;
+
+/// Download a dependency's artifacts archive and extract it into the workspace.
+/// Returns the archive size.
 pub async fn download_and_extract_artifacts(
-    gitlab_url: &str,
+    gitlab: &GitLabClient,
     job_id: u64,
     token: &str,
     workspace_path: &str,
-    artifact_names: &[String],
-) -> Result<()> {
-    let client = reqwest::Client::new();
-
-    for artifact_name in artifact_names {
-        let url = format!(
-            "{}/api/v4/jobs/{}/artifacts/{}",
-            gitlab_url, job_id, artifact_name
-        );
-
-        info!("📥 Downloading artifact: {}", artifact_name);
-
-        let response = client
-            .get(&url)
-            .header("JOB-TOKEN", token)
-            .send()
-            .await
-            .context("Failed to download artifact")?;
-
-        if !response.status().is_success() {
-            warn!("Artifact {} not found or failed to download", artifact_name);
-            continue;
-        }
-
-        let artifact_data = response
-            .bytes()
-            .await
-            .context("Failed to read artifact data")?;
-
-        // Extract ZIP to workspace
-        extract_zip_to_workspace(&artifact_data, workspace_path)?;
-
-        info!(
-            "✅ Extracted artifact {} ({} bytes)",
-            artifact_name,
-            artifact_data.len()
-        );
-    }
-
-    Ok(())
+) -> Result<usize> {
+    let data = gitlab.download_artifacts(job_id, token).await?;
+    let size = data.len();
+    extract_archive(data, workspace_path).await?;
+    Ok(size)
 }
 
-/// Download and extract cache for a job
-pub async fn download_and_extract_cache(
-    gitlab_url: &str,
-    job_id: u64,
-    token: &str,
-    workspace_path: &str,
-    cache_key: &str,
-) -> Result<()> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/v4/jobs/{}/cache/{}", gitlab_url, job_id, cache_key);
-
-    info!("📥 Downloading cache: {}", cache_key);
-
-    let response = client
-        .get(&url)
-        .header("JOB-TOKEN", token)
-        .send()
+/// Extract an untrusted ZIP archive into the workspace, off the async runtime
+pub async fn extract_archive(data: Vec<u8>, workspace_path: &str) -> Result<()> {
+    let workspace = workspace_path.to_string();
+    tokio::task::spawn_blocking(move || extract_zip_to_workspace(&data, &workspace))
         .await
-        .context("Failed to download cache")?;
-
-    if !response.status().is_success() {
-        info!("📭 Cache miss: {}", cache_key);
-        return Ok(());
-    }
-
-    let cache_data = response
-        .bytes()
-        .await
-        .context("Failed to read cache data")?;
-
-    // Extract ZIP to workspace
-    extract_zip_to_workspace(&cache_data, workspace_path)?;
-
-    info!(
-        "✅ Extracted cache {} ({} bytes)",
-        cache_key,
-        cache_data.len()
-    );
-
-    Ok(())
+        .context("Extraction task panicked")?
 }
 
 /// Limits applied when extracting untrusted archives (zip bomb protection)
@@ -250,18 +184,41 @@ fn symlink_stays_inside(link: &Path, target: &Path) -> bool {
 
 /// Create ZIP archive from paths (used for artifacts and cache upload)
 pub async fn create_zip_from_paths(workspace_path: &str, paths: &[String]) -> Result<Vec<u8>> {
-    let workspace = workspace_path.to_string();
-    let patterns = paths.to_vec();
-    tokio::task::spawn_blocking(move || collect_zip(&workspace, &patterns))
-        .await
-        .context("Archive task panicked")?
+    create_archive(workspace_path, paths, "zip").await
 }
 
-/// Collect files matching `patterns` inside the workspace into a ZIP.
+/// Archive the files matching `paths` in the format GitLab expects for the
+/// artifact: `zip` (archives), `gzip` (reports; one gzip member per file) or
+/// `raw` (a single file as is)
+pub async fn create_archive(
+    workspace_path: &str,
+    paths: &[String],
+    format: &str,
+) -> Result<Vec<u8>> {
+    let workspace = workspace_path.to_string();
+    let patterns = paths.to_vec();
+    let format = format.to_string();
+    tokio::task::spawn_blocking(move || {
+        let files = collect_paths(&workspace, &patterns)?;
+        match format.as_str() {
+            "zip" => build_zip(Path::new(&workspace), &files),
+            "gzip" => build_gzip(&files),
+            "raw" => match files.as_slice() {
+                [file] => Ok(std::fs::read(file)?),
+                _ => anyhow::bail!("raw artifacts need exactly one file, got {}", files.len()),
+            },
+            other => anyhow::bail!("Unsupported artifact format {:?}", other),
+        }
+    })
+    .await
+    .context("Archive task panicked")?
+}
+
+/// Files matching `patterns` inside the workspace.
 ///
 /// Patterns that are absolute or contain `..` are skipped, matches reached through a
-/// symlinked directory are skipped, and symlinks are stored as links (never followed).
-fn collect_zip(workspace_path: &str, patterns: &[String]) -> Result<Vec<u8>> {
+/// symlinked directory are skipped, and symlinks are returned as-is (never followed).
+fn collect_paths(workspace_path: &str, patterns: &[String]) -> Result<Vec<PathBuf>> {
     use std::collections::BTreeSet;
     use std::path::Component;
 
@@ -270,7 +227,7 @@ fn collect_zip(workspace_path: &str, patterns: &[String]) -> Result<Vec<u8>> {
         .canonicalize()
         .with_context(|| format!("Workspace {} not found", workspace_path))?;
 
-    let mut entries: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    let mut entries: BTreeSet<PathBuf> = BTreeSet::new();
     for pattern in patterns {
         let pattern_path = Path::new(pattern);
         if pattern_path.is_absolute()
@@ -302,14 +259,33 @@ fn collect_zip(workspace_path: &str, patterns: &[String]) -> Result<Vec<u8>> {
             }
         }
     }
+    Ok(entries.into_iter().collect())
+}
 
+fn build_zip(root: &Path, files: &[PathBuf]) -> Result<Vec<u8>> {
     let mut zip_buffer = Vec::new();
     let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
-    for path in &entries {
+    for path in files {
         add_path_to_zip(&mut zip, path, root)?;
     }
     zip.finish()?;
     Ok(zip_buffer)
+}
+
+/// Concatenated gzip members, one per regular file (symlinks are skipped)
+fn build_gzip(files: &[PathBuf]) -> Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+
+    let mut out = Vec::new();
+    for path in files {
+        if !std::fs::symlink_metadata(path)?.is_file() {
+            continue;
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::copy(&mut std::fs::File::open(path)?, &mut encoder)?;
+        out.extend(encoder.finish()?);
+    }
+    Ok(out)
 }
 
 /// A glob match is inside the workspace if its parent directory canonicalizes under the root
@@ -544,6 +520,38 @@ mod tests {
         .unwrap();
 
         assert!(zip_names(&data).is_empty());
+    }
+
+    #[tokio::test]
+    async fn gzip_archive_holds_each_report_file() {
+        use std::io::Read;
+        let ws = tempdir().unwrap();
+        std::fs::write(ws.path().join("a.xml"), b"<a/>").unwrap();
+        std::fs::write(ws.path().join("b.xml"), b"<b/>").unwrap();
+
+        let data = create_archive(ws.path().to_str().unwrap(), &["*.xml".to_string()], "gzip")
+            .await
+            .unwrap();
+
+        let mut decoded = String::new();
+        flate2::read::MultiGzDecoder::new(&data[..])
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, "<a/><b/>");
+    }
+
+    #[tokio::test]
+    async fn raw_archive_requires_exactly_one_file() {
+        let ws = tempdir().unwrap();
+        std::fs::write(ws.path().join("report.json"), b"{}").unwrap();
+        std::fs::write(ws.path().join("other.json"), b"[]").unwrap();
+        let ws_path = ws.path().to_str().unwrap();
+
+        let one = create_archive(ws_path, &["report.json".to_string()], "raw").await;
+        assert_eq!(one.unwrap(), b"{}");
+        assert!(create_archive(ws_path, &["*.json".to_string()], "raw")
+            .await
+            .is_err());
     }
 
     #[cfg(unix)]

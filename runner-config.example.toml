@@ -15,6 +15,8 @@ gitlab_url = "https://gitlab.com"
 
 # ===== CACHE CONFIGURATION =====
 cache_enabled = true
+# Local job cache (`cache:` in .gitlab-ci.yml), one directory per project
+cache_dir = "/var/lib/turboci/cache"
 redis_url = "redis://127.0.0.1:6379"
 
 # S3/MinIO configuration (OPTIONAL - comment out to use Redis-only mode)

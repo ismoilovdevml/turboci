@@ -19,6 +19,9 @@ pub struct RunnerConfig {
 
     /// Cache configuration
     pub cache_enabled: bool,
+    /// Directory of the local job cache (`cache:` in .gitlab-ci.yml)
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: String,
     pub redis_url: String,
     pub s3_bucket: Option<String>,
     pub s3_endpoint: Option<String>,
@@ -54,6 +57,10 @@ pub struct ShellConfig {
     pub work_dir: String,
 }
 
+fn default_cache_dir() -> String {
+    "/var/lib/turboci/cache".to_string()
+}
+
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
@@ -70,6 +77,7 @@ impl Default for RunnerConfig {
             runner_token: String::new(),
             gitlab_url: "https://gitlab.com".to_string(),
             cache_enabled: true,
+            cache_dir: default_cache_dir(),
             redis_url: "redis://127.0.0.1:6379".to_string(),
             s3_bucket: None,
             s3_endpoint: None,

@@ -313,42 +313,52 @@ impl GitLabClient {
         .await
     }
 
-    /// Upload job artifacts (GitLab 17.x) with retry
+    /// Upload an artifacts archive as gitlab-runner does: multipart `file` field,
+    /// with format, type and expiry as query parameters
     pub async fn upload_artifacts(
         &self,
         job_id: u64,
         token: &str,
-        artifact_data: Vec<u8>,
-        artifact_type: &str,
-        expire_in: Option<&str>,
+        upload: ArtifactUpload,
     ) -> Result<()> {
-        let mut url = format!("{}/api/v4/jobs/{}/artifacts", self.url, job_id);
-
-        if let Some(expiration) = expire_in {
-            url = format!("{}?expire_in={}", url, expiration);
+        let url = format!("{}/api/v4/jobs/{}/artifacts", self.url, job_id);
+        let mut query = vec![
+            ("artifact_format", upload.format.clone()),
+            ("artifact_type", upload.artifact_type.clone()),
+        ];
+        if let Some(expire_in) = &upload.expire_in {
+            query.push(("expire_in", expire_in.clone()));
         }
 
-        let token_owned = token.to_string();
-        let artifact_type_owned = artifact_type.to_string();
-
         self.retry_with_backoff(|| async {
+            let part = reqwest::multipart::Part::bytes(upload.data.clone())
+                .file_name(upload.file_name.clone())
+                .mime_str("application/octet-stream")?;
             let response = self
                 .client
                 .post(&url)
-                .header("JOB-TOKEN", &token_owned)
-                .header("Content-Type", "application/zip")
-                .header("artifact-type", &artifact_type_owned)
-                .body(artifact_data.clone())
+                .query(&query)
+                .header("JOB-TOKEN", token)
+                .timeout(TRANSFER_TIMEOUT)
+                .multipart(reqwest::multipart::Form::new().part("file", part))
                 .send()
                 .await
                 .context("Failed to upload artifacts")?;
 
-            if !response.status().is_success() {
-                let error = response.text().await.unwrap_or_default();
-                return Err(anyhow::anyhow!("Artifact upload failed: {}", error));
+            match response.status() {
+                StatusCode::CREATED | StatusCode::OK => Ok(()),
+                StatusCode::PAYLOAD_TOO_LARGE => Err(anyhow::anyhow!(
+                    "Artifact upload rejected: archive is larger than the instance limit"
+                )),
+                status => {
+                    let error = response.text().await.unwrap_or_default();
+                    Err(anyhow::anyhow!(
+                        "Artifact upload failed: {} {}",
+                        status,
+                        error
+                    ))
+                }
             }
-
-            Ok(())
         })
         .await?;
 
@@ -356,8 +366,8 @@ impl GitLabClient {
         Ok(())
     }
 
-    /// Download job artifacts (GitLab 17.x)
-    #[allow(dead_code)]
+    /// Download the artifacts archive of job `job_id` (a dependency), authenticated
+    /// with that dependency's token. Redirects to object storage are followed.
     pub async fn download_artifacts(&self, job_id: u64, token: &str) -> Result<Vec<u8>> {
         let url = format!("{}/api/v4/jobs/{}/artifacts", self.url, job_id);
 
@@ -365,60 +375,20 @@ impl GitLabClient {
             .client
             .get(&url)
             .header("JOB-TOKEN", token)
+            .timeout(TRANSFER_TIMEOUT)
             .send()
             .await
             .context("Failed to download artifacts")?;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Artifact download failed"));
-        }
-
-        let bytes = response
-            .bytes()
-            .await
-            .context("Failed to read artifact bytes")?;
-
-        Ok(bytes.to_vec())
-    }
-
-    /// Upload cache archive (GitLab 17.x)
-    /// Upload cache with retry
-    pub async fn upload_cache(
-        &self,
-        job_id: u64,
-        token: &str,
-        key: &str,
-        cache_data: Vec<u8>,
-    ) -> Result<()> {
-        let url = format!("{}/api/v4/jobs/{}/cache", self.url, job_id);
-        let token_owned = token.to_string();
-        let key_owned = key.to_string();
-
-        self.retry_with_backoff(|| async {
-            let response = self
-                .client
-                .post(&url)
-                .header("JOB-TOKEN", &token_owned)
-                .header("Cache-Key", &key_owned)
-                .header("Content-Type", "application/zip")
-                .body(cache_data.clone())
-                .send()
+        match response.status() {
+            StatusCode::OK => Ok(response
+                .bytes()
                 .await
-                .context("Failed to upload cache")?;
-
-            if !response.status().is_success() {
-                return Err(anyhow::anyhow!(
-                    "Cache upload failed: {}",
-                    response.status()
-                ));
-            }
-
-            Ok(())
-        })
-        .await?;
-
-        info!("Cache uploaded: {}", key);
-        Ok(())
+                .context("Failed to read artifact bytes")?
+                .to_vec()),
+            StatusCode::NOT_FOUND => Err(anyhow::anyhow!("job #{} has no artifacts", job_id)),
+            status => Err(anyhow::anyhow!("Artifact download failed: {}", status)),
+        }
     }
 }
 
@@ -718,6 +688,22 @@ pub struct RetryConfig {
     pub when: Vec<String>,
 }
 
+/// Timeout for artifact transfers (the client default of 30s is for API calls)
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// An archive to upload as job artifacts
+#[derive(Debug, Clone)]
+pub struct ArtifactUpload {
+    pub data: Vec<u8>,
+    /// File name of the archive, e.g. `artifacts.zip`
+    pub file_name: String,
+    /// `zip`, `gzip` or `raw`
+    pub format: String,
+    /// `archive`, or a report type such as `junit`
+    pub artifact_type: String,
+    pub expire_in: Option<String>,
+}
+
 /// Why a job failed, as GitLab expects it in `failure_reason`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -975,6 +961,79 @@ mod tests {
             .update_job(7, "job-token", JobState::Success, None, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_artifacts_sends_multipart_file_with_query_parameters() {
+        use wiremock::matchers::{header_exists, query_param};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/7/artifacts"))
+            .and(header("JOB-TOKEN", "job-token"))
+            .and(query_param("artifact_format", "zip"))
+            .and(query_param("artifact_type", "archive"))
+            .and(query_param("expire_in", "1 week"))
+            .and(header_exists("content-type"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .upload_artifacts(
+                7,
+                "job-token",
+                ArtifactUpload {
+                    data: b"PK-zip-bytes".to_vec(),
+                    file_name: "artifacts.zip".to_string(),
+                    format: "zip".to_string(),
+                    artifact_type: "archive".to_string(),
+                    expire_in: Some("1 week".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let request = &server.received_requests().await.unwrap()[0];
+        let content_type = request.headers["content-type"].to_str().unwrap();
+        assert!(
+            content_type.starts_with("multipart/form-data"),
+            "{}",
+            content_type
+        );
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(
+            body.contains("name=\"file\"; filename=\"artifacts.zip\""),
+            "{}",
+            body
+        );
+        assert!(body.contains("PK-zip-bytes"));
+    }
+
+    #[tokio::test]
+    async fn download_artifacts_follows_redirect_to_object_storage() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/9/artifacts"))
+            .and(header("JOB-TOKEN", "dep-token"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/storage/archive.zip", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/storage/archive.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"zip-data".to_vec()))
+            .mount(&server)
+            .await;
+
+        let data = client(&server)
+            .download_artifacts(9, "dep-token")
+            .await
+            .unwrap();
+
+        assert_eq!(data, b"zip-data");
     }
 
     #[tokio::test]
