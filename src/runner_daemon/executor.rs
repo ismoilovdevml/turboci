@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,9 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::cancel::CancelSignal;
+use super::config::DockerConfig;
 use super::git::{self, GitStrategy};
+use super::image::{self, PullPolicy};
 use super::script::{self, JobEnv};
 use super::trace::TraceWriter;
 use crate::gitlab::{FailureReason, Job, RemoteState};
@@ -363,128 +366,96 @@ impl Utf8Decoder {
 #[derive(Clone)]
 pub struct DockerExecutor {
     docker: Arc<Docker>,
-    default_image: String,
+    config: DockerConfig,
 }
 
 impl std::fmt::Debug for DockerExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DockerExecutor")
-            .field("default_image", &self.default_image)
+            .field("config", &self.config)
             .finish()
     }
 }
 
+/// Containers and network created for one job, removed when it ends
+#[derive(Default)]
+struct JobContainers {
+    network: Option<String>,
+    services: Vec<String>,
+    job: Option<String>,
+}
+
 impl DockerExecutor {
-    pub fn new(default_image: String) -> Result<Self> {
+    pub fn new(config: DockerConfig) -> Result<Self> {
         let docker =
             Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
+        config.memory_bytes()?;
 
         Ok(Self {
             docker: Arc::new(docker),
-            default_image,
+            config,
         })
     }
 
     async fn execute(&self, job: &Job, job_dir: &Path, trace: &mut TraceWriter<'_>) -> JobOutcome {
-        let image = job
-            .image
-            .as_ref()
-            .map(|img| img.name.clone())
-            .unwrap_or_else(|| self.default_image.clone());
+        let mut containers = JobContainers::default();
+        let outcome = self
+            .start_and_run(job, job_dir, trace, &mut containers)
+            .await;
+        // Always runs, including after failures, timeouts and cancellation
+        self.release(&containers, job_dir).await;
+        outcome
+    }
 
+    async fn start_and_run(
+        &self,
+        job: &Job,
+        job_dir: &Path,
+        trace: &mut TraceWriter<'_>,
+        containers: &mut JobContainers,
+    ) -> JobOutcome {
+        let (image, policies) = match &job.image {
+            Some(img) => (img.name.clone(), img.pull_policy.clone()),
+            None => (self.config.default_image.clone(), Vec::new()),
+        };
         trace
             .write(&format!("Using Docker executor with image {} ...\n", image))
             .await;
         info!("🐳 Using Docker image: {}", image);
-
-        if let Err(e) = self.pull_image(&image).await {
-            return Err(JobFailure {
-                reason: FailureReason::ImagePullFailure,
-                exit_code: None,
-                message: format!("failed to pull image {}: {}", image, e),
-            });
-        }
+        self.ensure_image(&image, &policies, job, trace).await?;
 
         let env = script::job_env(job, "/builds", job_dir);
         write_variable_files(&env)
             .await
             .map_err(JobFailure::system)?;
-
-        let container_id = self
-            .create_container(job, &image, job_dir, &env)
-            .await
-            .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-        info!("📦 Created container: {}", container_id);
-
-        use bollard::container::StartContainerOptions;
-        let outcome = match self
-            .docker
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
-            .await
-        {
-            Ok(()) => {
-                let runner = DockerRunner {
-                    docker: &self.docker,
-                    container_id: &container_id,
-                    env: env.to_docker(),
-                };
-                let dirs = JobDirs {
-                    builds: "/builds".to_string(),
-                    project: "/builds/project".to_string(),
-                };
-                run_job_steps(job, &runner, trace, &dirs).await
-            }
-            Err(e) => Err(JobFailure::system(format!(
-                "Failed to start container: {}",
-                e
-            ))),
-        };
-
-        // Always runs, including after failures and timeouts
-        self.release_container(&container_id, job_dir).await;
-        outcome
-    }
-
-    /// Pull Docker image
-    async fn pull_image(&self, image: &str) -> Result<()> {
-        use bollard::image::CreateImageOptions;
-
-        let options = Some(CreateImageOptions {
-            from_image: image,
-            ..Default::default()
-        });
-
-        let mut stream = self.docker.create_image(options, None, None);
-
-        while let Some(info) = stream.next().await {
-            info?;
-        }
-
-        Ok(())
-    }
-
-    /// Create the job container with the workspace mounted at /builds
-    async fn create_container(
-        &self,
-        job: &Job,
-        image: &str,
-        job_dir: &Path,
-        env: &JobEnv,
-    ) -> Result<String> {
-        use bollard::container::CreateContainerOptions;
-        use bollard::models::{ContainerCreateBody, HostConfig};
-
-        let options = CreateContainerOptions {
-            name: format!("turboci-job-{}", job.id),
-            ..Default::default()
-        };
-
         tokio::fs::create_dir_all(job_dir.join("project"))
             .await
-            .context("Failed to create host workspace")?;
+            .map_err(|e| JobFailure::system(format!("Failed to create host workspace: {}", e)))?;
 
+        // Services need a network of their own to be reachable by alias
+        if !job.services.is_empty() {
+            let network = format!("turboci-job-{}", job.id);
+            self.create_network(&network)
+                .await
+                .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+            containers.network = Some(network);
+        }
+        for (index, service) in job.services.iter().enumerate() {
+            trace
+                .write(&format!("Starting service {} ...\n", service.name))
+                .await;
+            self.ensure_image(&service.name, &service.pull_policy, job, trace)
+                .await?;
+            let id = self
+                .start_service(job, index, service, &env, containers.network.as_deref())
+                .await
+                .map_err(|e| JobFailure::system(format!("service {}: {:#}", service.name, e)))?;
+            containers.services.push(id);
+        }
+
+        let name = format!("turboci-job-{}", job.id);
         let config = ContainerCreateBody {
-            image: Some(image.to_string()),
+            image: Some(image.clone()),
             working_dir: Some("/builds".to_string()),
             env: Some(env.to_docker()),
             // Keep the container alive for the whole job; steps run as execs
@@ -493,51 +464,237 @@ impl DockerExecutor {
                 "-c".to_string(),
                 "while :; do sleep 3600; done".to_string(),
             ]),
-            host_config: Some(HostConfig {
-                binds: Some(vec![format!("{}:/builds", job_dir.display())]),
-                ..Default::default()
-            }),
+            host_config: Some(
+                self.host_config(
+                    std::iter::once(format!("{}:/builds", job_dir.display()))
+                        .chain(self.config.volumes.iter().cloned())
+                        .collect(),
+                    containers.network.as_deref(),
+                ),
+            ),
             ..Default::default()
         };
-
-        let response = self
-            .docker
-            .create_container(Some(options), config)
+        let id = self
+            .create_named(&name, config)
             .await
-            .context("Failed to create container")?;
+            .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+        containers.job = Some(id.clone());
+        info!("📦 Created container: {}", id);
 
-        Ok(response.id)
+        use bollard::container::StartContainerOptions;
+        self.docker
+            .start_container(&id, None::<StartContainerOptions<String>>)
+            .await
+            .map_err(|e| JobFailure::system(format!("Failed to start container: {}", e)))?;
+
+        let runner = DockerRunner {
+            docker: &self.docker,
+            container_id: &id,
+            env: env.to_docker(),
+        };
+        let dirs = JobDirs {
+            builds: "/builds".to_string(),
+            project: "/builds/project".to_string(),
+        };
+        run_job_steps(job, &runner, trace, &dirs).await
     }
 
-    /// Hand the workspace back to the runner's user (files created in the
-    /// container belong to root) and remove the container
-    async fn release_container(&self, container_id: &str, job_dir: &Path) {
-        use bollard::container::RemoveContainerOptions;
+    /// Host settings shared by job and service containers
+    fn host_config(&self, binds: Vec<String>, network: Option<&str>) -> HostConfig {
+        HostConfig {
+            binds: (!binds.is_empty()).then_some(binds),
+            network_mode: Some(
+                network
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.config.network_mode.clone()),
+            ),
+            privileged: Some(self.config.privileged),
+            // Validated when the executor is created
+            memory: self.config.memory_bytes().ok().flatten(),
+            nano_cpus: self.config.cpus.map(|cpus| (cpus * 1e9) as i64),
+            ..Default::default()
+        }
+    }
 
-        #[cfg(unix)]
-        if let Ok(meta) = std::fs::metadata(job_dir) {
-            use std::os::unix::fs::MetadataExt;
-            let chown = format!("chown -R {}:{} /builds", meta.uid(), meta.gid());
-            if let Err(e) = self.exec_as_root(container_id, &chown).await {
-                warn!("Failed to reset workspace ownership: {}", e);
+    /// Make `image` available according to the pull policy, using the registry
+    /// credentials GitLab sent with the job
+    async fn ensure_image(
+        &self,
+        image: &str,
+        job_policies: &[String],
+        job: &Job,
+        trace: &mut TraceWriter<'_>,
+    ) -> JobOutcome {
+        let pull_failure = |message: String| JobFailure {
+            reason: FailureReason::ImagePullFailure,
+            exit_code: None,
+            message,
+        };
+        let reference = image::with_default_tag(image);
+        let present = self.docker.inspect_image(&reference).await.is_ok();
+        match PullPolicy::resolve(job_policies, &self.config.pull_policy) {
+            PullPolicy::Never if present => return Ok(()),
+            PullPolicy::Never => {
+                return Err(pull_failure(format!(
+                    "image {} is not present and pull_policy is never",
+                    image
+                )))
             }
+            PullPolicy::IfNotPresent if present => {
+                trace
+                    .write(&format!("Using locally found image {}\n", image))
+                    .await;
+                return Ok(());
+            }
+            _ => {}
         }
 
-        if let Err(e) = self
+        trace.write(&format!("Pulling image {} ...\n", image)).await;
+        let credentials = image::credentials_for(image, &job.credentials).map(|c| {
+            bollard::auth::DockerCredentials {
+                username: Some(c.username.clone()),
+                password: Some(c.password.clone()),
+                serveraddress: Some(image::registry(image).to_string()),
+                ..Default::default()
+            }
+        });
+        use bollard::image::CreateImageOptions;
+        let options = Some(CreateImageOptions {
+            from_image: reference.as_str(),
+            ..Default::default()
+        });
+        let mut stream = self.docker.create_image(options, None, credentials);
+        while let Some(progress) = stream.next().await {
+            if let Err(e) = progress {
+                return Err(pull_failure(format!(
+                    "failed to pull image {}: {}",
+                    image, e
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a bridge network for the job (replacing a leftover one)
+    async fn create_network(&self, name: &str) -> Result<()> {
+        let _ = self.docker.remove_network(name).await;
+        self.docker
+            .create_network(bollard::models::NetworkCreateRequest {
+                name: name.to_string(),
+                driver: Some("bridge".to_string()),
+                ..Default::default()
+            })
+            .await
+            .with_context(|| format!("Failed to create network {}", name))?;
+        Ok(())
+    }
+
+    /// Start a service container reachable by its aliases on the job network
+    async fn start_service(
+        &self,
+        job: &Job,
+        index: usize,
+        service: &crate::gitlab::Service,
+        env: &JobEnv,
+        network: Option<&str>,
+    ) -> Result<String> {
+        use bollard::models::{EndpointSettings, NetworkingConfig};
+
+        let aliases = image::service_aliases(&service.name, service.alias.as_deref());
+        let networking_config = network.map(|network| NetworkingConfig {
+            endpoints_config: Some(std::collections::HashMap::from([(
+                network.to_string(),
+                EndpointSettings {
+                    aliases: Some(aliases),
+                    ..Default::default()
+                },
+            )])),
+        });
+        let config = ContainerCreateBody {
+            image: Some(service.name.clone()),
+            env: Some(env.to_docker()),
+            entrypoint: service.entrypoint.clone(),
+            cmd: service.command.clone(),
+            host_config: Some(self.host_config(Vec::new(), network)),
+            networking_config,
+            ..Default::default()
+        };
+        let id = self
+            .create_named(&format!("turboci-job-{}-svc-{}", job.id, index), config)
+            .await?;
+
+        use bollard::container::StartContainerOptions;
+        self.docker
+            .start_container(&id, None::<StartContainerOptions<String>>)
+            .await
+            .context("Failed to start service container")?;
+        Ok(id)
+    }
+
+    /// Create a container under a fixed name, replacing a leftover one
+    async fn create_named(&self, name: &str, config: ContainerCreateBody) -> Result<String> {
+        use bollard::container::{CreateContainerOptions, RemoveContainerOptions};
+
+        let _ = self
             .docker
             .remove_container(
-                container_id,
+                name,
                 Some(RemoveContainerOptions {
                     force: true,
                     v: true,
                     ..Default::default()
                 }),
             )
+            .await;
+        let response = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: name.to_string(),
+                    ..Default::default()
+                }),
+                config,
+            )
             .await
-        {
-            warn!("Failed to remove container {}: {}", container_id, e);
-        } else {
-            info!("🗑️  Removed container: {}", container_id);
+            .context("Failed to create container")?;
+        Ok(response.id)
+    }
+
+    /// Hand the workspace back to the runner's user (files created in the
+    /// container belong to root), then remove containers and network
+    async fn release(&self, containers: &JobContainers, job_dir: &Path) {
+        use bollard::container::RemoveContainerOptions;
+
+        #[cfg(unix)]
+        if let (Some(job), Ok(meta)) = (&containers.job, std::fs::metadata(job_dir)) {
+            use std::os::unix::fs::MetadataExt;
+            let chown = format!("chown -R {}:{} /builds", meta.uid(), meta.gid());
+            if let Err(e) = self.exec_as_root(job, &chown).await {
+                warn!("Failed to reset workspace ownership: {}", e);
+            }
+        }
+
+        for id in containers.job.iter().chain(&containers.services) {
+            match self
+                .docker
+                .remove_container(
+                    id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(()) => info!("🗑️  Removed container: {}", id),
+                Err(e) => warn!("Failed to remove container {}: {}", id, e),
+            }
+        }
+        if let Some(network) = &containers.network {
+            if let Err(e) = self.docker.remove_network(network).await {
+                warn!("Failed to remove network {}: {}", network, e);
+            }
         }
     }
 
@@ -920,8 +1077,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
     async fn docker_executor_runs_job_and_cleans_up() {
-        let executor =
-            ExecutorType::Docker(DockerExecutor::new("alpine:3.20".to_string()).unwrap());
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                default_image: "alpine:3.20".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
         let job_id = 900_000_000 + u64::from(std::process::id());
         let j = job(serde_json::json!({
             "id": job_id, "token": "t",
@@ -976,6 +1138,68 @@ mod tests {
         // ...and the runner's user can delete the workspace
         executor.cleanup(job_id).await;
         assert!(!job_dir.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_executor_runs_services_with_limits() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                memory: Some("256m".to_string()),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 910_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "redis:7-alpine", "pull_policy": ["if-not-present"]},
+            "services": [{"name": "redis:7-alpine", "alias": "cache"}],
+            "steps": steps(
+                &[
+                    "for i in $(seq 1 20); do redis-cli -h redis ping >/dev/null 2>&1 && break; sleep 0.5; done",
+                    "echo \"by-image $(redis-cli -h redis ping)\"",
+                    "echo \"by-alias $(redis-cli -h cache ping)\"",
+                    "echo \"memory $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes)\""
+                ],
+                &[]
+            )
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("by-image PONG"), "{}", log);
+        assert!(log.contains("by-alias PONG"), "{}", log);
+        assert!(log.contains("memory 268435456"), "{}", log);
+
+        // Job container, service container and job network are all gone
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        for name in [
+            format!("turboci-job-{}", job_id),
+            format!("turboci-job-{}-svc-0", job_id),
+        ] {
+            assert!(docker
+                .inspect_container(
+                    &name,
+                    None::<bollard::query_parameters::InspectContainerOptions>
+                )
+                .await
+                .is_err());
+        }
+        assert!(docker
+            .inspect_network(
+                &format!("turboci-job-{}", job_id),
+                None::<bollard::query_parameters::InspectNetworkOptions>
+            )
+            .await
+            .is_err());
+        executor.cleanup(job_id).await;
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod cancel;
 pub mod config;
 pub mod executor;
 pub mod git;
+pub mod image;
 pub mod job_cache;
 pub mod script;
 pub mod system_id;

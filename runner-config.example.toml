@@ -41,5 +41,13 @@ privileged = false
 # Mount volumes
 volumes = []
 
-# Docker network mode
+# Docker network for jobs without services (jobs with services get their own network)
 network_mode = "bridge"
+
+# "always" (default, like gitlab-runner), "if-not-present" or "never".
+# A job's image:pull_policy overrides it.
+pull_policy = "always"
+
+# Resource limits per container (job and services); unset = no limit
+# memory = "2g"
+# cpus = 2.0

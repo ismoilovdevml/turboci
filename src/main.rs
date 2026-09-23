@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
                 "docker" => {
                     info!("🐳 Using Docker executor (isolated containers)");
                     ExecutorType::Docker(DockerExecutor::new(
-                        runner_config.executor.docker.default_image.clone(),
+                        runner_config.executor.docker.clone(),
                     )?)
                 }
                 _ => {

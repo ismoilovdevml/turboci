@@ -29,6 +29,24 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// Accept either `"always"` or `["always", ...]` (GitLab sends a list)
+fn string_or_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(value)) => vec![value],
+        Some(OneOrMany::Many(values)) => values,
+    })
+}
+
 fn default_cache_policy() -> String {
     "pull-push".to_string()
 }
@@ -496,6 +514,7 @@ impl RunnerFeatures {
         Self {
             variables: true,
             image: executor == "docker",
+            services: executor == "docker",
             artifacts: true,
             cache: true,
             fallback_cache_keys: true,
@@ -674,14 +693,21 @@ pub struct Image {
     pub ports: Vec<serde_json::Value>,
     #[serde(default)]
     pub executor_opts: Option<serde_json::Value>,
-    #[serde(default)]
-    pub pull_policy: Option<String>,
+    #[serde(default, deserialize_with = "string_or_list")]
+    pub pull_policy: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Service {
     pub name: String,
+    #[serde(default)]
     pub alias: Option<String>,
+    #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "string_or_list")]
+    pub pull_policy: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -861,6 +887,20 @@ mod tests {
             .unwrap()
             .remove("token");
         parse(v);
+
+        let mut v = upstream_job();
+        v["image"]["pull_policy"] = serde_json::json!(["always", "if-not-present"]);
+        v["services"][0]["pull_policy"] = serde_json::json!("if-not-present");
+        let job = parse(v);
+        assert_eq!(
+            job.image.unwrap().pull_policy,
+            vec!["always", "if-not-present"]
+        );
+        assert_eq!(job.services[0].pull_policy, vec!["if-not-present"]);
+        assert_eq!(
+            job.services[0].command.as_deref(),
+            Some(&["sleep".to_string(), "30".to_string()][..])
+        );
 
         let mut v = upstream_job();
         v["image"] = serde_json::Value::Null;

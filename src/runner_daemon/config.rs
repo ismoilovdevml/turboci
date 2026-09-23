@@ -45,8 +45,42 @@ pub struct ExecutorConfig {
 pub struct DockerConfig {
     pub default_image: String,
     pub privileged: bool,
+    /// Extra binds for job containers, e.g. "/cache:/cache:rw"
     pub volumes: Vec<String>,
+    /// Network for jobs without services (jobs with services get their own network)
     pub network_mode: String,
+    /// "always", "if-not-present" or "never" (a job's image:pull_policy overrides it)
+    pub pull_policy: String,
+    /// Memory limit per container, e.g. "2g" or "512m"
+    pub memory: Option<String>,
+    /// CPU limit per container, e.g. 1.5
+    pub cpus: Option<f64>,
+}
+
+impl DockerConfig {
+    /// Memory limit in bytes
+    pub fn memory_bytes(&self) -> Result<Option<i64>> {
+        let Some(memory) = self.memory.as_deref() else {
+            return Ok(None);
+        };
+        let memory = memory.trim().to_ascii_lowercase();
+        let (number, unit) = memory.split_at(
+            memory
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(memory.len()),
+        );
+        let multiplier: i64 = match unit {
+            "" | "b" => 1,
+            "k" | "kb" => 1 << 10,
+            "m" | "mb" => 1 << 20,
+            "g" | "gb" => 1 << 30,
+            _ => anyhow::bail!("executor.docker.memory: unknown unit in {:?}", memory),
+        };
+        let number: i64 = number
+            .parse()
+            .with_context(|| format!("executor.docker.memory: invalid value {:?}", memory))?;
+        Ok(Some(number * multiplier))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +160,9 @@ impl Default for DockerConfig {
             privileged: false,
             volumes: vec![],
             network_mode: "bridge".to_string(),
+            pull_policy: "always".to_string(),
+            memory: None,
+            cpus: None,
         }
     }
 }
@@ -167,6 +204,20 @@ impl RunnerConfig {
         }
         if self.check_interval == 0 {
             anyhow::bail!("check_interval must be at least 1 second");
+        }
+        let docker = &self.executor.docker;
+        docker.memory_bytes()?;
+        if docker.cpus.is_some_and(|cpus| cpus <= 0.0) {
+            anyhow::bail!("executor.docker.cpus must be greater than 0");
+        }
+        if !matches!(
+            docker.pull_policy.as_str(),
+            "always" | "if-not-present" | "never"
+        ) {
+            anyhow::bail!(
+                "executor.docker.pull_policy must be always, if-not-present or never, got {:?}",
+                docker.pull_policy
+            );
         }
         match self.executor.executor_type.as_str() {
             "docker" | "shell" => Ok(()),
@@ -288,6 +339,30 @@ mod tests {
         ] {
             let config = RunnerConfig::parse(bad).unwrap();
             assert!(config.validate().is_err(), "accepted: {}", bad);
+        }
+    }
+
+    #[test]
+    fn parses_docker_limits() {
+        let config = RunnerConfig::parse(
+            "runner_token = \"t\"\n[executor.docker]\nmemory = \"512m\"\ncpus = 1.5\npull_policy = \"if-not-present\"",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.executor.docker.memory_bytes().unwrap(),
+            Some(512 << 20)
+        );
+
+        for bad in [
+            "memory = \"lots\"",
+            "cpus = 0.0",
+            "pull_policy = \"sometimes\"",
+        ] {
+            let config =
+                RunnerConfig::parse(&format!("runner_token = \"t\"\n[executor.docker]\n{}", bad))
+                    .unwrap();
+            assert!(config.validate().is_err(), "accepted {}", bad);
         }
     }
 
