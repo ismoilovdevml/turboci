@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -14,6 +14,22 @@ pub mod config;
 pub mod executor;
 pub mod git;
 pub mod system_id;
+
+/// Wait for a free job slot, then ask GitLab for a job.
+///
+/// The permit is taken before the request, so the runner never accepts more jobs
+/// than `concurrent`; it is returned with the job and released when the job ends.
+async fn claim_job(
+    semaphore: &Arc<Semaphore>,
+    gitlab: &GitLabClient,
+    runner_token: &str,
+) -> Result<Option<(Job, OwnedSemaphorePermit)>> {
+    let permit = semaphore.clone().acquire_owned().await?;
+    Ok(gitlab
+        .request_job(runner_token)
+        .await?
+        .map(|job| (job, permit)))
+}
 
 #[derive(Clone)]
 pub struct RunnerDaemon {
@@ -75,9 +91,9 @@ impl RunnerDaemon {
                     );
                 }
             }
-            // Request a job from GitLab
-            match self.gitlab.request_job(&self.config.runner_token).await {
-                Ok(Some(job)) => {
+            // Request a job only when a slot is free
+            match claim_job(&self.semaphore, &self.gitlab, &self.config.runner_token).await {
+                Ok(Some((job, permit))) => {
                     let job_name = job
                         .job_info
                         .as_ref()
@@ -90,6 +106,7 @@ impl RunnerDaemon {
                     // Execute job concurrently
                     let daemon = self.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = daemon.execute_job(job).await {
                             error!("Job execution failed: {}", e);
                         }
@@ -109,9 +126,6 @@ impl RunnerDaemon {
 
     /// Execute a single job
     async fn execute_job(&self, job: Job) -> Result<()> {
-        // Acquire semaphore permit (limit concurrency)
-        let _permit = self.semaphore.acquire().await?;
-
         let job_name = job
             .job_info
             .as_ref()
@@ -418,4 +432,61 @@ pub struct RunnerStats {
     pub cache_hit_rate: f64,
     pub total_cached_size: u64,
     pub cached_items: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn claim_job_does_not_request_while_all_slots_are_busy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": 1, "token": "job-token"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gitlab = GitLabClient::new(server.uri(), "runner-token".to_string());
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let (_job, permit) = claim_job(&semaphore, &gitlab, "runner-token")
+            .await
+            .unwrap()
+            .expect("job expected");
+
+        // The only slot is taken by the running job: no second request may be sent
+        let second = tokio::time::timeout(
+            Duration::from_millis(200),
+            claim_job(&semaphore, &gitlab, "runner-token"),
+        )
+        .await;
+        assert!(second.is_err(), "requested a job with no free slot");
+
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn claim_job_releases_slot_when_no_job_is_available() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let gitlab = GitLabClient::new(server.uri(), "runner-token".to_string());
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        assert!(claim_job(&semaphore, &gitlab, "runner-token")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(semaphore.available_permits(), 1);
+    }
 }
