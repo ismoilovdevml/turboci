@@ -123,6 +123,34 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path) -> JobEnv {
     env
 }
 
+/// Environment of a service container: like gitlab-runner, only public and
+/// internal job variables (never masked or protected secrets), plus the
+/// service's own `variables:`, which take precedence
+pub fn service_env(
+    job: &Job,
+    service_variables: &[crate::gitlab::Variable],
+    values: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut env = JobEnv::default();
+    let visible = job
+        .variables
+        .iter()
+        .filter(|v| (v.public || v.internal) && !v.masked && !v.file);
+    for var in visible.chain(service_variables) {
+        if !is_valid_key(&var.key) {
+            continue;
+        }
+        let value = var.value.clone().unwrap_or_default();
+        let value = if var.raw {
+            value
+        } else {
+            expand(&value, values)
+        };
+        env.set(&var.key, value);
+    }
+    env.to_docker()
+}
+
 /// Expand `$VAR` and `${VAR}` from `values` (unknown names expand to empty);
 /// `$$` is a literal `$`, as in GitLab.
 pub fn expand(value: &str, values: &HashMap<String, String>) -> String {

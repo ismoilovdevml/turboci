@@ -527,17 +527,27 @@ impl DockerExecutor {
             self.ensure_image(&service_image, Some(&service.pull_policy), job, trace)
                 .await?;
             let id = self
-                .start_service(
+                .create_service(
                     job,
                     index,
                     &service_image,
                     service,
-                    &env,
+                    &values,
                     containers.network.as_deref(),
                 )
                 .await
                 .map_err(|e| JobFailure::system(format!("service {}: {:#}", service.name, e)))?;
-            containers.services.push(id);
+            // Recorded before starting, so a service that fails to start is removed too
+            containers.services.push(id.clone());
+            use bollard::container::StartContainerOptions;
+            self.docker
+                .start_container(&id, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|e| JobFailure::system(format!("service {}: {}", service_image, e)))?;
+        }
+        if let Some(network) = containers.network.clone() {
+            self.wait_for_services(job.id, &network, &containers.services, trace)
+                .await;
         }
 
         let name = format!("turboci-job-{}", job.id);
@@ -722,14 +732,14 @@ impl DockerExecutor {
         Ok(())
     }
 
-    /// Start a service container reachable by its aliases on the job network
-    async fn start_service(
+    /// Create a service container reachable by its aliases on the job network
+    async fn create_service(
         &self,
         job: &Job,
         index: usize,
         image: &str,
         service: &crate::gitlab::Service,
-        env: &JobEnv,
+        values: &std::collections::HashMap<String, String>,
         network: Option<&str>,
     ) -> Result<String> {
         use bollard::models::{EndpointSettings, NetworkingConfig};
@@ -746,23 +756,123 @@ impl DockerExecutor {
         });
         let config = ContainerCreateBody {
             image: Some(image.to_string()),
-            env: Some(env.to_docker()),
+            env: Some(script::service_env(job, &service.variables, values)),
             entrypoint: service.entrypoint.clone(),
             cmd: service.command.clone(),
-            host_config: Some(self.host_config(Vec::new(), network)),
+            // Configured volumes too, e.g. /certs/client for docker:dind with TLS
+            host_config: Some(self.host_config(self.config.volumes.clone(), network)),
             networking_config,
             ..Default::default()
         };
-        let id = self
-            .create_named(&format!("turboci-job-{}-svc-{}", job.id, index), config)
-            .await?;
-
-        use bollard::container::StartContainerOptions;
-        self.docker
-            .start_container(&id, None::<StartContainerOptions<String>>)
+        self.create_named(&format!("turboci-job-{}-svc-{}", job.id, index), config)
             .await
-            .context("Failed to start service container")?;
-        Ok(id)
+    }
+
+    /// Wait until the services' exposed TCP ports accept connections, like
+    /// gitlab-runner (up to 30s each, then a warning), so scripts do not start
+    /// against a database that is still booting
+    async fn wait_for_services(
+        &self,
+        job_id: u64,
+        network: &str,
+        services: &[String],
+        trace: &mut TraceWriter<'_>,
+    ) {
+        let mut checks = Vec::new();
+        for id in services {
+            let Ok(info) = self
+                .docker
+                .inspect_container(
+                    id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            else {
+                continue;
+            };
+            let host = info
+                .name
+                .unwrap_or_default()
+                .trim_start_matches('/')
+                .to_string();
+            let ports = info
+                .config
+                .and_then(|config| config.exposed_ports)
+                .map(|ports| ports.into_keys().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for port in ports.iter().filter_map(|p| p.strip_suffix("/tcp")) {
+                checks.push(format!(
+                    "i=0; until nc -z -w1 {host} {port}; do i=$((i+1)); \
+                     if [ $i -ge 30 ]; then echo \"WARNING: service {host}:{port} did not respond within 30s\"; break; fi; \
+                     sleep 1; done",
+                ));
+            }
+        }
+        if checks.is_empty() {
+            return;
+        }
+        trace
+            .write("Waiting for services to be up and running (timeout 30 seconds)...\n")
+            .await;
+        match self
+            .run_on_network(job_id, network, &checks.join("\n"))
+            .await
+        {
+            Ok(output) => trace.write(&output).await,
+            Err(e) => warn!("Could not check services: {:#}", e),
+        }
+    }
+
+    /// Run a shell script in a short-lived helper container on `network`
+    async fn run_on_network(&self, job_id: u64, network: &str, script: &str) -> Result<String> {
+        use bollard::container::{LogsOptions, StartContainerOptions, WaitContainerOptions};
+
+        self.pull_if_missing(&self.config.helper_image).await?;
+        let config = ContainerCreateBody {
+            image: Some(self.config.helper_image.clone()),
+            entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+            cmd: Some(vec![script.to_string()]),
+            host_config: Some(HostConfig {
+                network_mode: Some(network.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = self
+            .create_named(&format!("turboci-job-{}-svc-wait", job_id), config)
+            .await?;
+        let result = async {
+            self.docker
+                .start_container(&id, None::<StartContainerOptions<String>>)
+                .await?;
+            let mut wait = self
+                .docker
+                .wait_container(&id, None::<WaitContainerOptions<String>>);
+            tokio::time::timeout(CLEANUP_TIMEOUT, async {
+                while let Some(status) = wait.next().await {
+                    status?;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("service check timed out")??;
+            let mut logs = self.docker.logs(
+                &id,
+                Some(LogsOptions::<String> {
+                    stdout: true,
+                    stderr: true,
+                    ..Default::default()
+                }),
+            );
+            let mut output = String::new();
+            while let Some(chunk) = logs.next().await {
+                output.push_str(&chunk?.to_string());
+            }
+            anyhow::Ok(output)
+        }
+        .await;
+        let _ = self.force_remove(&id).await;
+        result
     }
 
     /// Create a container under a fixed name, replacing a leftover one
@@ -1619,6 +1729,52 @@ mod tests {
         assert!(log.contains("image debian:bookworm-slim"), "{}", log);
         assert!(log.contains("bash-syntax-ok"), "{}", log);
         assert!(log.contains("array=b"), "{}", log);
+        executor.cleanup(job_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_services_wait_get_their_variables_and_volumes_but_no_secrets() {
+        let shared = tempfile::tempdir().unwrap();
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                volumes: vec![format!("{}:/shared", shared.path().display())],
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 950_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "redis:7-alpine"},
+            "variables": [
+                {"key": "PUBLIC_VAR", "value": "pub", "public": true},
+                {"key": "SECRET_VAR", "value": "hidden-secret", "masked": true}
+            ],
+            "services": [{
+                "name": "redis:7-alpine",
+                "command": ["sh", "-c",
+                    "echo \"svc=$SVC_ONLY public=$PUBLIC_VAR secret=$SECRET_VAR\" > /shared/env.txt; sleep 3; exec redis-server"],
+                "variables": [{"key": "SVC_ONLY", "value": "svc-value"}]
+            }],
+            // No retry loop: the runner must wait for the service's port
+            "steps": steps(&["echo \"ping=$(redis-cli -h redis ping)\""], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("Waiting for services"), "{}", log);
+        assert!(log.contains("ping=PONG"), "{}", log);
+        assert_eq!(
+            std::fs::read_to_string(shared.path().join("env.txt")).unwrap(),
+            "svc=svc-value public=pub secret=\n"
+        );
         executor.cleanup(job_id).await;
     }
 

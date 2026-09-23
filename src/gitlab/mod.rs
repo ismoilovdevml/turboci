@@ -708,6 +708,9 @@ pub struct Service {
     pub command: Option<Vec<String>>,
     #[serde(default, deserialize_with = "string_or_list")]
     pub pull_policy: Vec<String>,
+    /// Service-level `variables:`
+    #[serde(default)]
+    pub variables: Vec<Variable>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
