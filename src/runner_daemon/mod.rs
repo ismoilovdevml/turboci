@@ -238,23 +238,6 @@ impl RunnerDaemon {
             }
         }
 
-        // Check internal cache before execution
-        let cache_key = self.compute_cache_key(&job).await?;
-        if let Some(_cached_result) = self.load_from_cache(&cache_key).await? {
-            info!("✅ Job #{} completed from cache!", job.id);
-
-            self.gitlab
-                .update_job(
-                    job.id,
-                    &job.token,
-                    JobState::Success,
-                    Some("Completed from cache (TurboCI)"),
-                )
-                .await?;
-
-            return Ok(());
-        }
-
         // Mask the job token, dependency tokens and masked variables
         let scrubber = self.scrubber.with_job_secrets(&job);
 
@@ -283,9 +266,6 @@ impl RunnerDaemon {
                         0
                     }
                 };
-
-                // Save to internal cache for future use
-                self.save_to_cache(&cache_key, &scrubbed_trace).await?;
 
                 // Upload artifacts in parallel if available (GitLab 17.x)
                 if let Some(ref artifacts) = job.artifacts {
@@ -411,69 +391,6 @@ impl RunnerDaemon {
             }
         }
 
-        Ok(())
-    }
-
-    /// Compute cache key for a job
-    async fn compute_cache_key(&self, job: &Job) -> Result<String> {
-        use blake3::Hasher;
-
-        let mut hasher = Hasher::new();
-
-        // Hash job script
-        for step in &job.steps {
-            for script_line in &step.script {
-                hasher.update(script_line.as_bytes());
-            }
-        }
-
-        // Hash git commit SHA if available
-        if let Some(ref git_info) = job.git_info {
-            hasher.update(git_info.sha.as_bytes());
-        }
-
-        // Hash variables (for environment-specific cache)
-        for var in &job.variables {
-            if !var.masked {
-                // Don't include secrets in cache key
-                if let Some(ref value) = var.value {
-                    hasher.update(format!("{}={}", var.key, value).as_bytes());
-                }
-            }
-        }
-
-        let hash = hasher.finalize().to_hex();
-        let project_id = job.job_info.as_ref().map(|ji| ji.project_id).unwrap_or(0);
-        Ok(format!("job:{}:{}", project_id, hash))
-    }
-
-    /// Load job result from cache
-    async fn load_from_cache(&self, key: &str) -> Result<Option<String>> {
-        if !self.config.cache_enabled {
-            return Ok(None);
-        }
-
-        match self.storage.retrieve(key).await? {
-            Some(data) => {
-                let trace = String::from_utf8(data)?;
-                info!("📦 Cache HIT: {}", key);
-                Ok(Some(trace))
-            }
-            None => {
-                info!("📭 Cache MISS: {}", key);
-                Ok(None)
-            }
-        }
-    }
-
-    /// Save job result to cache
-    async fn save_to_cache(&self, key: &str, trace: &str) -> Result<()> {
-        if !self.config.cache_enabled {
-            return Ok(());
-        }
-
-        self.storage.store(key, trace.as_bytes()).await?;
-        info!("💾 Cached result: {}", key);
         Ok(())
     }
 

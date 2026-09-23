@@ -19,6 +19,8 @@ mod runner_daemon;
 #[cfg(feature = "runner")]
 mod security;
 #[cfg(feature = "runner")]
+// Only runner statistics use it until the S3 cache backend lands (#14)
+#[allow(dead_code)]
 mod storage;
 
 use cache::CacheManager;
