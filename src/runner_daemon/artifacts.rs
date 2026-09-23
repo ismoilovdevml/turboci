@@ -183,24 +183,30 @@ fn symlink_stays_inside(link: &Path, target: &Path) -> bool {
 }
 
 /// Create ZIP archive from paths (used for artifacts and cache upload)
-pub async fn create_zip_from_paths(workspace_path: &str, paths: &[String]) -> Result<Vec<u8>> {
+pub async fn create_zip_from_paths(
+    workspace_path: &str,
+    paths: &[String],
+) -> Result<Option<Vec<u8>>> {
     create_archive(workspace_path, paths, "zip").await
 }
 
 /// Archive the files matching `paths` in the format GitLab expects for the
 /// artifact: `zip` (archives), `gzip` (reports; one gzip member per file) or
-/// `raw` (a single file as is)
+/// `raw` (a single file as is). `None` when no file matches.
 pub async fn create_archive(
     workspace_path: &str,
     paths: &[String],
     format: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     let workspace = workspace_path.to_string();
     let patterns = paths.to_vec();
     let format = format.to_string();
     tokio::task::spawn_blocking(move || {
         let files = collect_paths(&workspace, &patterns)?;
-        match format.as_str() {
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let data = match format.as_str() {
             "zip" => build_zip(Path::new(&workspace), &files),
             "gzip" => build_gzip(&files),
             "raw" => match files.as_slice() {
@@ -208,7 +214,8 @@ pub async fn create_archive(
                 _ => anyhow::bail!("raw artifacts need exactly one file, got {}", files.len()),
             },
             other => anyhow::bail!("Unsupported artifact format {:?}", other),
-        }
+        }?;
+        Ok(Some(data))
     })
     .await
     .context("Archive task panicked")?
@@ -523,7 +530,8 @@ mod tests {
             ],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("files matched");
 
         assert_eq!(zip_names(&data), vec!["dist/js/app.js", "report.xml"]);
     }
@@ -548,7 +556,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(zip_names(&data).is_empty());
+        assert!(data.is_none());
     }
 
     #[tokio::test]
@@ -560,7 +568,8 @@ mod tests {
 
         let data = create_archive(ws.path().to_str().unwrap(), &["*.xml".to_string()], "gzip")
             .await
-            .unwrap();
+            .unwrap()
+            .expect("files matched");
 
         let mut decoded = String::new();
         flate2::read::MultiGzDecoder::new(&data[..])
@@ -580,11 +589,7 @@ mod tests {
         let ws_path = ws.path().to_str().unwrap();
 
         let leaked = create_archive(ws_path, &["gl-sast-report.json".to_string()], "raw").await;
-        assert!(
-            leaked.is_err(),
-            "symlink target was read: {:?}",
-            leaked.map(String::from_utf8)
-        );
+        assert!(leaked.is_err(), "symlink target was read");
 
         let fifo = ws.path().join("report.json");
         assert!(std::process::Command::new("mkfifo")
@@ -609,7 +614,7 @@ mod tests {
         let ws_path = ws.path().to_str().unwrap();
 
         let one = create_archive(ws_path, &["report.json".to_string()], "raw").await;
-        assert_eq!(one.unwrap(), b"{}");
+        assert_eq!(one.unwrap().unwrap(), b"{}");
         assert!(create_archive(ws_path, &["*.json".to_string()], "raw")
             .await
             .is_err());
@@ -626,7 +631,8 @@ mod tests {
 
         let data = create_zip_from_paths(ws.path().to_str().unwrap(), &["leak".to_string()])
             .await
-            .unwrap();
+            .unwrap()
+            .expect("files matched");
 
         let mut archive = ZipArchive::new(std::io::Cursor::new(&data)).unwrap();
         let mut entry = archive.by_name("leak").unwrap();
@@ -648,6 +654,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(zip_names(&data).is_empty());
+        assert!(data.is_none());
     }
 }

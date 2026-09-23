@@ -758,6 +758,9 @@ pub struct Dependency {
     pub name: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub token: String,
+    /// Absent when the dependency produced no artifacts
+    #[serde(default)]
+    pub artifacts_file: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

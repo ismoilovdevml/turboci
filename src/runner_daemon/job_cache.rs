@@ -81,15 +81,18 @@ impl LocalCache {
         Ok(None)
     }
 
-    /// Archive `paths` from the workspace under `key`; returns the archive size
+    /// Archive `paths` from the workspace under `key`; returns the archive size,
+    /// or `None` when no file matched (nothing is saved)
     pub async fn save(
         &self,
         project_id: u64,
         key: &str,
         workspace: &str,
         paths: &[String],
-    ) -> Result<usize> {
-        let data = artifacts::create_zip_from_paths(workspace, paths).await?;
+    ) -> Result<Option<usize>> {
+        let Some(data) = artifacts::create_zip_from_paths(workspace, paths).await? else {
+            return Ok(None);
+        };
         let path = self.archive_path(project_id, key);
         let dir = path.parent().unwrap_or(Path::new("."));
         tokio::fs::create_dir_all(dir)
@@ -104,7 +107,7 @@ impl LocalCache {
         ));
         tokio::fs::write(&tmp, &data).await?;
         tokio::fs::rename(&tmp, &path).await?;
-        Ok(data.len())
+        Ok(Some(data.len()))
     }
 }
 

@@ -252,8 +252,14 @@ impl RunnerDaemon {
                 .execute(&job, &mut trace, &WorkspaceRestore(self))
                 .await;
         }
-        self.upload_artifacts(&job, &mut trace, outcome.is_ok())
+        // An upload failure fails a job that otherwise succeeded (the next stage
+        // would miss its inputs); the job's own failure takes precedence
+        let uploaded = self
+            .upload_artifacts(&job, &mut trace, outcome.is_ok())
             .await;
+        if outcome.is_ok() {
+            outcome = uploaded;
+        }
         self.upload_cache(&job, &mut trace, outcome.is_ok()).await;
         self.executor.cleanup(job.id).await;
         heartbeat.abort();
@@ -354,38 +360,49 @@ impl RunnerDaemon {
             }
         }
 
-        for dependency in &job.dependencies {
+        // Jobs without artifacts have nothing to download; a failed download
+        // fails the job, as the script would run without its inputs
+        for dependency in job
+            .dependencies
+            .iter()
+            .filter(|d| d.artifacts_file.is_some())
+        {
             trace
                 .write(&format!(
                     "Downloading artifacts from job #{} ({})...\n",
                     dependency.id, dependency.name
                 ))
                 .await;
-            if let Err(e) = artifacts::download_and_extract_artifacts(
+            artifacts::download_and_extract_artifacts(
                 &self.gitlab,
                 dependency.id,
                 &dependency.token,
                 &workspace,
             )
             .await
-            {
-                warn!(
-                    "Failed to download artifacts from job #{}: {}",
-                    dependency.id, e
-                );
-                trace
-                    .write(&format!("WARNING: Failed to download artifacts: {}\n", e))
-                    .await;
-            }
+            .map_err(|e| JobFailure {
+                reason: FailureReason::ScriptFailure,
+                exit_code: None,
+                message: format!(
+                    "failed to download artifacts from job #{} ({}): {:#}",
+                    dependency.id, dependency.name, e
+                ),
+            })?;
         }
         Ok(())
     }
 
     /// Upload artifacts whose `when` matches the job result (default: on_success)
-    async fn upload_artifacts(&self, job: &Job, trace: &mut TraceWriter<'_>, succeeded: bool) {
+    async fn upload_artifacts(
+        &self,
+        job: &Job,
+        trace: &mut TraceWriter<'_>,
+        succeeded: bool,
+    ) -> JobOutcome {
         let Some(ref job_artifacts) = job.artifacts else {
-            return;
+            return Ok(());
         };
+        let mut failure = None;
         let workspace = self.executor.job_dir(job.id).join("project");
 
         for artifact in job_artifacts {
@@ -414,7 +431,13 @@ impl RunnerDaemon {
             )
             .await
             {
-                Ok(data) => {
+                Ok(None) => {
+                    trace
+                        .write("WARNING: No files matched the artifact paths, nothing uploaded\n")
+                        .await;
+                    continue;
+                }
+                Ok(Some(data)) => {
                     let extension = match format {
                         "gzip" => ".gz",
                         "zip" => ".zip",
@@ -439,13 +462,19 @@ impl RunnerDaemon {
             match result {
                 Ok(()) => info!("✅ Uploaded artifact: {}", name),
                 Err(e) => {
-                    warn!("Failed to upload artifact {}: {}", name, e);
+                    warn!("Failed to upload artifact {}: {:#}", name, e);
                     trace
-                        .write(&format!("WARNING: Uploading artifacts failed: {}\n", e))
+                        .write(&format!("ERROR: Uploading artifacts failed: {:#}\n", e))
                         .await;
+                    failure.get_or_insert(JobFailure {
+                        reason: FailureReason::ScriptFailure,
+                        exit_code: None,
+                        message: format!("uploading artifacts ({}) failed: {:#}", name, e),
+                    });
                 }
             }
         }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Save cache entries whose policy pushes and whose `when` matches the result
@@ -480,9 +509,17 @@ impl RunnerDaemon {
                 )
                 .await
             {
-                Ok(size) => {
+                Ok(Some(size)) => {
                     trace
                         .write(&format!("Created cache {} ({} bytes)\n", key, size))
+                        .await
+                }
+                Ok(None) => {
+                    trace
+                        .write(&format!(
+                            "No files matched the paths of cache {}, not saved\n",
+                            key
+                        ))
                         .await
                 }
                 Err(e) => {
@@ -682,6 +719,86 @@ mod tests {
             "on_failure artifacts uploaded"
         );
         assert_eq!(daemon.cache.stats().0, 0, "no cache saved for failed jobs");
+    }
+
+    #[tokio::test]
+    async fn failed_artifact_upload_fails_the_job() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex(
+                r"^/api/v4/jobs/\d+/artifacts$",
+            ))
+            .respond_with(ResponseTemplate::new(413))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+
+        daemon
+            .execute_job(lifecycle_job(
+                61,
+                &["mkdir -p out", "echo x > out/a.txt"],
+                "on_success",
+            ))
+            .await
+            .unwrap();
+
+        let update = final_update(&server, 61).await;
+        assert_eq!(update["state"], "failed");
+        assert_eq!(update["failure_reason"], "script_failure");
+        assert!(trace_of(&server, 61)
+            .await
+            .contains("ERROR: Uploading artifacts failed"));
+    }
+
+    #[tokio::test]
+    async fn dependency_artifacts_are_required_only_when_they_exist() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/5/artifacts"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let with_deps = |id: u64, deps: serde_json::Value| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "token": "t",
+                "steps": [{"name": "script", "script": ["echo script-ran"], "when": "on_success"}],
+                "dependencies": deps
+            }))
+            .unwrap()
+        };
+
+        // A dependency without artifacts is skipped silently
+        daemon
+            .execute_job(with_deps(
+                71,
+                serde_json::json!([{"id": 4, "name": "lint", "token": "d"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(final_update(&server, 71).await["state"], "success");
+        assert!(requests(&server, "GET", 4).await.is_empty());
+
+        // A failed download of existing artifacts fails the job before its script
+        daemon
+            .execute_job(with_deps(
+                72,
+                serde_json::json!([{"id": 5, "name": "build", "token": "d",
+                "artifacts_file": {"filename": "artifacts.zip", "size": 10}}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(final_update(&server, 72).await["state"], "failed");
+        let trace = trace_of(&server, 72).await;
+        assert!(
+            trace.contains("failed to download artifacts from job #5"),
+            "{}",
+            trace
+        );
+        assert!(!trace.contains("\nscript-ran"), "{}", trace);
     }
 
     #[tokio::test]
