@@ -1,0 +1,82 @@
+default:
+  tags: [turboci]
+  image: alpine:3.20
+
+variables:
+  GREETING: "hello"
+  NESTED: "${GREETING}-world"
+
+stages: [build, test]
+
+build:
+  stage: build
+  script:
+    - echo "commit $CI_COMMIT_SHA on $CI_COMMIT_REF_NAME in $CI_PROJECT_DIR"
+    - test "$(cat VERSION)" = "1.0.0"
+    - mkdir -p dist vendor
+    - echo "built-$CI_COMMIT_SHORT_SHA" > dist/app.txt
+    - echo "dep-from-$CI_PIPELINE_ID" > vendor/lib.txt
+    - cd dist
+    - export STEP=exported
+    - echo "state=$STEP dir=$(basename "$PWD")"
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 day
+  cache:
+    key: deps-$CI_COMMIT_REF_SLUG
+    paths: [vendor/]
+
+test:artifacts:
+  stage: test
+  needs: [build]
+  script:
+    - cat dist/app.txt
+    - grep -q "built-$CI_COMMIT_SHORT_SHA" dist/app.txt
+
+test:cache:
+  stage: test
+  script:
+    - cat vendor/lib.txt
+  cache:
+    key: deps-$CI_COMMIT_REF_SLUG
+    paths: [vendor/]
+    policy: pull
+
+test:services:
+  stage: test
+  image: redis:7-alpine
+  services:
+    - name: redis:7-alpine
+      alias: cache
+  script:
+    - for i in $(seq 1 20); do redis-cli -h cache ping >/dev/null 2>&1 && break; sleep 0.5; done
+    - echo "by-alias $(redis-cli -h cache ping)"
+    - echo "by-image $(redis-cli -h redis ping)"
+
+test:variables:
+  stage: test
+  script:
+    - echo "masked=$E2E_SECRET"
+    - echo "file=$(cat "$E2E_FILE")"
+    - test "$NESTED" = "hello-world"
+
+test:failure:
+  stage: test
+  script:
+    - echo "about to fail"
+    - exit 3
+    - echo "never printed"
+  after_script:
+    - echo "after_script ran"
+  allow_failure: true
+
+test:cancel:
+  stage: test
+  rules:
+    - if: $E2E_CANCEL
+  script:
+    - echo "long job started"
+    - sleep 300
+    - echo "never printed"
+  after_script:
+    - echo "after_script after cancel"
