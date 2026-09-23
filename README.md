@@ -89,11 +89,13 @@ redis_url = "redis://127.0.0.1:6379"
 cache_ttl_seconds = 604800
 
 [executor]
-executor_type = "shell"
-
-[executor.shell]
-work_dir = "/tmp/turboci-builds"
+executor_type = "docker"
 ```
+
+The default executor is `docker`, which isolates each job in a container.
+`executor_type = "shell"` runs job scripts directly on the host with the
+runner's privileges and no isolation; only choose it when every project on the
+runner is trusted (the installer accepts `TURBOCI_EXECUTOR=shell`).
 
 ### 3. Connect to GitLab
 
@@ -120,18 +122,42 @@ runner_token = "glrt-YOUR-TOKEN-HERE"
 
 **Systemd service (Linux):**
 
+The service runs as an unprivileged `turboci` system user. Membership in the
+`docker` group is needed for the Docker executor (and is root-equivalent on
+the host). The config holds the runner token, so only that group may read it.
+
 ```bash
+sudo useradd --system --no-create-home --home-dir /var/lib/turboci --shell /usr/sbin/nologin turboci
+sudo usermod -aG docker turboci
+sudo install -d -o turboci -g turboci -m 0750 /var/lib/turboci
+sudo chown root:turboci /etc/turboci-runner.toml
+sudo chmod 0640 /etc/turboci-runner.toml
+
 sudo tee /etc/systemd/system/turboci.service > /dev/null <<EOF
 [Unit]
 Description=TurboCI Runner
-After=network.target redis.service
+After=network.target docker.service redis.service
 
 [Service]
 Type=simple
-User=root
+User=turboci
+Group=turboci
+WorkingDirectory=/var/lib/turboci
 ExecStart=/usr/local/bin/turboci runner-start -c /etc/turboci-runner.toml
 Restart=always
 RestartSec=10
+NoNewPrivileges=true
+# Must stay false: Docker bind-mounts job workspaces from /tmp/turboci-builds
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/turboci /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target
