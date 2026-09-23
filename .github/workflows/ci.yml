@@ -2,96 +2,77 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  test:
-    name: Test
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
-
-    services:
-      redis:
-        image: redis:alpine
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 6379:6379
-
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          override: true
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "test"
-          cache-on-failure: true
-
-      - name: Run tests
-        run: cargo test --verbose
-
-  build:
-    name: Build
-    runs-on: ${{ matrix.os }}
+  check:
+    name: Clippy + test (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        # windows-latest - temporarily disabled
+        features:
+          - { name: default, flags: "" }
+          - { name: all-features, flags: "--all-features" }
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          override: true
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "build-${{ matrix.os }}"
-          cache-on-failure: true
+          shared-key: check-${{ matrix.features.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --all-targets ${{ matrix.features.flags }} -- -D warnings
+      - run: cargo test --locked ${{ matrix.features.flags }}
 
-      - name: Build
-        run: cargo build --release --verbose
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: turboci-${{ matrix.os }}
-          path: target/release/turboci${{ matrix.os == 'windows-latest' && '.exe' || '' }}
-
-  lint:
-    name: Lint
+  audit:
+    name: Security audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
         with:
-          toolchain: stable
-          override: true
-          components: rustfmt, clippy
+          tool: cargo-audit
+      - run: cargo audit
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+  build-musl:
+    name: Build (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          shared-key: "lint"
-          cache-on-failure: true
-
-      - name: Run rustfmt
-        run: cargo fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-musl
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - run: cargo build --locked --release --all-features --target x86_64-unknown-linux-musl

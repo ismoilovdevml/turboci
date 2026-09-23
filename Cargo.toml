@@ -30,8 +30,8 @@ zip = { version = "5", default-features = false, features = ["deflate"] }
 # Runner daemon dependencies (optional feature)
 bollard = { version = "0.19", optional = true }
 futures-util = { version = "0.3", optional = true }
-aws-sdk-s3 = { version = "1", optional = true }
-aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "default-https-client", "sigv4a"] }
+aws-config = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "default-https-client", "credentials-process", "sso"] }
 toml = { version = "0.9", optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
 hyper = { version = "1", features = ["server"], optional = true }
@@ -46,6 +46,7 @@ api = ["axum", "prometheus", "hyper", "tower"]
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 
 [[bin]]
 name = "turboci"

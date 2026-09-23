@@ -6,156 +6,83 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build for ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux musl build (static binary for x86_64)
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cross: false
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
 
-          # macOS builds disabled for now (not used in production)
-          # - os: macos-latest
-          #   target: x86_64-apple-darwin
-          #   cross: false
-          # - os: macos-latest
-          #   target: aarch64-apple-darwin
-          #   cross: false
-
+  version:
+    name: Check tag matches Cargo.toml
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - run: |
+          crate_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v${crate_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate_version}"
+            exit 1
+          fi
 
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [ci, version]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          cache: true
-
-      # Cache Rust dependencies for faster builds
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+          targets: ${{ matrix.target }}
+      # Restores the cache saved by CI's build-musl job on main
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache Cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-build-
-
-      - name: Install musl tools (Linux)
-        if: contains(matrix.target, 'linux-musl')
+          shared-key: release-musl
+          save-if: false
+      - name: Install musl tools
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-
-      - name: Build release
+      - name: Build
+        run: cargo build --locked --release --all-features --target ${{ matrix.target }}
+      - name: Package
         run: |
-          cargo build --release --all-features --target ${{ matrix.target }}
-
-      - name: Strip binary (Linux)
-        if: contains(matrix.target, 'linux')
-        run: |
-          strip target/${{ matrix.target }}/release/turboci || true
-
-      - name: Strip binary (macOS)
-        if: contains(matrix.target, 'darwin')
-        run: |
-          strip target/${{ matrix.target }}/release/turboci || true
-
-      - name: Prepare binary for release
-        run: |
+          strip target/${{ matrix.target }}/release/turboci
           cp target/${{ matrix.target }}/release/turboci turboci-${{ matrix.target }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: turboci-${{ matrix.target }}
           path: turboci-${{ matrix.target }}
+          if-no-files-found: error
 
   release:
-    name: Create Release
+    name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: Move artifacts to root
+          merge-multiple: true
+      - name: Prepare assets and checksums
         run: |
-          find artifacts -name "turboci-*" -type f -exec mv {} . \;
-          # Create a copy of Linux binary as 'turboci' for backward compatibility
+          mv artifacts/turboci-* .
+          # Unsuffixed name kept for install.sh backward compatibility
           cp turboci-x86_64-unknown-linux-musl turboci
-          ls -lh turboci-*
-          ls -lh turboci
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+          sha256sum turboci turboci-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
             turboci
             turboci-*
-          body: |
-            ## ⚡ TurboCI ${{ github.ref_name }}
-
-            ### 📥 Quick Install
-
-            **Linux (x86_64):**
-            ```bash
-            curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh | bash
-            ```
-
-            **macOS (Intel/Apple Silicon):**
-            ```bash
-            curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh | bash
-            ```
-
-            ### 🗑️ Uninstall
-
-            ```bash
-            curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/uninstall.sh | bash
-            ```
-
-            ### 📦 Pre-built Binaries
-
-            Download the appropriate binary for your platform:
-            - `turboci` - Linux x86_64 (static binary, works on all distros)
-            - `turboci-x86_64-unknown-linux-musl` - Linux x86_64 with explicit platform name
-
-            ### ✨ Features
-
-            - ⚡ Super fast CI/CD runner with distributed caching
-            - 🔄 GitLab Runner compatibility with advanced features
-            - 📦 Content-based caching with BLAKE3 hashing
-            - 🐳 Docker executor support
-            - ☁️ Hybrid storage (Redis + S3/MinIO)
-            - 📊 Built-in performance monitoring
-
-            ### 🚀 What's Changed
-
-            See commits for details.
+            SHA256SUMS
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
