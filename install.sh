@@ -10,6 +10,13 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc"
 BIN_NAME="turboci"
 SERVICE_NAME="turboci"
+SERVICE_USER="turboci"
+STATE_DIR="/var/lib/turboci"
+# The Docker executor currently uses this fixed host path for job workspaces.
+DOCKER_BUILDS_DIR="/tmp/turboci-builds"
+# Executor for the generated config: "docker" (default) or "shell".
+# Select shell explicitly with: sudo TURBOCI_EXECUTOR=shell bash install.sh
+EXECUTOR="${TURBOCI_EXECUTOR:-docker}"
 
 # Colors
 RED='\033[0;31m'
@@ -181,6 +188,80 @@ install_turboci() {
     fi
 }
 
+# Validate the executor choice; shell must be an explicit, warned-about choice
+validate_executor() {
+    case "$EXECUTOR" in
+        docker)
+            echo -e "${GREEN}✓${NC} Executor: ${BLUE}docker${NC} (jobs isolated in containers)"
+            ;;
+        shell)
+            echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${YELLOW}⚠️  WARNING: shell executor selected (TURBOCI_EXECUTOR=shell)${NC}"
+            echo -e "${YELLOW}   Job scripts will run directly on this host as the${NC}"
+            echo -e "${YELLOW}   '$SERVICE_USER' user, with no container isolation.${NC}"
+            echo -e "${YELLOW}   Any project that can run CI jobs on this runner can read${NC}"
+            echo -e "${YELLOW}   the runner token and other jobs' workspaces.${NC}"
+            echo -e "${YELLOW}   Use it only when every project on this runner is trusted.${NC}"
+            echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            ;;
+        *)
+            echo -e "${RED}❌ Unknown TURBOCI_EXECUTOR: '$EXECUTOR' (use 'docker' or 'shell')${NC}"
+            exit 1
+            ;;
+    esac
+}
+
+# Create the unprivileged system user the service runs as (idempotent)
+create_service_user() {
+    echo -e "\n${YELLOW}👤 Creating service user...${NC}"
+
+    if id -u "$SERVICE_USER" > /dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} User already exists: ${BLUE}$SERVICE_USER${NC}"
+    else
+        useradd --system --no-create-home --home-dir "$STATE_DIR" \
+            --shell /usr/sbin/nologin "$SERVICE_USER"
+        echo -e "${GREEN}✓${NC} User created: ${BLUE}$SERVICE_USER${NC}"
+    fi
+
+    # Membership in the docker group is required to use the Docker socket.
+    # Note: docker group access is equivalent to root on this host.
+    if getent group docker > /dev/null 2>&1; then
+        usermod -aG docker "$SERVICE_USER"
+        echo -e "${GREEN}✓${NC} Added $SERVICE_USER to the docker group"
+    elif [ "$EXECUTOR" = "docker" ]; then
+        echo -e "${YELLOW}⚠️  Docker group not found - is Docker installed?${NC}"
+        echo -e "${YELLOW}   After installing Docker run: usermod -aG docker $SERVICE_USER${NC}"
+    fi
+}
+
+# Create directories owned by the service user
+create_directories() {
+    echo -e "\n${YELLOW}📁 Creating directories...${NC}"
+
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STATE_DIR" "$STATE_DIR/builds"
+    echo -e "${GREEN}✓${NC} State directory: ${BLUE}$STATE_DIR${NC}"
+
+    # Job containers run as root, so files they create in the workspace can
+    # not always be removed by the service user. Let systemd-tmpfiles create
+    # the workspace root with the right owner and age out leftovers.
+    if [ -d /etc/tmpfiles.d ]; then
+        echo "d $DOCKER_BUILDS_DIR 0750 $SERVICE_USER $SERVICE_USER 1d" > /etc/tmpfiles.d/turboci.conf
+        if command -v systemd-tmpfiles > /dev/null 2>&1; then
+            systemd-tmpfiles --create /etc/tmpfiles.d/turboci.conf || true
+        fi
+        echo -e "${GREEN}✓${NC} tmpfiles rule: ${BLUE}/etc/tmpfiles.d/turboci.conf${NC}"
+    fi
+
+    # Workspaces left behind by an earlier root-run install cannot be
+    # written or cleaned up by the unprivileged service user.
+    for dir in "$DOCKER_BUILDS_DIR" /tmp/turboci; do
+        if [ -e "$dir" ] && [ "$(stat -c %U "$dir" 2>/dev/null)" != "$SERVICE_USER" ]; then
+            echo -e "${YELLOW}⚠️  $dir exists and is not owned by $SERVICE_USER${NC}"
+            echo -e "${YELLOW}   Remove it before starting the service: rm -rf $dir${NC}"
+        fi
+    done
+}
+
 # Create TurboCI config
 create_config() {
     echo -e "\n${YELLOW}📝 Creating configuration...${NC}"
@@ -193,32 +274,54 @@ create_config() {
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             echo -e "${BLUE}ℹ️  Keeping existing config${NC}"
+            secure_config
+            if grep -Eq '^[[:space:]]*executor_type[[:space:]]*=[[:space:]]*"shell"' "$CONFIG_FILE"; then
+                echo -e "${YELLOW}⚠️  Existing config uses the shell executor (no job isolation)${NC}"
+            fi
             return
         fi
     fi
 
-    # Create config
-    cat > "$CONFIG_FILE" << 'EOF'
+    # Create the file with restrictive permissions before writing the token field
+    install -m 0640 -o root -g "$SERVICE_USER" /dev/null "$CONFIG_FILE"
+
+    cat > "$CONFIG_FILE" << EOF
 # TurboCI Runner Configuration
 concurrent = 4
+check_interval = 3
 runner_token = ""
 gitlab_url = "https://gitlab.com"
 redis_url = "redis://127.0.0.1:6379"
 cache_enabled = true
-cache_ttl_seconds = 604800
+s3_prefix = "turboci"
+storage_threshold = 10485760
 
 [executor]
-executor_type = "shell"
+# "docker" isolates each job in a container. "shell" runs job scripts
+# directly on this host as the $SERVICE_USER user - only for trusted projects.
+executor_type = "$EXECUTOR"
 
 [executor.shell]
-work_dir = "/tmp/turboci-builds"
+work_dir = "$STATE_DIR/builds"
 
 [executor.docker]
 default_image = "alpine:latest"
+privileged = false
+volumes = []
+network_mode = "bridge"
 EOF
 
-    echo -e "${GREEN}✓${NC} Config created: ${BLUE}$CONFIG_FILE${NC}"
+    secure_config
+
+    echo -e "${GREEN}✓${NC} Config created: ${BLUE}$CONFIG_FILE${NC} (executor: $EXECUTOR)"
     echo -e "${YELLOW}⚠️  You must edit this file and set your runner_token${NC}"
+}
+
+# The config holds the runner token: readable by the service group only
+secure_config() {
+    chown "root:$SERVICE_USER" "$CONFIG_FILE"
+    chmod 0640 "$CONFIG_FILE"
+    echo -e "${GREEN}✓${NC} Config permissions: root:$SERVICE_USER 0640"
 }
 
 # Create systemd service
@@ -231,13 +334,14 @@ create_service() {
 [Unit]
 Description=TurboCI Runner
 Documentation=https://github.com/$REPO
-After=network.target $REDIS_SERVICE.service
+After=network.target docker.service $REDIS_SERVICE.service
 Requires=$REDIS_SERVICE.service
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/tmp
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$STATE_DIR
 ExecStart=$INSTALL_DIR/$BIN_NAME runner-start -c $CONFIG_DIR/turboci-runner.toml
 Restart=always
 RestartSec=10
@@ -245,8 +349,21 @@ StandardOutput=journal
 StandardError=journal
 
 # Security
-NoNewPrivileges=false
+NoNewPrivileges=true
+# PrivateTmp must stay off: the Docker executor bind-mounts job workspaces
+# from $DOCKER_BUILDS_DIR, and dockerd resolves that path in the host's /tmp.
+# A private /tmp would hand every job container an empty workspace.
+# Revisit once workspaces move out of /tmp (issue #21).
 PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$STATE_DIR /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target
@@ -296,7 +413,8 @@ print_next_steps() {
     echo -e "\n${BLUE}📊 Installed Components:${NC}"
     echo -e "   ✓ Redis Server:  ${GREEN}Running${NC}"
     echo -e "   ✓ TurboCI:       ${GREEN}$LATEST_VERSION${NC}"
-    echo -e "   ✓ Config:        ${BLUE}$CONFIG_DIR/turboci-runner.toml${NC}"
+    echo -e "   ✓ Config:        ${BLUE}$CONFIG_DIR/turboci-runner.toml${NC} (executor: $EXECUTOR)"
+    echo -e "   ✓ Runs as:       ${BLUE}$SERVICE_USER${NC} (work dir $STATE_DIR)"
     echo -e "   ✓ Service:       ${GREEN}Enabled${NC} (not started)"
 
     echo -e "\n${BLUE}🔧 Management Commands:${NC}"
@@ -318,11 +436,14 @@ print_next_steps() {
 main() {
     echo -e "${BLUE}Starting automated installation...${NC}\n"
 
+    validate_executor
     detect_os
     detect_arch
     install_redis
     get_latest_version
     install_turboci
+    create_service_user
+    create_directories
     create_config
     create_service
     enable_service

@@ -30,14 +30,15 @@ storage_threshold = 10485760
 
 # ===== EXECUTOR CONFIGURATION =====
 [executor]
-# Executor type: "shell" (FAST!) or "docker" (isolated)
-# shell = Direct execution on host (10x faster, less isolation)
-# docker = Container execution (slower, better isolation)
-executor_type = "shell"
+# Executor type: "docker" (default, isolated) or "shell"
+# docker = Container execution per job (isolated from the host)
+# shell = Direct execution on the host as the runner's user, NO isolation.
+#         Only use shell when every project on this runner is trusted.
+executor_type = "docker"
 
 # Shell executor configuration (used when executor_type = "shell")
 [executor.shell]
-work_dir = "/tmp/turboci-builds"
+work_dir = "/var/lib/turboci/builds"
 
 # Docker executor configuration (used when executor_type = "docker")
 [executor.docker]

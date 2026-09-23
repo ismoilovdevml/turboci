@@ -83,7 +83,9 @@ impl Default for RunnerConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
-            executor_type: "shell".to_string(), // Default to shell for speed!
+            // Docker isolates jobs from the host. The shell executor runs job
+            // scripts directly as the runner's user and must be chosen explicitly.
+            executor_type: "docker".to_string(),
             docker: DockerConfig::default(),
             shell: ShellConfig::default(),
         }
@@ -146,5 +148,11 @@ mod tests {
 
         assert_eq!(config.concurrent, loaded.concurrent);
         assert_eq!(config.gitlab_url, loaded.gitlab_url);
+    }
+
+    #[test]
+    fn test_default_executor_is_docker() {
+        assert_eq!(RunnerConfig::default().executor.executor_type, "docker");
+        assert_eq!(ExecutorConfig::default().executor_type, "docker");
     }
 }

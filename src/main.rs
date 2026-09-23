@@ -163,6 +163,11 @@ async fn main() -> Result<()> {
             let executor = match runner_config.executor.executor_type.as_str() {
                 "shell" => {
                     info!("⚡ Using Shell executor (direct execution, super fast!)");
+                    tracing::warn!(
+                        "Shell executor runs job scripts directly on this host with the \
+                         runner's privileges and no isolation. Use executor_type = \"docker\" \
+                         unless every project using this runner is trusted."
+                    );
                     ExecutorType::Shell(ShellExecutor::new(Some(
                         runner_config.executor.shell.work_dir.clone(),
                     )))
