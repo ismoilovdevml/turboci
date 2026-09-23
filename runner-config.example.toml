@@ -45,8 +45,11 @@ volumes = []
 network_mode = "bridge"
 
 # "always" (default, like gitlab-runner), "if-not-present" or "never".
-# A job's image:pull_policy overrides it.
+# A job may choose a policy with image:pull_policy only from
+# allowed_pull_policies (empty = only pull_policy), so a project cannot use
+# "never"/"if-not-present" to run another project's cached private image.
 pull_policy = "always"
+allowed_pull_policies = []
 
 # Image with git and sh that checks out sources, so job images need neither
 helper_image = "alpine/git:latest"

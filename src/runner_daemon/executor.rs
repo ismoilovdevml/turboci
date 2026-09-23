@@ -427,7 +427,8 @@ impl DockerExecutor {
             .write(&format!("Using Docker executor with image {} ...\n", image))
             .await;
         info!("🐳 Using Docker image: {}", image);
-        self.ensure_image(&image, &policies, job, trace).await?;
+        self.ensure_image(&image, Some(&policies), job, trace)
+            .await?;
 
         let env = script::job_env(job, "/builds", job_dir);
         write_variable_files(&env)
@@ -439,8 +440,7 @@ impl DockerExecutor {
 
         if job.git_info.is_some() && git::strategy(&job.variables) != GitStrategy::None {
             let helper = self.config.helper_image.clone();
-            self.ensure_image(&helper, &["if-not-present".to_string()], job, trace)
-                .await?;
+            self.ensure_image(&helper, None, job, trace).await?;
             let id = self
                 .start_helper(job, job_dir, &env)
                 .await
@@ -460,7 +460,7 @@ impl DockerExecutor {
             trace
                 .write(&format!("Starting service {} ...\n", service.name))
                 .await;
-            self.ensure_image(&service.name, &service.pull_policy, job, trace)
+            self.ensure_image(&service.name, Some(&service.pull_policy), job, trace)
                 .await?;
             let id = self
                 .start_service(job, index, service, &env, containers.network.as_deref())
@@ -569,10 +569,12 @@ impl DockerExecutor {
 
     /// Make `image` available according to the pull policy, using the registry
     /// credentials GitLab sent with the job
+    /// `job_policies` is `None` for the runner's own helper image, which is pulled
+    /// only when missing
     async fn ensure_image(
         &self,
         image: &str,
-        job_policies: &[String],
+        job_policies: Option<&[String]>,
         job: &Job,
         trace: &mut TraceWriter<'_>,
     ) -> JobOutcome {
@@ -583,7 +585,16 @@ impl DockerExecutor {
         };
         let reference = image::with_default_tag(image);
         let present = self.docker.inspect_image(&reference).await.is_ok();
-        match PullPolicy::resolve(job_policies, &self.config.pull_policy) {
+        let policy = match job_policies {
+            None => PullPolicy::IfNotPresent,
+            Some(policies) => PullPolicy::resolve(
+                policies,
+                &self.config.pull_policy,
+                &self.config.allowed_pull_policies,
+            )
+            .map_err(pull_failure)?,
+        };
+        match policy {
             PullPolicy::Never if present => return Ok(()),
             PullPolicy::Never => {
                 return Err(pull_failure(format!(

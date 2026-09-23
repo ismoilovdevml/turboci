@@ -51,6 +51,8 @@ pub struct DockerConfig {
     pub network_mode: String,
     /// "always", "if-not-present" or "never" (a job's image:pull_policy overrides it)
     pub pull_policy: String,
+    /// Pull policies jobs may choose with `image:pull_policy`; empty = only `pull_policy`
+    pub allowed_pull_policies: Vec<String>,
     /// Image with git and sh that checks out sources (job images need neither)
     pub helper_image: String,
     /// Memory limit per container, e.g. "2g" or "512m"
@@ -163,6 +165,7 @@ impl Default for DockerConfig {
             volumes: vec![],
             network_mode: "bridge".to_string(),
             pull_policy: "always".to_string(),
+            allowed_pull_policies: Vec::new(),
             helper_image: "alpine/git:latest".to_string(),
             memory: None,
             cpus: None,
@@ -213,14 +216,13 @@ impl RunnerConfig {
         if docker.cpus.is_some_and(|cpus| cpus <= 0.0) {
             anyhow::bail!("executor.docker.cpus must be greater than 0");
         }
-        if !matches!(
-            docker.pull_policy.as_str(),
-            "always" | "if-not-present" | "never"
-        ) {
-            anyhow::bail!(
-                "executor.docker.pull_policy must be always, if-not-present or never, got {:?}",
-                docker.pull_policy
-            );
+        for policy in std::iter::once(&docker.pull_policy).chain(&docker.allowed_pull_policies) {
+            if !matches!(policy.as_str(), "always" | "if-not-present" | "never") {
+                anyhow::bail!(
+                    "executor.docker pull policies must be always, if-not-present or never, got {:?}",
+                    policy
+                );
+            }
         }
         match self.executor.executor_type.as_str() {
             "docker" | "shell" => Ok(()),

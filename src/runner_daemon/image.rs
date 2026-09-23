@@ -78,19 +78,44 @@ pub enum PullPolicy {
 }
 
 impl PullPolicy {
-    /// First policy the job asks for, else the runner's configured default
-    pub fn resolve(job_policies: &[String], default: &str) -> Self {
+    fn parse(policy: &str) -> Option<Self> {
+        match policy {
+            "always" => Some(PullPolicy::Always),
+            "if-not-present" => Some(PullPolicy::IfNotPresent),
+            "never" => Some(PullPolicy::Never),
+            _ => None,
+        }
+    }
+
+    /// The policy for a job image. Without a job policy the runner's default is
+    /// used; a job may only pick policies the runner allows (`allowed`, or just
+    /// the default when empty), like gitlab-runner's `allowed_pull_policies`.
+    /// Otherwise a job could, for example, use `never` to run another project's
+    /// private image from the local cache without registry credentials.
+    pub fn resolve(
+        job_policies: &[String],
+        default: &str,
+        allowed: &[String],
+    ) -> Result<Self, String> {
+        if job_policies.is_empty() {
+            return Ok(Self::parse(default).unwrap_or(PullPolicy::Always));
+        }
+        let allowed: Vec<&str> = if allowed.is_empty() {
+            vec![default]
+        } else {
+            allowed.iter().map(String::as_str).collect()
+        };
         job_policies
             .iter()
             .map(String::as_str)
-            .chain(std::iter::once(default))
-            .find_map(|p| match p {
-                "always" => Some(PullPolicy::Always),
-                "if-not-present" => Some(PullPolicy::IfNotPresent),
-                "never" => Some(PullPolicy::Never),
-                _ => None,
+            .filter(|policy| allowed.contains(policy))
+            .find_map(Self::parse)
+            .ok_or_else(|| {
+                format!(
+                    "pull_policy {:?} is not one of the runner's allowed pull policies {:?}",
+                    job_policies, allowed
+                )
             })
-            .unwrap_or(PullPolicy::Always)
     }
 }
 
@@ -163,15 +188,28 @@ mod tests {
     }
 
     #[test]
-    fn job_pull_policy_overrides_runner_default() {
+    fn job_pull_policy_limited_to_allowed_policies() {
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+
         assert_eq!(
-            PullPolicy::resolve(&[], "if-not-present"),
-            PullPolicy::IfNotPresent
+            PullPolicy::resolve(&[], "if-not-present", &[]),
+            Ok(PullPolicy::IfNotPresent)
         );
+        // Only the runner's own policy is allowed by default
+        assert!(PullPolicy::resolve(&s(&["never"]), "always", &[]).is_err());
+        assert!(PullPolicy::resolve(&s(&["if-not-present"]), "always", &[]).is_err());
         assert_eq!(
-            PullPolicy::resolve(&["never".to_string()], "always"),
-            PullPolicy::Never
+            PullPolicy::resolve(&s(&["always"]), "always", &[]),
+            Ok(PullPolicy::Always)
         );
-        assert_eq!(PullPolicy::resolve(&[], "bogus"), PullPolicy::Always);
+        // The first job policy that is allowed wins
+        assert_eq!(
+            PullPolicy::resolve(
+                &s(&["never", "if-not-present"]),
+                "always",
+                &s(&["always", "if-not-present"])
+            ),
+            Ok(PullPolicy::IfNotPresent)
+        );
     }
 }
