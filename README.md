@@ -45,9 +45,11 @@ This script installs:
 
 ```bash
 VERSION=$(curl -s https://api.github.com/repos/ismoilovdevml/turboci/releases/latest | grep tag_name | cut -d'"' -f4)
-curl -L "https://github.com/ismoilovdevml/turboci/releases/download/${VERSION}/turboci-linux-x86_64" -o turboci
-chmod +x turboci
-sudo mv turboci /usr/local/bin/
+BASE="https://github.com/ismoilovdevml/turboci/releases/download/${VERSION}"
+curl -fLO "$BASE/turboci-x86_64-unknown-linux-musl"
+curl -fLO "$BASE/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+sudo install -m 0755 turboci-x86_64-unknown-linux-musl /usr/local/bin/turboci
 ```
 
 ## ⚙️ Configuration

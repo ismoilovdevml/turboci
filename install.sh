@@ -117,17 +117,31 @@ get_latest_version() {
 install_turboci() {
     echo -e "\n${YELLOW}📥 Downloading TurboCI $LATEST_VERSION...${NC}"
 
-    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_VERSION/turboci-$TARGET"
-    TEMP_FILE="/tmp/turboci-download-$$"
+    RELEASE_URL="https://github.com/$REPO/releases/download/$LATEST_VERSION"
+    ASSET="turboci-$TARGET"
+    TEMP_FILE=$(mktemp)
+    SUMS_FILE=$(mktemp)
+    trap 'rm -f "$TEMP_FILE" "$SUMS_FILE"' EXIT
 
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
+    if ! curl -fsSL "$RELEASE_URL/$ASSET" -o "$TEMP_FILE"; then
         echo -e "${RED}❌ Download failed${NC}"
-        echo -e "${YELLOW}URL: $DOWNLOAD_URL${NC}"
-        rm -f "$TEMP_FILE"
+        echo -e "${YELLOW}URL: $RELEASE_URL/$ASSET${NC}"
         exit 1
     fi
 
-    echo -e "${GREEN}✓${NC} Downloaded successfully"
+    # Refuse binaries that do not match the release's published checksum
+    if ! curl -fsSL "$RELEASE_URL/SHA256SUMS" -o "$SUMS_FILE"; then
+        echo -e "${RED}❌ Release $LATEST_VERSION has no SHA256SUMS; refusing to install an unverified binary${NC}"
+        exit 1
+    fi
+    EXPECTED=$(awk -v asset="$ASSET" '$2 == asset || $2 == "*" asset { print $1 }' "$SUMS_FILE")
+    ACTUAL=$(sha256sum "$TEMP_FILE" | awk '{ print $1 }')
+    if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+        echo -e "${RED}❌ Checksum mismatch for $ASSET (expected '${EXPECTED:-none}', got '$ACTUAL')${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓${NC} Downloaded and verified (sha256 $ACTUAL)"
 
     # Install binary
     echo -e "${YELLOW}📦 Installing to $INSTALL_DIR...${NC}"
@@ -227,8 +241,12 @@ create_config() {
 
     if [ -f "$CONFIG_FILE" ]; then
         echo -e "${YELLOW}⚠️  Config already exists: $CONFIG_FILE${NC}"
-        read -p "Overwrite? (y/N): " -n 1 -r
-        echo
+        # stdin is the script itself under `curl | bash`: ask on the terminal
+        REPLY=""
+        if [ -r /dev/tty ]; then
+            read -p "Overwrite? (y/N): " -n 1 -r < /dev/tty
+            echo
+        fi
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             echo -e "${BLUE}ℹ️  Keeping existing config${NC}"
             secure_config

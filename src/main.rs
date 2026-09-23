@@ -226,73 +226,7 @@ async fn main() -> Result<()> {
             println!("  Cache archives:  {}", archives);
             println!("  Cache size:      {:.1} MB", bytes as f64 / 1_048_576.0);
         }
-        Commands::Upgrade => {
-            info!("🔄 Checking for updates...");
-
-            // Get current version
-            let current_version = env!("CARGO_PKG_VERSION");
-            println!("Current version: {}", current_version);
-
-            // Fetch latest release from GitHub
-            let client = reqwest::Client::new();
-            let response = client
-                .get("https://api.github.com/repos/ismoilovdevml/turboci/releases/latest")
-                .header("User-Agent", "TurboCI")
-                .send()
-                .await?;
-
-            let release: serde_json::Value = response.json().await?;
-            let latest_version = release["tag_name"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Failed to get latest version"))?
-                .trim_start_matches('v');
-
-            println!("Latest version: {}", latest_version);
-
-            if current_version == latest_version {
-                println!("✅ You are already running the latest version!");
-                return Ok(());
-            }
-
-            println!("📥 Downloading TurboCI {}...", latest_version);
-
-            // Detect architecture
-            let target = if cfg!(target_arch = "x86_64") && cfg!(target_os = "linux") {
-                "x86_64-unknown-linux-musl"
-            } else {
-                return Err(anyhow::anyhow!("Unsupported platform for auto-upgrade"));
-            };
-
-            let download_url = format!(
-                "https://github.com/ismoilovdevml/turboci/releases/download/v{}/turboci-{}",
-                latest_version, target
-            );
-
-            // Download new binary
-            let binary_data = client.get(&download_url).send().await?.bytes().await?;
-
-            // Get current executable path
-            let current_exe = std::env::current_exe()?;
-            let temp_path = current_exe.with_extension("new");
-
-            // Write new binary
-            std::fs::write(&temp_path, binary_data)?;
-
-            // Make executable
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&temp_path)?.permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&temp_path, perms)?;
-            }
-
-            // Replace current binary
-            std::fs::rename(&temp_path, &current_exe)?;
-
-            println!("✅ Successfully upgraded to version {}", latest_version);
-            println!("🔄 Please restart TurboCI to use the new version");
-        }
+        Commands::Upgrade => upgrade().await?,
     }
 
     Ok(())
@@ -328,4 +262,143 @@ fn spawn_signal_handler(shutdown: runner_daemon::ShutdownHandle) -> Result<()> {
         }
     });
     Ok(())
+}
+
+const RELEASES_API: &str = "https://api.github.com/repos/ismoilovdevml/turboci/releases/latest";
+
+/// Replace this binary with the latest release, after checking it against the
+/// release's SHA256SUMS and making sure it runs
+async fn upgrade() -> Result<()> {
+    info!("🔄 Checking for updates...");
+    let current_version = env!("CARGO_PKG_VERSION");
+    println!("Current version: {}", current_version);
+
+    let client = reqwest::Client::builder()
+        .user_agent("TurboCI")
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let release: serde_json::Value = client
+        .get(RELEASES_API)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let tag = release["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Latest release has no tag"))?;
+    let latest_version = tag.trim_start_matches('v');
+    println!("Latest version: {}", latest_version);
+    if current_version == latest_version {
+        println!("✅ You are already running the latest version!");
+        return Ok(());
+    }
+
+    if !(cfg!(target_arch = "x86_64") && cfg!(target_os = "linux")) {
+        anyhow::bail!("Unsupported platform for auto-upgrade");
+    }
+    let asset = "turboci-x86_64-unknown-linux-musl";
+    let base = format!(
+        "https://github.com/ismoilovdevml/turboci/releases/download/{}",
+        tag
+    );
+
+    println!("📥 Downloading TurboCI {}...", latest_version);
+    let download = |name: String| {
+        let client = client.clone();
+        let url = format!("{}/{}", base, name);
+        async move {
+            let bytes = client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()
+                .map_err(|e| anyhow::anyhow!("Failed to download {}: {}", url, e))?
+                .bytes()
+                .await?;
+            anyhow::Ok(bytes)
+        }
+    };
+    let binary = download(asset.to_string()).await?;
+    let sums = download("SHA256SUMS".to_string())
+        .await
+        .map_err(|e| anyhow::anyhow!("{} (refusing to upgrade without checksums)", e))?;
+    verify_checksum(&binary, &String::from_utf8_lossy(&sums), asset)?;
+    println!("✅ Checksum verified");
+
+    let current_exe = std::env::current_exe()?;
+    let temp_path = current_exe.with_extension("new");
+    std::fs::write(&temp_path, &binary)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let runs = std::process::Command::new(&temp_path)
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !runs {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::bail!("The downloaded binary does not run; keeping the current version");
+    }
+    std::fs::rename(&temp_path, &current_exe)?;
+
+    println!("✅ Successfully upgraded to version {}", latest_version);
+    println!("🔄 Please restart TurboCI to use the new version");
+    Ok(())
+}
+
+/// Check `data` against the entry for `asset` in a `sha256sum` style SHA256SUMS file
+fn verify_checksum(data: &[u8], sums: &str, asset: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let expected = sums
+        .lines()
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .find(|(_, name)| name.trim().trim_start_matches('*') == asset)
+        .map(|(hash, _)| hash.to_ascii_lowercase())
+        .ok_or_else(|| anyhow::anyhow!("SHA256SUMS has no entry for {}", asset))?;
+    let actual: String = Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    if actual != expected {
+        anyhow::bail!(
+            "Checksum mismatch for {}: expected {}, got {}",
+            asset,
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::verify_checksum;
+
+    // sha256("hello")
+    const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn accepts_matching_checksum() {
+        let sums = format!(
+            "{}  turboci\n{}  turboci-x86_64-unknown-linux-musl\n",
+            "0".repeat(64),
+            HELLO
+        );
+        verify_checksum(b"hello", &sums, "turboci-x86_64-unknown-linux-musl").unwrap();
+    }
+
+    #[test]
+    fn rejects_mismatch_and_missing_entry() {
+        let sums = format!("{}  turboci-x86_64-unknown-linux-musl\n", HELLO);
+        assert!(verify_checksum(b"tampered", &sums, "turboci-x86_64-unknown-linux-musl").is_err());
+        assert!(verify_checksum(b"hello", &sums, "turboci-other").is_err());
+        assert!(
+            verify_checksum(b"<html>404</html>", "", "turboci-x86_64-unknown-linux-musl").is_err()
+        );
+    }
 }
