@@ -22,6 +22,15 @@ pub mod script;
 pub mod system_id;
 pub mod trace;
 
+/// Aborts a spawned task when dropped
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Restores into the workspace once the executor has checked out sources
 struct WorkspaceRestore<'a>(&'a RunnerDaemon);
 
@@ -236,7 +245,9 @@ impl RunnerDaemon {
         let cancel = CancelSignal::default();
         let mut trace = TraceWriter::new(Some(&self.gitlab), job.id, &job.token, &scrubber)
             .with_cancel(cancel.clone());
-        let heartbeat = self.spawn_heartbeat(&job, cancel.clone());
+        // Aborted when dropped, even if the job panics, so GitLab is not told
+        // forever that a dead job is running
+        let _heartbeat = AbortOnDrop(self.spawn_heartbeat(&job, cancel.clone()));
         trace
             .write(&format!(
                 "Running with TurboCI {}\n",
@@ -267,7 +278,7 @@ impl RunnerDaemon {
             self.upload_cache(&job, &mut trace, outcome.is_ok()).await;
         }
         self.executor.cleanup(job.id).await;
-        heartbeat.abort();
+        drop(_heartbeat);
 
         // Jobs stopped by a runner shutdown are the runner's failure, not the user's
         let stopped_by_shutdown = *self.shutdown.borrow() == Shutdown::Abort;
@@ -783,6 +794,35 @@ mod tests {
         );
         assert!(body.contains("build/release/app"));
         assert!(!body.contains("app.map"));
+    }
+
+    #[tokio::test]
+    async fn output_of_a_quiet_job_reaches_gitlab_while_it_runs() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 91, "token": "t",
+            "steps": [{"name": "script", "when": "on_success",
+                       "script": ["echo started-and-waiting", "sleep 8"]}]
+        }))
+        .unwrap();
+        let running = tokio::spawn(async move { daemon.execute_job(job).await });
+
+        let mut seen_at = None;
+        for tenth in 0..70 {
+            sleep(Duration::from_millis(100)).await;
+            if trace_of(&server, 91).await.contains("started-and-waiting") {
+                seen_at = Some(tenth);
+                break;
+            }
+        }
+        assert!(!running.is_finished(), "job ended before the check");
+        assert!(
+            seen_at.is_some(),
+            "output held back while the job was quiet"
+        );
+        running.await.unwrap().unwrap();
     }
 
     #[tokio::test]

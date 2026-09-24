@@ -39,6 +39,9 @@ const DEFAULT_AFTER_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
 const SHELL_DETECT: &str =
     r#"if command -v bash >/dev/null 2>&1; then exec bash -c "$1"; fi; exec sh -c "$1""#;
 
+/// How often output of a quiet script is pushed to GitLab
+const TRACE_FLUSH_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Upper bound for resetting workspace ownership after a job
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Host directory holding Docker job workspaces (bind-mounted as /builds)
@@ -354,7 +357,7 @@ async fn get_sources(
     trace
         .write(&format!(
             "Fetching changes...\nChecking out {} as detached HEAD (ref is {})...\n",
-            &git_info.sha[..git_info.sha.len().min(8)],
+            git_info.sha.chars().take(8).collect::<String>(),
             git_info.ref_name
         ))
         .await;
@@ -1111,6 +1114,40 @@ struct DockerRunner<'a> {
     env: Vec<String>,
 }
 
+impl DockerRunner<'_> {
+    /// Kill every process in the container except its init (the idle loop), so a
+    /// timed-out or canceled script stops before after_script runs. Runs `kill`
+    /// directly (no shell), as root, bounded in time.
+    async fn stop_scripts(&self) {
+        let stop = async {
+            let exec = self
+                .docker
+                .create_exec(
+                    self.container_id,
+                    CreateExecOptions {
+                        cmd: Some(vec!["kill", "-KILL", "-1"]),
+                        user: Some("0"),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            if let StartExecResults::Attached { mut output, .. } =
+                self.docker.start_exec(&exec.id, None).await?
+            {
+                while output.next().await.is_some() {}
+            }
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(Duration::from_secs(10), stop).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Could not stop the script: {:#}", e),
+            Err(_) => warn!("Could not stop the script: timed out"),
+        }
+    }
+}
+
 #[async_trait]
 impl ScriptRunner for DockerRunner<'_> {
     async fn run(
@@ -1141,14 +1178,25 @@ impl ScriptRunner for DockerRunner<'_> {
         if let StartExecResults::Attached { mut output, .. } =
             self.docker.start_exec(&exec.id, None).await?
         {
+            let mut flush = tokio::time::interval(TRACE_FLUSH_INTERVAL);
             loop {
-                // On timeout or cancel the exec keeps running until the container is removed
                 let next = tokio::select! {
                     next = tokio::time::timeout_at(limits.deadline, output.next()) => next,
-                    _ = limits.cancel.reached(limits.stop_at) => return Ok(RunStatus::Canceled),
+                    _ = limits.cancel.reached(limits.stop_at) => {
+                        self.stop_scripts().await;
+                        return Ok(RunStatus::Canceled);
+                    }
+                    // A quiet script must not keep its last lines from GitLab
+                    _ = flush.tick() => {
+                        trace.flush().await;
+                        continue;
+                    }
                 };
                 let chunk = match next {
-                    Err(_) => return Ok(RunStatus::TimedOut),
+                    Err(_) => {
+                        self.stop_scripts().await;
+                        return Ok(RunStatus::TimedOut);
+                    }
                     Ok(None) => break,
                     Ok(Some(chunk)) => chunk?,
                 };
@@ -1249,8 +1297,12 @@ impl ScriptRunner for ShellRunner {
         let (mut out_open, mut err_open) = (true, true);
         let (mut stdout, mut stderr) = (Utf8Decoder::default(), Utf8Decoder::default());
 
+        let mut flush = tokio::time::interval(TRACE_FLUSH_INTERVAL);
         while out_open || err_open {
             tokio::select! {
+                _ = flush.tick() => {
+                    trace.flush().await;
+                }
                 n = out.read(&mut out_buf), if out_open => match n? {
                     0 => out_open = false,
                     n => trace.write(&stdout.decode(&out_buf[..n])).await,
@@ -1921,6 +1973,41 @@ mod tests {
         assert!(gone, "own leftover container not removed");
         assert!(net_gone, "own leftover network not removed");
         assert!(kept, "another runner's container was removed");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_timeout_stops_the_script_before_after_script() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 960_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "alpine:3.20"},
+            "runner_info": {"timeout": 2},
+            "steps": steps(
+                &["sleep 30"],
+                &["if ps | grep -v grep | grep -q 'sleep 30'; then echo script-still-running; else echo script-stopped; fi"]
+            )
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::JobExecutionTimeout
+        );
+        assert!(log.contains("script-stopped"), "{}", log);
+        executor.cleanup(job_id).await;
     }
 
     #[test]
