@@ -100,6 +100,16 @@ test:docker-build:
     - docker build -q -f Dockerfile.e2e -t "e2e-build:$CI_PIPELINE_ID" .
     - docker image inspect "e2e-build:$CI_PIPELINE_ID" --format 'built {{.Id}}'
 
+# A private image pulled with a registry login (DOCKER_AUTH_CONFIG or the
+# runner's Docker config); runs when E2E_PRIVATE_IMAGE is set
+test:private-image:
+  stage: test
+  rules:
+    - if: $E2E_PRIVATE_IMAGE
+  image: $E2E_PRIVATE_IMAGE
+  script:
+    - echo "private image $(. /etc/os-release && echo "$ID $VERSION_ID") pulled"
+
 test:runner-config:
   stage: test
   script:
