@@ -187,7 +187,7 @@ pub async fn create_zip_from_paths(
     workspace_path: &str,
     paths: &[String],
 ) -> Result<Option<Vec<u8>>> {
-    create_archive(workspace_path, paths, "zip").await
+    create_archive(workspace_path, paths, &[], "zip").await
 }
 
 /// Archive the files matching `paths` in the format GitLab expects for the
@@ -196,13 +196,15 @@ pub async fn create_zip_from_paths(
 pub async fn create_archive(
     workspace_path: &str,
     paths: &[String],
+    exclude: &[String],
     format: &str,
 ) -> Result<Option<Vec<u8>>> {
     let workspace = workspace_path.to_string();
     let patterns = paths.to_vec();
+    let exclude = exclude.to_vec();
     let format = format.to_string();
     tokio::task::spawn_blocking(move || {
-        let files = collect_paths(&workspace, &patterns)?;
+        let files = collect_paths(&workspace, &patterns, &exclude)?;
         if files.is_empty() {
             return Ok(None);
         }
@@ -254,7 +256,11 @@ fn read_regular_file(path: &Path, max: u64) -> Result<Vec<u8>> {
 ///
 /// Patterns that are absolute or contain `..` are skipped, matches reached through a
 /// symlinked directory are skipped, and symlinks are returned as-is (never followed).
-fn collect_paths(workspace_path: &str, patterns: &[String]) -> Result<Vec<PathBuf>> {
+fn collect_paths(
+    workspace_path: &str,
+    patterns: &[String],
+    exclude: &[String],
+) -> Result<Vec<PathBuf>> {
     use std::collections::BTreeSet;
     use std::path::Component;
 
@@ -295,7 +301,31 @@ fn collect_paths(workspace_path: &str, patterns: &[String]) -> Result<Vec<PathBu
             }
         }
     }
-    Ok(entries.into_iter().collect())
+
+    // `artifacts:exclude`: glob patterns on workspace-relative paths (`**` spans directories)
+    let exclude: Vec<glob::Pattern> = exclude
+        .iter()
+        .filter_map(|p| match glob::Pattern::new(p) {
+            Ok(pattern) => Some(pattern),
+            Err(e) => {
+                warn!("Ignoring invalid exclude pattern {:?}: {}", p, e);
+                None
+            }
+        })
+        .collect();
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        ..Default::default()
+    };
+    Ok(entries
+        .into_iter()
+        .filter(|path| {
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            !exclude
+                .iter()
+                .any(|pattern| pattern.matches_path_with(relative, options))
+        })
+        .collect())
 }
 
 fn build_zip(root: &Path, files: &[PathBuf]) -> Result<Vec<u8>> {
@@ -560,16 +590,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exclude_patterns_drop_matching_files() {
+        let ws = tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("dist/js")).unwrap();
+        std::fs::create_dir_all(ws.path().join("dist/tmp/deep")).unwrap();
+        std::fs::write(ws.path().join("dist/js/app.js"), b"js").unwrap();
+        std::fs::write(ws.path().join("dist/js/app.js.map"), b"map").unwrap();
+        std::fs::write(ws.path().join("dist/tmp/deep/scratch"), b"x").unwrap();
+
+        let data = create_archive(
+            ws.path().to_str().unwrap(),
+            &["dist".to_string()],
+            &["dist/**/*.map".to_string(), "dist/tmp/**".to_string()],
+            "zip",
+        )
+        .await
+        .unwrap()
+        .expect("files matched");
+
+        assert_eq!(zip_names(&data), vec!["dist/js/app.js"]);
+    }
+
+    #[tokio::test]
     async fn gzip_archive_holds_each_report_file() {
         use std::io::Read;
         let ws = tempdir().unwrap();
         std::fs::write(ws.path().join("a.xml"), b"<a/>").unwrap();
         std::fs::write(ws.path().join("b.xml"), b"<b/>").unwrap();
 
-        let data = create_archive(ws.path().to_str().unwrap(), &["*.xml".to_string()], "gzip")
-            .await
-            .unwrap()
-            .expect("files matched");
+        let data = create_archive(
+            ws.path().to_str().unwrap(),
+            &["*.xml".to_string()],
+            &[],
+            "gzip",
+        )
+        .await
+        .unwrap()
+        .expect("files matched");
 
         let mut decoded = String::new();
         flate2::read::MultiGzDecoder::new(&data[..])
@@ -588,7 +645,8 @@ mod tests {
         std::os::unix::fs::symlink(&secret, ws.path().join("gl-sast-report.json")).unwrap();
         let ws_path = ws.path().to_str().unwrap();
 
-        let leaked = create_archive(ws_path, &["gl-sast-report.json".to_string()], "raw").await;
+        let leaked =
+            create_archive(ws_path, &["gl-sast-report.json".to_string()], &[], "raw").await;
         assert!(leaked.is_err(), "symlink target was read");
 
         let fifo = ws.path().join("report.json");
@@ -599,7 +657,7 @@ mod tests {
             .success());
         let blocked = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            create_archive(ws_path, &["report.json".to_string()], "raw"),
+            create_archive(ws_path, &["report.json".to_string()], &[], "raw"),
         )
         .await
         .expect("reading a FIFO must not block");
@@ -613,9 +671,9 @@ mod tests {
         std::fs::write(ws.path().join("other.json"), b"[]").unwrap();
         let ws_path = ws.path().to_str().unwrap();
 
-        let one = create_archive(ws_path, &["report.json".to_string()], "raw").await;
+        let one = create_archive(ws_path, &["report.json".to_string()], &[], "raw").await;
         assert_eq!(one.unwrap().unwrap(), b"{}");
-        assert!(create_archive(ws_path, &["*.json".to_string()], "raw")
+        assert!(create_archive(ws_path, &["*.json".to_string()], &[], "raw")
             .await
             .is_err());
     }

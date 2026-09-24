@@ -524,6 +524,7 @@ impl RunnerFeatures {
             refspecs: true,
             masking: true,
             raw_variables: true,
+            artifacts_exclude: true,
             multi_build_steps: true,
             return_exit_code: true,
             cancelable: true,
@@ -721,6 +722,8 @@ pub struct Artifact {
     pub untracked: bool,
     #[serde(default)]
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
     #[serde(default)]
     pub when: Option<String>,
     #[serde(default)]
@@ -1043,7 +1046,7 @@ mod tests {
                 "features": {
                     "variables": true, "refspecs": true, "masking": true,
                     "return_exit_code": true, "image": false, "services": false,
-                    "trace_checksum": false, "trace_reset": false, "artifacts_exclude": false
+                    "trace_checksum": false, "trace_reset": false, "artifacts_exclude": true
                 }
             }})))
             .respond_with(ResponseTemplate::new(204))

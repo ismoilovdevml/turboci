@@ -403,6 +403,14 @@ impl RunnerDaemon {
             return Ok(());
         };
         let mut failure = None;
+        // Paths, exclude patterns and names may use variables
+        let variables = job_variables(job);
+        let expand_all = |items: &[String]| -> Vec<String> {
+            items
+                .iter()
+                .map(|item| script::expand(item, &variables))
+                .collect()
+        };
         let workspace = self.executor.job_dir(job.id).join("project");
 
         for artifact in job_artifacts {
@@ -414,7 +422,13 @@ impl RunnerDaemon {
             if !wanted || artifact.paths.is_empty() {
                 continue;
             }
-            let name = artifact.name.as_deref().unwrap_or("artifacts");
+            let name = artifact
+                .name
+                .as_deref()
+                .map(|name| script::expand(name, &variables))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "artifacts".to_string());
+            let name = name.as_str();
             let artifact_type = artifact.artifact_type.as_deref().unwrap_or("archive");
             let format = artifact.artifact_format.as_deref().unwrap_or("zip");
             trace
@@ -426,7 +440,8 @@ impl RunnerDaemon {
 
             let result = match artifacts::create_archive(
                 &workspace.to_string_lossy(),
-                &artifact.paths,
+                &expand_all(&artifact.paths),
+                &expand_all(&artifact.exclude),
                 format,
             )
             .await
@@ -505,7 +520,11 @@ impl RunnerDaemon {
                     project_id(job),
                     &key,
                     &workspace.to_string_lossy(),
-                    &cache_entry.paths,
+                    &cache_entry
+                        .paths
+                        .iter()
+                        .map(|path| script::expand(path, &variables))
+                        .collect::<Vec<_>>(),
                 )
                 .await
             {
@@ -719,6 +738,36 @@ mod tests {
             "on_failure artifacts uploaded"
         );
         assert_eq!(daemon.cache.stats().0, 0, "no cache saved for failed jobs");
+    }
+
+    #[tokio::test]
+    async fn artifact_paths_and_names_use_variables() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 81, "token": "t",
+            "variables": [{"key": "OUT", "value": "build/release", "public": true},
+                          {"key": "FLAVOR", "value": "linux", "public": true}],
+            "steps": [{"name": "script", "when": "on_success",
+                       "script": ["mkdir -p build/release", "echo bin > build/release/app", "echo map > build/release/app.map"]}],
+            "artifacts": [{"name": "app-$FLAVOR", "paths": ["$OUT/"], "exclude": ["$OUT/*.map"]}]
+        }))
+        .unwrap();
+
+        daemon.execute_job(job).await.unwrap();
+
+        assert_eq!(final_update(&server, 81).await["state"], "success");
+        let uploads = requests(&server, "POST", 81).await;
+        assert_eq!(uploads.len(), 1);
+        let body = String::from_utf8_lossy(&uploads[0].body);
+        assert!(
+            body.contains("filename=\"app-linux.zip\""),
+            "{}",
+            &body[..200.min(body.len())]
+        );
+        assert!(body.contains("build/release/app"));
+        assert!(!body.contains("app.map"));
     }
 
     #[tokio::test]
