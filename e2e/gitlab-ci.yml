@@ -15,12 +15,14 @@ build:
     - test "$(cat VERSION)" = "1.0.0"
     - mkdir -p dist vendor
     - echo "built-$CI_COMMIT_SHORT_SHA" > dist/app.txt
+    - echo "source map" > dist/app.txt.map
     - echo "dep-from-$CI_PIPELINE_ID" > vendor/lib.txt
     - cd dist
     - export STEP=exported
     - echo "state=$STEP dir=$(basename "$PWD")"
   artifacts:
     paths: [dist/]
+    exclude: ["dist/*.map"]
     expire_in: 1 day
   cache:
     key: deps-$CI_COMMIT_REF_SLUG
@@ -32,6 +34,7 @@ test:artifacts:
   script:
     - cat dist/app.txt
     - grep -q "built-$CI_COMMIT_SHORT_SHA" dist/app.txt
+    - test ! -e dist/app.txt.map && echo "excluded file not in artifacts"
 
 test:cache:
   stage: test
@@ -49,7 +52,7 @@ test:services:
     - name: redis:7-alpine
       alias: cache
   script:
-    - for i in $(seq 1 20); do redis-cli -h cache ping >/dev/null 2>&1 && break; sleep 0.5; done
+    # No retry loop: the runner waits for the service's port
     - echo "by-alias $(redis-cli -h cache ping)"
     - echo "by-image $(redis-cli -h redis ping)"
 
@@ -67,8 +70,15 @@ test:failure:
     - exit 3
     - echo "never printed"
   after_script:
-    - echo "after_script ran"
+    - echo "after_script ran with CI_JOB_STATUS=$CI_JOB_STATUS"
   allow_failure: true
+
+test:bash:
+  stage: test
+  image: debian:bookworm-slim
+  script:
+    - '[[ "$CI_COMMIT_REF_NAME" == main ]] && echo "bash syntax ok"'
+    - arr=(a b c); echo "array=${arr[2]}"
 
 test:cancel:
   stage: test
