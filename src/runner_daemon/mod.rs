@@ -22,6 +22,52 @@ pub mod script;
 pub mod system_id;
 pub mod trace;
 
+/// Retry count for a transfer, from a job variable such as
+/// ARTIFACT_DOWNLOAD_ATTEMPTS (1-10, default 1)
+fn attempts(job: &Job, key: &str) -> u32 {
+    job.variables
+        .iter()
+        .rev()
+        .find(|v| v.key == key)
+        .and_then(|v| v.value.as_deref())
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 10)
+}
+
+/// Hands out CI_CONCURRENT_ID (lowest free slot on this runner) and
+/// CI_CONCURRENT_PROJECT_ID (lowest free slot among the project's jobs)
+#[derive(Default)]
+struct ConcurrencySlots {
+    runner: std::collections::BTreeSet<u32>,
+    projects: std::collections::HashMap<u64, std::collections::BTreeSet<u32>>,
+}
+
+impl ConcurrencySlots {
+    fn lowest_free(used: &std::collections::BTreeSet<u32>) -> u32 {
+        (0..).find(|id| !used.contains(id)).unwrap_or(0)
+    }
+
+    fn acquire(&mut self, project: u64) -> (u32, u32) {
+        let id = Self::lowest_free(&self.runner);
+        self.runner.insert(id);
+        let used = self.projects.entry(project).or_default();
+        let project_id = Self::lowest_free(used);
+        used.insert(project_id);
+        (id, project_id)
+    }
+
+    fn release(&mut self, project: u64, (id, project_id): (u32, u32)) {
+        self.runner.remove(&id);
+        if let Some(used) = self.projects.get_mut(&project) {
+            used.remove(&project_id);
+            if used.is_empty() {
+                self.projects.remove(&project);
+            }
+        }
+    }
+}
+
 /// Aborts a spawned task when dropped
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -134,6 +180,7 @@ pub struct RunnerDaemon {
     scrubber: Arc<SecretScrubber>,
     shutdown: Arc<watch::Sender<Shutdown>>,
     heartbeat_interval: Duration,
+    slots: Arc<std::sync::Mutex<ConcurrencySlots>>,
 }
 
 impl RunnerDaemon {
@@ -162,6 +209,7 @@ impl RunnerDaemon {
             scrubber: Arc::new(scrubber),
             shutdown: Arc::new(watch::Sender::new(Shutdown::Running)),
             heartbeat_interval: HEARTBEAT_INTERVAL,
+            slots: Arc::default(),
         }
     }
 
@@ -238,7 +286,35 @@ impl RunnerDaemon {
     }
 
     /// Run a job end to end and always report a final state to GitLab
-    async fn execute_job(&self, job: Job) -> Result<()> {
+    async fn execute_job(&self, mut job: Job) -> Result<()> {
+        // Slot numbers scripts use for per-slot directories, like gitlab-runner
+        let project = project_id(&job);
+        let slot = self
+            .slots
+            .lock()
+            .map(|mut slots| slots.acquire(project))
+            .unwrap_or_default();
+        for (key, value) in [
+            ("CI_CONCURRENT_ID", slot.0),
+            ("CI_CONCURRENT_PROJECT_ID", slot.1),
+        ] {
+            job.variables.insert(
+                0,
+                serde_json::from_value(serde_json::json!({
+                    "key": key, "value": value.to_string(), "public": true, "internal": true
+                }))
+                .expect("valid variable"),
+            );
+        }
+        let result = self.run_job(&job).await;
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.release(project, slot);
+        }
+        result
+    }
+
+    async fn run_job(&self, job: &Job) -> Result<()> {
+        let job = job.clone();
         let job_name = job
             .job_info
             .as_ref()
@@ -368,7 +444,15 @@ impl RunnerDaemon {
                 trace
                     .write(&format!("Restoring cache {}...\n", keys[0]))
                     .await;
-                match self.cache.restore(project_id(job), &keys, &workspace).await {
+                let tries = attempts(job, "RESTORE_CACHE_ATTEMPTS");
+                let mut restored = self.cache.restore(project_id(job), &keys, &workspace).await;
+                for _ in 1..tries {
+                    if restored.is_ok() {
+                        break;
+                    }
+                    restored = self.cache.restore(project_id(job), &keys, &workspace).await;
+                }
+                match restored {
                     Ok(Some(key)) => {
                         trace
                             .write(&format!("Successfully restored cache {}\n", key))
@@ -400,13 +484,28 @@ impl RunnerDaemon {
                 .await;
             let cancel = trace.cancel();
             let job_dir = self.executor.job_dir(job.id);
-            let download = artifacts::download_and_extract_artifacts(
-                &self.gitlab,
-                dependency.id,
-                &dependency.token,
-                &workspace,
-                &job_dir,
-            );
+            let tries = attempts(job, "ARTIFACT_DOWNLOAD_ATTEMPTS");
+            let download = async {
+                let mut result = Err(anyhow::anyhow!("not attempted"));
+                for attempt in 1..=tries {
+                    result = artifacts::download_and_extract_artifacts(
+                        &self.gitlab,
+                        dependency.id,
+                        &dependency.token,
+                        &workspace,
+                        &job_dir,
+                    )
+                    .await;
+                    if result.is_ok() || attempt == tries {
+                        break;
+                    }
+                    warn!(
+                        "Artifact download attempt {}/{} failed, retrying",
+                        attempt, tries
+                    );
+                }
+                result
+            };
             let result = tokio::select! {
                 result = download => result,
                 _ = cancel.reached(RemoteState::Aborted) => {
@@ -977,6 +1076,36 @@ mod tests {
             "ignored files are untracked too"
         );
         assert!(!body.contains("README"));
+    }
+
+    #[test]
+    fn concurrency_slots_reuse_the_lowest_free_ids() {
+        let mut slots = ConcurrencySlots::default();
+        let a = slots.acquire(1);
+        let b = slots.acquire(1);
+        let c = slots.acquire(2);
+        assert_eq!((a, b, c), ((0, 0), (1, 1), (2, 0)));
+
+        slots.release(1, a);
+        assert_eq!(slots.acquire(3), (0, 0));
+        assert_eq!(slots.acquire(1), (3, 0));
+    }
+
+    #[tokio::test]
+    async fn jobs_get_concurrency_ids() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 121, "token": "t",
+            "steps": [{"name": "script", "when": "on_success",
+                       "script": ["echo ids=$CI_CONCURRENT_ID/$CI_CONCURRENT_PROJECT_ID"]}]
+        }))
+        .unwrap();
+
+        daemon.execute_job(job).await.unwrap();
+
+        assert!(trace_of(&server, 121).await.contains("ids=0/0"));
     }
 
     #[tokio::test]

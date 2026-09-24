@@ -324,6 +324,10 @@ async fn run_job_steps(
         };
 
         let mut script = script::step_script(&lines);
+        // CI_DEBUG_TRACE shows every command as it runs (masking still applies)
+        if variable_value(job, "CI_DEBUG_TRACE") == Some("true") {
+            script = format!("set -x\n{}", script);
+        }
         if is_after_script {
             // Like gitlab-runner, after_script can tell how the job went
             let status = match &failure {
@@ -390,6 +394,28 @@ async fn get_sources(
     dirs: &JobDirs,
     limits: &Limits<'_>,
 ) -> std::result::Result<(), RunError> {
+    // hooks:pre_get_sources_script runs before the checkout, where it happens
+    let hook = pre_get_sources_script(job);
+    if !hook.is_empty() {
+        trace.write("Running pre_get_sources_script\n").await;
+        match runner
+            .run(&script::step_script(&hook), &dirs.builds, trace, limits)
+            .await
+        {
+            Ok(RunStatus::Exited(0)) => {}
+            Ok(RunStatus::Exited(code)) => {
+                return Err(RunError::Failed(JobFailure {
+                    reason: FailureReason::ScriptFailure,
+                    exit_code: Some(code),
+                    message: format!("pre_get_sources_script failed with exit code {}", code),
+                }))
+            }
+            Ok(RunStatus::TimedOut) => return Err(RunError::TimedOut),
+            Ok(RunStatus::Canceled) => return Err(RunError::Canceled),
+            Err(e) => return Err(RunError::Failed(JobFailure::system(format!("{:#}", e)))),
+        }
+    }
+
     let Some(ref git_info) = job.git_info else {
         return Ok(());
     };
@@ -475,6 +501,17 @@ async fn get_sources(
         }
     }
     Ok(())
+}
+
+/// Lines of the job's `hooks:pre_get_sources_script`
+fn pre_get_sources_script(job: &Job) -> Vec<String> {
+    job.hooks
+        .iter()
+        .filter(|hook| hook["name"] == "pre_get_sources_script")
+        .filter_map(|hook| hook["script"].as_array())
+        .flatten()
+        .filter_map(|line| line.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Value of a job variable (last definition wins)
@@ -1746,6 +1783,25 @@ mod tests {
         assert!(log.contains("(attempt 1/3), retrying"), "{}", log);
         assert!(log.contains("(attempt 2/3), retrying"), "{}", log);
         assert!(!log.contains("attempt 3/3"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn pre_get_sources_hook_and_debug_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 12, "token": "t",
+            "hooks": [{"name": "pre_get_sources_script", "script": ["echo hook-ran-first"]}],
+            "variables": [{"key": "CI_DEBUG_TRACE", "value": "true"}],
+            "steps": steps(&["X=traced-value"], &[])
+        }));
+
+        let (outcome, log) = run_shell(&j, dir.path()).await;
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        let hook = log.find("hook-ran-first").expect("hook output");
+        let step = log.find("step_script").expect("step output");
+        assert!(hook < step, "{}", log);
+        assert!(log.contains("+ X=traced-value"), "{}", log);
     }
 
     #[tokio::test]
