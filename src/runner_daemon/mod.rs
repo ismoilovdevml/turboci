@@ -661,8 +661,18 @@ impl RunnerDaemon {
                 if cache_entry.policy != "pull" && cache_entry.policy != "pull-push" {
                     continue;
                 }
-                // CACHE_FALLBACK_KEY is the last resort, after the entry's own fallbacks
-                let fallback = variables.get("CACHE_FALLBACK_KEY").cloned();
+                // CACHE_FALLBACK_KEY is the last resort, after the entry's own
+                // fallbacks. Like gitlab-runner, it may not name a protected
+                // branch's cache, or any branch could read it.
+                let mut fallback = variables.get("CACHE_FALLBACK_KEY").cloned();
+                if fallback.as_deref().is_some_and(|key| {
+                    job_cache::resolve_key(key, &variables).ends_with("-protected")
+                }) {
+                    trace
+                        .write("WARNING: CACHE_FALLBACK_KEY ending in -protected is not allowed, ignoring it\n")
+                        .await;
+                    fallback = None;
+                }
                 let keys: Vec<String> = std::iter::once(&cache_entry.key)
                     .chain(&cache_entry.fallback_keys)
                     .chain(fallback.as_ref())
@@ -1263,6 +1273,51 @@ mod tests {
             trace
         );
         assert!(trace.contains("from-main"), "{}", trace);
+    }
+
+    #[tokio::test]
+    async fn cache_fallback_key_cannot_reach_protected_caches() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let with_cache = |id: u64, key: &str, script: &str, vars: serde_json::Value| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "token": "t",
+                "job_info": {"name": "j", "stage": "s", "project_id": 9, "project_name": "p"},
+                "variables": vars,
+                "steps": [{"name": "script", "script": [script], "when": "on_success"}],
+                "cache": [{"key": key, "paths": ["vendor/"], "policy": "pull-push"}]
+            }))
+            .unwrap()
+        };
+
+        daemon
+            .execute_job(with_cache(
+                111,
+                "deps-protected",
+                "mkdir -p vendor && echo from-protected > vendor/x",
+                serde_json::json!([]),
+            ))
+            .await
+            .unwrap();
+        daemon
+            .execute_job(with_cache(
+                112,
+                "deps-non_protected",
+                "cat vendor/x || echo nothing-restored",
+                serde_json::json!([{"key": "CACHE_FALLBACK_KEY", "value": "deps-protected"}]),
+            ))
+            .await
+            .unwrap();
+
+        let trace = trace_of(&server, 112).await;
+        assert!(
+            trace.contains("ending in -protected is not allowed"),
+            "{}",
+            trace
+        );
+        assert!(!trace.contains("from-protected"), "{}", trace);
+        assert!(trace.contains("nothing-restored"), "{}", trace);
     }
 
     #[tokio::test]

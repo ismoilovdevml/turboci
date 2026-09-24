@@ -359,7 +359,7 @@ mod tests {
     fn stream_scrubber_holds_back_pattern_touching_chunk_end() {
         let scrubber = SecretScrubber::new(vec![]);
         let mut stream = StreamScrubber::new(&scrubber);
-        let token = "glrt-ztr69pD0SBp9pB1og6xgE286MQp0OjEKdToxCw";
+        let token = "glrt-TESTtoken0000synthetic1111notreal22";
 
         let mut out = stream.push(&format!("{}{}", "x".repeat(200), &token[..30]));
         out.push_str(&stream.push(&format!("{} end", &token[30..])));
@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn test_scrub_gitlab_token() {
         let scrubber = SecretScrubber::new(vec![]);
-        let text = "Runner token: glrt-ztr69pD0SBp9pB1og6xgE286MQp0OjEKdToxCw";
+        let text = "Runner token: glrt-TESTtoken0000synthetic1111notreal22";
         let scrubbed = scrubber.scrub(text);
         assert_eq!(scrubbed, "Runner token: [MASKED]");
     }

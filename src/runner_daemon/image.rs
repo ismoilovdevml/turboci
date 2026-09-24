@@ -25,7 +25,14 @@ pub fn with_default_tag(image: &str) -> String {
 /// Registry host of an image; Docker Hub images have none in their name
 pub fn registry(image: &str) -> &str {
     match repository(image).split_once('/') {
-        Some((first, _)) if first.contains('.') || first.contains(':') || first == "localhost" => {
+        // Docker's rule (splitDockerDomain): a dot, a port, "localhost", or
+        // any uppercase letter makes the first component a registry host
+        Some((first, _))
+            if first.contains('.')
+                || first.contains(':')
+                || first == "localhost"
+                || first.chars().any(|c| c.is_ascii_uppercase()) =>
+        {
             first
         }
         _ => "docker.io",
@@ -172,6 +179,11 @@ mod tests {
             "registry.gitlab.com"
         );
         assert_eq!(registry("localhost:5000/app"), "localhost:5000");
+        // Docker treats an uppercase first component as a host, so the Docker
+        // Hub login must not be offered for it
+        assert_eq!(registry("Myhost/app"), "Myhost");
+        let hub = r#"{"auths": {"https://index.docker.io/v1/": {"auth": "aHViOnB3"}}}"#;
+        assert_eq!(docker_config_auth(hub, "Myhost/app"), None);
     }
 
     #[test]

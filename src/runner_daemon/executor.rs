@@ -94,14 +94,23 @@ impl ExecutorType {
         trace: &mut TraceWriter<'_>,
         restore: &dyn Restore,
     ) -> JobOutcome {
-        match self {
-            ExecutorType::Docker(executor) => {
-                executor
-                    .execute(job, &self.job_dir(job.id), trace, restore)
-                    .await
+        use futures_util::FutureExt;
+
+        let run = async {
+            match self {
+                ExecutorType::Docker(executor) => {
+                    executor
+                        .execute(job, &self.job_dir(job.id), trace, restore)
+                        .await
+                }
+                ExecutorType::Shell(executor) => executor.execute(job, trace, restore).await,
             }
-            ExecutorType::Shell(executor) => executor.execute(job, trace, restore).await,
-        }
+        };
+        // A bug must fail the job, not skip its cleanup and final report
+        std::panic::AssertUnwindSafe(run)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(JobFailure::system("internal runner error")))
     }
 
     /// Give jobs the custom CA the GitLab server's certificate is signed with
@@ -119,28 +128,46 @@ impl ExecutorType {
     pub async fn untracked_files(&self, job: &Job) -> Result<Vec<String>> {
         let job_id = job.id;
         let subdir = script::project_subdir(job).unwrap_or_else(|_| "project".to_string());
-        const LIST: &str = "git -c safe.directory='*' -C {dir} ls-files --others -z";
+        // The repository is the job's: its config must not run commands here
+        // (core.fsmonitor, hooks), since this runs after the job has ended
+        const NO_REPO_COMMANDS: [&str; 4] = [
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ];
         let output = match self {
             ExecutorType::Docker(executor) => {
                 let job_dir = self.job_dir(job_id);
+                let dir = format!("/builds/{}", subdir);
+                let script = format!(
+                    "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c safe.directory={dir} {} -C {dir} ls-files --others -z",
+                    NO_REPO_COMMANDS.join(" "),
+                );
                 executor
                     .run_helper(
                         &format!("turboci-job-{}-untracked", job_id),
-                        &LIST.replace("{dir}", &format!("/builds/{}", subdir)),
+                        &script,
                         HostConfig {
                             binds: Some(vec![format!("{}:/builds", job_dir.display())]),
                             network_mode: Some("none".to_string()),
                             ..Default::default()
                         },
                         true,
+                        // Not root: the workspace belongs to the runner again
+                        workspace_owner(&job_dir),
                     )
                     .await?
             }
             ExecutorType::Shell(_) => {
                 let project = self.job_dir(job_id).join(&subdir);
                 let out = Command::new("git")
-                    .args(["-c", "safe.directory=*", "-C"])
+                    .arg("-c")
+                    .arg(format!("safe.directory={}", project.display()))
+                    .args(NO_REPO_COMMANDS)
+                    .arg("-C")
                     .arg(&project)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
                     .args(["ls-files", "--others", "-z"])
                     .output()
                     .await
@@ -282,7 +309,12 @@ async fn run_job_steps(
 
     // RUNNER_SCRIPT_TIMEOUT caps the script steps within the job timeout
     let script_timeout = stage_timeout(job, "RUNNER_SCRIPT_TIMEOUT", trace).await;
-    let script_deadline = script_timeout.map_or(deadline, |t| deadline.min(Instant::now() + t));
+    // checked_add: a job may ask for any duration, which must never overflow
+    let script_deadline = script_timeout.map_or(deadline, |t| {
+        Instant::now()
+            .checked_add(t)
+            .map_or(deadline, |d| deadline.min(d))
+    });
     let after_script_timeout = stage_timeout(job, "RUNNER_AFTER_SCRIPT_TIMEOUT", trace).await;
 
     for step in &job.steps {
@@ -319,13 +351,17 @@ async fn run_job_steps(
         let limits = if is_after_script {
             trace.section_start(&section, "Running after_script").await;
             let secs = u64::from(step.timeout);
+            let wanted = match after_script_timeout {
+                Some(timeout) => timeout,
+                None if secs > 0 => Duration::from_secs(secs),
+                None => DEFAULT_AFTER_SCRIPT_TIMEOUT,
+            };
+            // after_script may not outlive the job timeout (it keeps a runner
+            // slot), but always gets the default grace, even after a timeout
+            let now = Instant::now();
+            let cap = deadline.max(now + DEFAULT_AFTER_SCRIPT_TIMEOUT);
             Limits {
-                deadline: Instant::now()
-                    + match after_script_timeout {
-                        Some(timeout) => timeout,
-                        None if secs > 0 => Duration::from_secs(secs),
-                        None => DEFAULT_AFTER_SCRIPT_TIMEOUT,
-                    },
+                deadline: now.checked_add(wanted).map_or(cap, |d| d.min(cap)),
                 cancel: &cancel,
                 stop_at: RemoteState::Aborted,
             }
@@ -693,6 +729,22 @@ fn service_ports(config: Option<&bollard::models::ContainerConfig>) -> Vec<u16> 
     ports
 }
 
+/// `uid:gid` owning a host directory, to run a helper as that user
+fn workspace_owner(dir: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir)
+            .ok()
+            .map(|meta| format!("{}:{}", meta.uid(), meta.gid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 /// Containers and network created for one job, removed when it ends
 #[derive(Default)]
 struct JobContainers {
@@ -775,11 +827,20 @@ impl DockerExecutor {
         trace: &mut TraceWriter<'_>,
         restore: &dyn Restore,
     ) -> JobOutcome {
+        use futures_util::FutureExt;
+
         let mut containers = JobContainers::default();
-        let outcome = self
-            .start_and_run(job, job_dir, trace, &mut containers, restore)
-            .await;
-        // Always runs, including after failures, timeouts and cancellation
+        let outcome = std::panic::AssertUnwindSafe(self.start_and_run(
+            job,
+            job_dir,
+            trace,
+            &mut containers,
+            restore,
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(JobFailure::system("internal runner error")));
+        // Always runs, including after failures, timeouts, cancellation and panics
         self.release(job.id, &containers, job_dir).await;
         outcome
     }
@@ -1251,6 +1312,7 @@ impl DockerExecutor {
                     ..Default::default()
                 },
                 false,
+                None,
             )
             .await
         {
@@ -1267,6 +1329,7 @@ impl DockerExecutor {
         script: &str,
         host_config: HostConfig,
         stdout_only: bool,
+        user: Option<String>,
     ) -> Result<String> {
         use bollard::container::{LogsOptions, StartContainerOptions, WaitContainerOptions};
 
@@ -1276,6 +1339,7 @@ impl DockerExecutor {
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
             cmd: Some(vec![script.to_string()]),
             host_config: Some(host_config),
+            user,
             ..Default::default()
         };
         let id = self.create_named(name, config).await?;
@@ -2030,6 +2094,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn huge_stage_timeouts_do_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 16, "token": "t",
+            "variables": [
+                {"key": "RUNNER_SCRIPT_TIMEOUT", "value": "10000000000000000000s"},
+                {"key": "RUNNER_AFTER_SCRIPT_TIMEOUT", "value": "10000000000000000000s"}
+            ],
+            "steps": steps(&["echo script-ran"], &["echo after-ran"])
+        }));
+        let (outcome, log) = run_shell(&j, dir.path()).await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("after-ran"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn untracked_listing_ignores_the_jobs_git_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ExecutorType::Shell(ShellExecutor::new(Some(
+            dir.path().to_string_lossy().into_owned(),
+        )));
+        let project = executor.job_dir(17).join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&project)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        let marker = dir.path().join("fsmonitor-ran");
+        git(&[
+            "config",
+            "core.fsmonitor",
+            &format!("touch {}", marker.display()),
+        ]);
+        std::fs::write(project.join("new.txt"), "n").unwrap();
+
+        let j = job(serde_json::json!({"id": 17, "token": "t"}));
+        let files = executor.untracked_files(&j).await.unwrap();
+
+        assert!(files.contains(&"new.txt".to_string()), "{:?}", files);
+        assert!(!marker.exists(), "the job's core.fsmonitor command ran");
+    }
+
+    #[tokio::test]
     async fn git_clone_path_moves_the_project_dir() {
         let dir = tempfile::tempdir().unwrap();
         let j = job(serde_json::json!({
@@ -2612,12 +2729,23 @@ mod tests {
         git(&project, &["add", "tracked"]);
         git(&project, &["commit", "-q", "-m", "init"]);
         std::fs::write(project.join("new.txt"), "n").unwrap();
+        // The job's repository config asks git to run a command
+        git(
+            &project,
+            &[
+                "config",
+                "core.fsmonitor",
+                "touch /builds/project/fsmonitor-ran",
+            ],
+        );
 
         let j = job(serde_json::json!({"id": job_id, "token": "t"}));
         let files = executor.untracked_files(&j).await.unwrap();
 
+        let ran = project.join("fsmonitor-ran").exists();
         executor.cleanup(job_id).await;
         assert_eq!(files, vec!["new.txt".to_string()]);
+        assert!(!ran, "the job's core.fsmonitor command ran");
     }
 
     #[test]
