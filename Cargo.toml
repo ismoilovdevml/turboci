@@ -35,6 +35,7 @@ toml = { version = "0.9", optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
 dns-lookup = "2"
 tempfile = "3"
+rustix = { version = "1.1", features = ["fs"] }
 
 [features]
 default = []

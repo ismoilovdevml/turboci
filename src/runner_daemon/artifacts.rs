@@ -94,6 +94,11 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
 
     let root = Path::new(workspace_path);
     std::fs::create_dir_all(root)?;
+    // Every operation below is relative to directory handles opened without
+    // following symlinks. The workspace may be changed while we extract (a
+    // job container is running), so a path checked once could be swapped
+    // for a symlink before it is used; a handle cannot.
+    let root_dir = safe_fs::open_root(root)?;
     let mut total_bytes: u64 = 0;
 
     for i in 0..archive.len() {
@@ -103,22 +108,18 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
             .with_context(|| format!("Unsafe path in archive: {:?}", file.name()))?;
 
         if file.is_dir() {
-            create_dirs_inside(root, &rel_path)?;
+            safe_fs::open_dirs(&root_dir, &rel_path)?;
             continue;
         }
 
-        if let Some(parent) = rel_path.parent() {
-            create_dirs_inside(root, parent)?;
-        }
-        let out_path = root.join(&rel_path);
-        remove_existing_symlink(&out_path)?;
+        let (parent, name) = safe_fs::split_leaf(&rel_path)?;
+        let dir = safe_fs::open_dirs(&root_dir, parent)?;
 
         if file.is_symlink() {
             let mut target = String::new();
             std::io::Read::read_to_string(&mut file, &mut target)?;
             if symlink_stays_inside(&rel_path, Path::new(&target)) {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&target, &out_path)?;
+                safe_fs::create_symlink(&dir, name, &target)?;
             } else {
                 warn!(
                     "Skipping symlink {:?} -> {:?}: points outside workspace",
@@ -130,7 +131,7 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
 
         // Bound the copy by the remaining budget; `size()` comes from the archive and can lie
         let remaining = limits.max_total_bytes.saturating_sub(total_bytes);
-        let mut out_file = std::fs::File::create(&out_path)?;
+        let mut out_file = safe_fs::create_file(&dir, name)?;
         let written = std::io::copy(
             &mut std::io::Read::take(&mut file, remaining.saturating_add(1)),
             &mut out_file,
@@ -143,44 +144,101 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
         }
         total_bytes += written;
 
-        // Set permissions (Unix), without setuid/setgid/sticky bits
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = file.unix_mode() {
-                std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode & 0o777))?;
-            }
+        // Permissions on the open file, without setuid/setgid/sticky bits
+        if let Some(mode) = file.unix_mode() {
+            safe_fs::set_mode(&out_file, mode & 0o777)?;
         }
     }
 
     Ok(())
 }
 
-/// Create `rel` under `root` one component at a time, refusing to pass through symlinks
-fn create_dirs_inside(root: &Path, rel: &Path) -> Result<()> {
-    let mut current = root.to_path_buf();
-    for component in rel.components() {
-        current.push(component);
-        match std::fs::symlink_metadata(&current) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                anyhow::bail!("Refusing to extract through symlink {:?}", current)
-            }
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => anyhow::bail!("Path component {:?} is not a directory", current),
-            Err(_) => std::fs::create_dir(&current)?,
-        }
-    }
-    Ok(())
-}
+/// Filesystem operations relative to directory handles that never follow a
+/// symlink, so a concurrent writer cannot redirect them outside the workspace
+mod safe_fs {
+    use anyhow::{Context, Result};
+    use rustix::fs::{self as rfs, Mode, OFlags};
+    use rustix::io::Errno;
+    use std::ffi::OsStr;
+    use std::os::fd::OwnedFd;
+    use std::path::{Component, Path};
 
-/// Replace a pre-existing symlink instead of writing through it
-fn remove_existing_symlink(path: &Path) -> Result<()> {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            std::fs::remove_file(path)?;
+    const DIR_FLAGS: OFlags = OFlags::DIRECTORY
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::RDONLY)
+        .union(OFlags::CLOEXEC);
+
+    pub fn open_root(root: &Path) -> Result<OwnedFd> {
+        rfs::open(root, DIR_FLAGS, Mode::empty())
+            .with_context(|| format!("Failed to open workspace {:?}", root))
+    }
+
+    /// Open (creating when missing) each directory of `rel` below `root`
+    pub fn open_dirs(root: &OwnedFd, rel: &Path) -> Result<OwnedFd> {
+        let mut dir = rfs::openat(root, ".", DIR_FLAGS, Mode::empty())?;
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                anyhow::bail!("Unsafe path component in {:?}", rel);
+            };
+            dir = open_or_create_dir(&dir, name)
+                .with_context(|| format!("Refusing to extract through {:?}", rel))?;
+        }
+        Ok(dir)
+    }
+
+    fn open_or_create_dir(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd> {
+        match rfs::openat(dir, name, DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => Ok(fd),
+            Err(Errno::NOENT) => {
+                match rfs::mkdirat(dir, name, Mode::from_raw_mode(0o755)) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                Ok(rfs::openat(dir, name, DIR_FLAGS, Mode::empty())?)
+            }
+            // ELOOP (a symlink) or ENOTDIR (a file): never walk through it
+            Err(e) => anyhow::bail!("{:?} is not a plain directory ({})", name, e),
         }
     }
-    Ok(())
+
+    pub fn split_leaf(rel: &Path) -> Result<(&Path, &OsStr)> {
+        let name = rel
+            .file_name()
+            .with_context(|| format!("Archive entry {:?} has no file name", rel))?;
+        Ok((rel.parent().unwrap_or(Path::new("")), name))
+    }
+
+    /// Remove whatever non-directory is at `name` (a leftover file or a
+    /// symlink someone planted); the new entry is then created exclusively
+    fn clear_leaf(dir: &OwnedFd, name: &OsStr) -> Result<()> {
+        match rfs::unlinkat(dir, name, rfs::AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("Cannot replace {:?}", name)),
+        }
+    }
+
+    pub fn create_file(dir: &OwnedFd, name: &OsStr) -> Result<std::fs::File> {
+        clear_leaf(dir, name)?;
+        // O_EXCL|O_NOFOLLOW: fails instead of following anything created in between
+        let fd = rfs::openat(
+            dir,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .with_context(|| format!("Failed to create {:?}", name))?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    pub fn create_symlink(dir: &OwnedFd, name: &OsStr, target: &str) -> Result<()> {
+        clear_leaf(dir, name)?;
+        rfs::symlinkat(target, dir, name)
+            .with_context(|| format!("Failed to create symlink {:?}", name))
+    }
+
+    pub fn set_mode(file: &std::fs::File, mode: u32) -> Result<()> {
+        Ok(rfs::fchmod(file, Mode::from_raw_mode(mode as _))?)
+    }
 }
 
 /// Whether a symlink at `link` (relative to the workspace) pointing at `target` resolves inside it
@@ -536,6 +594,38 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!outside.path().join("pwned.txt").exists());
+    }
+
+    /// A job container can change the workspace while it is being extracted
+    /// into. Writes go through directory handles, so replacing a directory
+    /// with a symlink after it was opened cannot redirect them, and a planted
+    /// leaf symlink is replaced rather than followed.
+    #[cfg(unix)]
+    #[test]
+    fn extraction_writes_stay_bound_to_opened_directories() {
+        use std::ffi::OsStr;
+
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = safe_fs::open_root(ws.path()).unwrap();
+        let dir = safe_fs::open_dirs(&root, Path::new("d")).unwrap();
+
+        // The job swaps d for a symlink after the runner opened it
+        std::fs::rename(ws.path().join("d"), ws.path().join("d.moved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("d")).unwrap();
+        // ...and plants a symlink where the next file will go
+        std::os::unix::fs::symlink(outside.path().join("leaf"), ws.path().join("d.moved/f"))
+            .unwrap();
+
+        let mut file = safe_fs::create_file(&dir, OsStr::new("f")).unwrap();
+        std::io::Write::write_all(&mut file, b"x").unwrap();
+        safe_fs::set_mode(&file, 0o600).unwrap();
+
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        let written = std::fs::symlink_metadata(ws.path().join("d.moved/f")).unwrap();
+        assert!(written.is_file());
+        // A new walk refuses to pass through the symlink
+        assert!(safe_fs::open_dirs(&root, Path::new("d/sub")).is_err());
     }
 
     #[cfg(unix)]
