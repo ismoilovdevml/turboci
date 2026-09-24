@@ -347,10 +347,12 @@ create_config() {
         echo -e "${YELLOW}⚠️  Replacing existing config (backup: $BACKUP)${NC}"
     elif [ -f "$CONFIG_FILE" ]; then
         echo -e "${YELLOW}⚠️  Config already exists: $CONFIG_FILE${NC}"
-        # stdin is the script itself under `curl | bash`: ask on the terminal
+        # stdin is the script itself under `curl | bash`: ask on the terminal.
+        # /dev/tty exists even without a terminal (ssh without -t, cron), so
+        # try to open it; without one the existing config is kept
         REPLY=""
-        if [ -r /dev/tty ]; then
-            read -p "Overwrite? (y/N): " -n 1 -r < /dev/tty
+        if { : </dev/tty; } 2>/dev/null; then
+            read -p "Overwrite? (y/N): " -n 1 -r </dev/tty || REPLY=""
             echo
         fi
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
