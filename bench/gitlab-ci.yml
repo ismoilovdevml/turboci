@@ -1,0 +1,53 @@
+# Runner benchmark: the same jobs run on TurboCI (BENCH_TAG=turboci) and on
+# gitlab-runner (BENCH_TAG=bench-glr). Only images already on the host are used.
+stages: [build, test]
+
+workflow:
+  rules:
+    - if: $BENCH_TAG
+
+default:
+  image: alpine:3.20
+  tags: [$BENCH_TAG]
+
+variables:
+  GIT_DEPTH: "1"
+
+noop:
+  stage: build
+  script:
+    - "true"
+
+upload:
+  stage: build
+  script:
+    - mkdir -p out
+    - dd if=/dev/urandom of=out/blob.bin bs=1M count=50 2>/dev/null
+  artifacts:
+    paths: [out/]
+    expire_in: 1 hour
+
+cache-job:
+  stage: build
+  cache:
+    key: bench-$BENCH_TAG
+    paths: [deps/]
+  script:
+    - mkdir -p deps
+    - '[ -f deps/done ] || { for i in $(seq 1 2000); do head -c 10240 /dev/urandom > deps/f$i; done; touch deps/done; }'
+    - ls deps | wc -l
+
+download:
+  stage: test
+  needs: [upload]
+  script:
+    - ls -l out/blob.bin
+
+service:
+  stage: test
+  needs: []
+  services:
+    - name: redis:7-alpine
+      alias: redis
+  script:
+    - nc -z redis 6379 && echo redis-up

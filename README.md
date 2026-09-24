@@ -5,32 +5,45 @@ A GitLab CI/CD runner written in Rust. It talks to GitLab's runner API like
 Docker containers (default) or directly on the host (shell executor). It is a
 single static binary with no external services: no Redis, no database.
 
+**Documentation:** https://ismoilovdevml.github.io/turboci/
+
+| | TurboCI 0.6.0 | gitlab-runner 18.5.0 |
+|---|---:|---:|
+| Pipeline duration (5 jobs, median of 16) | **9.6 s** | 11.9 s |
+| Memory while idle | **10.8 MB** | 87.9 MB |
+| Binary size | **11.5 MB** | 92.0 MB |
+
+Same host, same GitLab, same settings; see the
+[benchmarks](https://ismoilovdevml.github.io/turboci/benchmarks/) for the
+setup and how to reproduce them.
+
 ## ✅ What is supported
 
 - **Executors:** `docker` (one container per job) and `shell`
-- **Sources:** checks out the pipeline's exact commit via GitLab refspecs;
-  `GIT_STRATEGY` (`fetch`/`clone`/`none`/`empty`), `GIT_DEPTH`, `GIT_SUBMODULE_STRATEGY`
-- **Scripts:** each step runs in one shell (`set -e`, `pipefail` where available);
-  `before_script`/`script`/`after_script`, `when`, `allow_failure`, job and
-  `after_script` timeouts
-- **Variables:** CI/CD variables incl. file-type and `$VAR` expansion; masked
-  values, the job token and dependency tokens are masked in the job log
-- **Artifacts:** upload (`zip`, and `gzip`/`raw` reports), `artifacts:when`,
-  `expire_in`; download of dependency artifacts (`needs`/`dependencies`)
-- **Cache:** local cache on the runner host, `cache:key` with variables,
-  `fallback_keys`, `policy`, `when`
+- **Sources:** the pipeline's exact commit via GitLab refspecs; `GIT_STRATEGY`,
+  `GIT_DEPTH`, `GIT_CHECKOUT`, `GIT_FETCH_EXTRA_FLAGS`, submodules, Git LFS,
+  `hooks:pre_get_sources_script`
+- **Scripts:** `before_script`/`script`/`after_script`, `when`,
+  `allow_failure`, job, script and `after_script` timeouts, `CI_DEBUG_TRACE`,
+  collapsible log sections
+- **Variables:** CI/CD variables incl. file-type and `$VAR` expansion, the
+  predefined runner variables; masked values and tokens are masked in the log
+- **Artifacts:** `paths`, `exclude`, `untracked`, `when`, `expire_in`, reports
+  (`zip`, `gzip`, `raw`); dependency artifacts (`needs`/`dependencies`)
+- **Cache:** local cache on the runner host with `key`, `fallback_keys`,
+  `CACHE_FALLBACK_KEY`, `policy`, `when`, `untracked`
 - **Docker:** `services` with aliases on a per-job network, `pull_policy`,
-  private registry credentials from GitLab, `privileged`, extra `volumes`,
-  memory/CPU limits
-- **Operations:** job cancellation from the UI (graceful, with `after_script`),
-  SIGQUIT (finish running jobs) / SIGTERM (stop them), `concurrent` limit,
+  GitLab registry credentials, `privileged`, `volumes`, memory/CPU limits
+- **Operations:** cancellation from the UI, SIGQUIT/SIGTERM shutdown,
+  `concurrent`, self-signed GitLab CA, runner token rotation,
   checksum-verified install and `turboci upgrade`
 
 ## ⛔ Not supported (yet)
 
-Kubernetes and other executors, a distributed (S3) cache, `artifacts:exclude`,
-interactive web terminals, Vault secrets. GitLab only sends jobs that need these
-to runners that advertise them, so such jobs are not routed to TurboCI.
+Kubernetes and other executors, a distributed (S3) cache, interactive web
+terminals, external secrets (Vault), `DOCKER_AUTH_CONFIG`. See
+[pipeline support](https://ismoilovdevml.github.io/turboci/pipelines/) for the
+full list.
 
 ## 🚀 Installation
 

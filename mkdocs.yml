@@ -1,0 +1,59 @@
+site_name: TurboCI
+site_description: A GitLab CI/CD runner written in Rust
+site_url: https://ismoilovdevml.github.io/turboci/
+repo_url: https://github.com/ismoilovdevml/turboci
+repo_name: ismoilovdevml/turboci
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+
+nav:
+  - Overview: index.md
+  - Getting started:
+      - Installation: installation.md
+      - Connecting to GitLab: gitlab.md
+  - Reference:
+      - Configuration: configuration.md
+      - Pipeline support: pipelines.md
+      - Operations: operations.md
+  - Benchmarks: benchmarks.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.snippets:
+      base_path: [.]
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
