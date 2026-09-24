@@ -101,6 +101,15 @@ impl ExecutorType {
         }
     }
 
+    /// Give jobs the custom CA the GitLab server's certificate is signed with
+    pub fn with_ca_pem(mut self, pem: Option<String>) -> Self {
+        match &mut self {
+            ExecutorType::Docker(executor) => executor.ca_pem = pem,
+            ExecutorType::Shell(executor) => executor.ca_pem = pem,
+        }
+        self
+    }
+
     /// Remove what a previous run of this runner left behind
     pub async fn sweep_orphans(&self) {
         if let ExecutorType::Docker(executor) = self {
@@ -339,7 +348,8 @@ async fn get_sources(
         return Ok(());
     };
 
-    let commands = match git::strategy(&job.variables) {
+    let strategy = git::strategy(&job.variables);
+    let commands = match strategy {
         GitStrategy::None => {
             trace.write("Skipping Git repository setup\n").await;
             return Ok(());
@@ -362,27 +372,72 @@ async fn get_sources(
         ))
         .await;
 
-    match runner
-        .run(
-            // Checked-out files must stay writable for the runner (restore) and
-            // for images with a non-root USER, as with gitlab-runner
-            &format!("umask 0000\n{}", script::argv_script(&commands)),
-            &dirs.builds,
-            trace,
-            limits,
-        )
-        .await
+    // Like gitlab-runner: skip LFS objects during checkout, then pull them if
+    // git-lfs is available and the pipeline did not opt out
+    let lfs = if matches!(strategy, GitStrategy::Fetch)
+        && variable_value(job, "GIT_LFS_SKIP_SMUDGE") != Some("1")
     {
-        Ok(RunStatus::Exited(0)) => Ok(()),
-        Ok(RunStatus::Exited(code)) => Err(RunError::Failed(JobFailure {
-            reason: FailureReason::ScriptFailure,
-            exit_code: Some(code),
-            message: format!("getting sources failed with exit code {}", code),
-        })),
-        Ok(RunStatus::TimedOut) => Err(RunError::TimedOut),
-        Ok(RunStatus::Canceled) => Err(RunError::Canceled),
-        Err(e) => Err(RunError::Failed(JobFailure::system(format!("{:#}", e)))),
+        let dest = script::quote(&dirs.project);
+        let safe = script::quote(&format!("safe.directory={}", dirs.project));
+        format!(
+            "if git lfs version >/dev/null 2>&1 && [ -d {dest}/.git ]; then \
+             git -c {safe} -C {dest} lfs pull; fi\n"
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        "umask 0000\nexport GIT_LFS_SKIP_SMUDGE=1\n{}{}",
+        script::argv_script(&commands),
+        lfs
+    );
+    // GET_SOURCES_ATTEMPTS retries flaky fetches (1 to 10, default 1)
+    let attempts = variable_value(job, "GET_SOURCES_ATTEMPTS")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 10);
+    for attempt in 1..=attempts {
+        // Checked-out files must stay writable for the runner (restore) and
+        // for images with a non-root USER, as with gitlab-runner
+        let result = runner.run(&script, &dirs.builds, trace, limits).await;
+        match result {
+            Ok(RunStatus::Exited(0)) => return Ok(()),
+            Ok(RunStatus::Exited(code)) if attempt < attempts => {
+                trace
+                    .write(&format!(
+                        "WARNING: getting sources failed with exit code {} (attempt {}/{}), retrying\n",
+                        code, attempt, attempts
+                    ))
+                    .await;
+                let reset = script::argv_script(&[vec![
+                    "rm".to_string(),
+                    "-rf".to_string(),
+                    format!("{}/.git", dirs.project),
+                ]]);
+                let _ = runner.run(&reset, &dirs.builds, trace, limits).await;
+            }
+            Ok(RunStatus::Exited(code)) => {
+                return Err(RunError::Failed(JobFailure {
+                    reason: FailureReason::ScriptFailure,
+                    exit_code: Some(code),
+                    message: format!("getting sources failed with exit code {}", code),
+                }))
+            }
+            Ok(RunStatus::TimedOut) => return Err(RunError::TimedOut),
+            Ok(RunStatus::Canceled) => return Err(RunError::Canceled),
+            Err(e) => return Err(RunError::Failed(JobFailure::system(format!("{:#}", e)))),
+        }
     }
+    Ok(())
+}
+
+/// Value of a job variable (last definition wins)
+fn variable_value<'a>(job: &'a Job, key: &str) -> Option<&'a str> {
+    job.variables
+        .iter()
+        .rev()
+        .find(|v| v.key == key)
+        .and_then(|v| v.value.as_deref())
 }
 
 /// Write the files backing `file`-type variables
@@ -432,6 +487,8 @@ impl Utf8Decoder {
 pub struct DockerExecutor {
     docker: Arc<Docker>,
     config: DockerConfig,
+    /// Custom CA of the GitLab server, given to jobs
+    ca_pem: Option<String>,
     /// Value of the `turboci.runner` label on every container and network this
     /// runner creates, so leftovers of a crash can be found and removed
     owner: String,
@@ -468,6 +525,7 @@ impl DockerExecutor {
             docker: Arc::new(docker),
             config,
             owner: "turboci".to_string(),
+            ca_pem: None,
         })
     }
 
@@ -546,7 +604,15 @@ impl DockerExecutor {
         containers: &mut JobContainers,
         restore: &dyn Restore,
     ) -> JobOutcome {
-        let env = script::job_env(job, "/builds", job_dir);
+        let env = script::job_env(
+            job,
+            "/builds",
+            job_dir,
+            &script::RunnerVars {
+                disposable: true,
+                ca_pem: self.ca_pem.clone(),
+            },
+        );
         // Image and service names may use variables, e.g. $CI_REGISTRY_IMAGE/ci
         let values: std::collections::HashMap<String, String> = env.vars.iter().cloned().collect();
         let expand = |name: &str| script::expand(name, &values);
@@ -1242,12 +1308,15 @@ impl ScriptRunner for DockerRunner<'_> {
 #[derive(Clone, Debug)]
 pub struct ShellExecutor {
     work_dir: String,
+    /// Custom CA of the GitLab server, given to jobs
+    ca_pem: Option<String>,
 }
 
 impl ShellExecutor {
     pub fn new(work_dir: Option<String>) -> Self {
         Self {
             work_dir: work_dir.unwrap_or_else(|| "/tmp/turboci".to_string()),
+            ca_pem: None,
         }
     }
 
@@ -1272,7 +1341,15 @@ impl ShellExecutor {
             .await
             .map_err(JobFailure::system)?;
 
-        let env = script::job_env(job, &dirs.builds, &job_dir);
+        let env = script::job_env(
+            job,
+            &dirs.builds,
+            &job_dir,
+            &script::RunnerVars {
+                disposable: false,
+                ca_pem: self.ca_pem.clone(),
+            },
+        );
         write_variable_files(&env)
             .await
             .map_err(JobFailure::system)?;
@@ -1591,6 +1668,28 @@ mod tests {
 
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
         assert!(log.contains("version=2.0.0"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn get_sources_attempts_retry_a_failing_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 9, "token": "t",
+            "git_info": {
+                "repo_url": format!("file://{}/missing.git", dir.path().display()),
+                "ref": "main", "ref_type": "branch", "sha": "d".repeat(40),
+                "before_sha": "", "refspecs": []
+            },
+            "variables": [{"key": "GET_SOURCES_ATTEMPTS", "value": "3"}],
+            "steps": steps(&["echo never"], &[])
+        }));
+
+        let (outcome, log) = run_shell(&j, dir.path()).await;
+
+        assert_eq!(outcome.unwrap_err().reason, FailureReason::ScriptFailure);
+        assert!(log.contains("(attempt 1/3), retrying"), "{}", log);
+        assert!(log.contains("(attempt 2/3), retrying"), "{}", log);
+        assert!(!log.contains("attempt 3/3"), "{}", log);
     }
 
     #[tokio::test]

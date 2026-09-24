@@ -25,6 +25,7 @@ RUNNER_TOKEN="${TURBOCI_TOKEN:-}"
 CONCURRENT="${TURBOCI_CONCURRENT:-4}"
 VERSION="${TURBOCI_VERSION:-}"
 LOCAL_BINARY=""
+TLS_CA_FILE="${TURBOCI_TLS_CA_FILE:-}"
 START_SERVICE=1
 
 usage() {
@@ -38,6 +39,8 @@ Usage: install.sh [options]
   --concurrent N     Jobs run in parallel (default: 4)
   --version vX.Y.Z   Release to install (default: latest)
   --binary PATH      Install this binary instead of downloading a release
+  --tls-ca-file PATH CA certificate (PEM) of a GitLab with a self-signed or
+                     internal certificate
   --no-start         Configure but do not start the service
   -h, --help         Show this help
 
@@ -54,6 +57,7 @@ while [ $# -gt 0 ]; do
         --concurrent) CONCURRENT="${2:?--concurrent needs a value}"; shift 2 ;;
         --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
         --binary) LOCAL_BINARY="${2:?--binary needs a value}"; shift 2 ;;
+        --tls-ca-file) TLS_CA_FILE="${2:?--tls-ca-file needs a value}"; shift 2 ;;
         --no-start) START_SERVICE=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -151,6 +155,10 @@ validate_options() {
     fi
     if [ -n "$LOCAL_BINARY" ] && [ ! -f "$LOCAL_BINARY" ]; then
         echo -e "${RED}❌ --binary: $LOCAL_BINARY not found${NC}"
+        exit 1
+    fi
+    if [ -n "$TLS_CA_FILE" ] && ! grep -q "BEGIN CERTIFICATE" "$TLS_CA_FILE" 2>/dev/null; then
+        echo -e "${RED}❌ --tls-ca-file: $TLS_CA_FILE is not a PEM certificate${NC}"
         exit 1
     fi
 }
@@ -358,12 +366,20 @@ create_config() {
     # Create the file with restrictive permissions before writing the token field
     install -m 0640 -o root -g "$SERVICE_USER" /dev/null "$CONFIG_FILE"
 
+    TLS_CA_LINE=""
+    if [ -n "$TLS_CA_FILE" ]; then
+        install -m 0644 -o root -g root "$TLS_CA_FILE" /etc/turboci-ca.pem
+        TLS_CA_LINE='tls_ca_file = "/etc/turboci-ca.pem"'
+        echo -e "${GREEN}✓${NC} CA certificate: ${BLUE}/etc/turboci-ca.pem${NC}"
+    fi
+
     cat > "$CONFIG_FILE" << EOF
 # TurboCI Runner Configuration
 concurrent = $CONCURRENT
 check_interval = 3
 runner_token = "$RUNNER_TOKEN"
 gitlab_url = "$GITLAB_URL"
+$TLS_CA_LINE
 cache_enabled = true
 cache_dir = "$STATE_DIR/cache"
 

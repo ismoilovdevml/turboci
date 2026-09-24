@@ -13,6 +13,10 @@ runner_token = "glrt-YOUR_RUNNER_TOKEN_HERE"
 # GitLab instance URL
 gitlab_url = "https://gitlab.com"
 
+# CA (PEM) of a GitLab with a self-signed or internal certificate; trusted by
+# the runner, and given to jobs as CI_SERVER_TLS_CA_FILE / GIT_SSL_CAINFO
+# tls_ca_file = "/etc/turboci-ca.pem"
+
 # ===== CACHE CONFIGURATION =====
 cache_enabled = true
 # Local job cache (`cache:` in .gitlab-ci.yml), one directory per project

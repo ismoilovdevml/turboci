@@ -20,6 +20,10 @@ pub struct RunnerConfig {
     /// GitLab URL
     pub gitlab_url: String,
 
+    /// PEM file with the CA that signed the GitLab server's certificate
+    /// (self-signed or internal CA); trusted by the runner and given to jobs
+    pub tls_ca_file: Option<String>,
+
     /// Cache configuration
     pub cache_enabled: bool,
     /// Directory of the local job cache (`cache:` in .gitlab-ci.yml)
@@ -143,6 +147,7 @@ impl Default for RunnerConfig {
             check_interval: 3,
             runner_token: String::new(),
             gitlab_url: "https://gitlab.com".to_string(),
+            tls_ca_file: None,
             cache_enabled: true,
             cache_dir: default_cache_dir(),
             cache_max_age_days: 14,
@@ -320,6 +325,7 @@ mod tests {
             .replace("$CONCURRENT", "4")
             .replace("$RUNNER_TOKEN", "")
             .replace("$GITLAB_URL", "https://gitlab.com")
+            .replace("$TLS_CA_LINE", "tls_ca_file = \"/etc/turboci-ca.pem\"")
             .replace("$EXECUTOR", "docker")
             .replace("$STATE_DIR", "/var/lib/turboci")
             .replace("$SERVICE_USER", "turboci");

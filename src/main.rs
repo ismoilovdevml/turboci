@@ -135,6 +135,17 @@ async fn main() -> Result<()> {
             )
             .with_system_id(system_id.clone())
             .with_executor(&runner_config.executor.executor_type);
+            let ca_pem = match &runner_config.tls_ca_file {
+                Some(path) => Some(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| anyhow::anyhow!("Cannot read tls_ca_file {}: {}", path, e))?,
+                ),
+                None => None,
+            };
+            let gitlab = match &ca_pem {
+                Some(pem) => gitlab.with_root_certificate(pem.as_bytes())?,
+                None => gitlab,
+            };
 
             // Initialize executor based on config
             let executor = match runner_config.executor.executor_type.as_str() {
@@ -164,6 +175,7 @@ async fn main() -> Result<()> {
                 }
             };
 
+            let executor = executor.with_ca_pem(ca_pem);
             let daemon = RunnerDaemon::new(runner_config, gitlab, executor);
             spawn_signal_handler(daemon.shutdown_handle())?;
             daemon.start().await?;

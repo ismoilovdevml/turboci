@@ -105,6 +105,10 @@ pub fn checkout_commands(
     if depth > 0 {
         fetch.push(format!("--depth={}", depth));
     }
+    // Extra flags chosen by the pipeline (e.g. --filter=blob:none)
+    if let Some(extra) = variable(variables, "GIT_FETCH_EXTRA_FLAGS") {
+        fetch.extend(extra.split_whitespace().map(str::to_string));
+    }
     fetch.push("origin".to_string());
     if git_info.refspecs.is_empty() {
         // Older GitLab: fetch the commit itself
@@ -117,8 +121,11 @@ pub fn checkout_commands(
         init,
         git(&["remote", "add", "origin", &git_info.repo_url]),
         fetch,
-        git(&["checkout", "-q", "-f", &git_info.sha]),
     ];
+    // GIT_CHECKOUT=false fetches without checking out, as in gitlab-runner
+    if variable(variables, "GIT_CHECKOUT") != Some("false") {
+        commands.push(git(&["checkout", "-q", "-f", &git_info.sha]));
+    }
 
     match submodule_strategy(variables) {
         SubmoduleStrategy::None => {}
@@ -329,6 +336,24 @@ mod tests {
                 "--recursive"
             ]
         );
+    }
+
+    #[test]
+    fn checkout_and_fetch_flags_follow_variables() {
+        let sha = "c".repeat(40);
+        let info = git_info("https://x/r.git", &sha, &[], None);
+        let vars = [
+            var("GIT_CHECKOUT", "false"),
+            var("GIT_FETCH_EXTRA_FLAGS", "--filter=blob:none --prune-tags"),
+        ];
+
+        let cmds = checkout_commands(&info, &vars, "/w").unwrap();
+
+        assert!(!cmds
+            .iter()
+            .any(|argv| argv.contains(&"checkout".to_string())));
+        assert!(cmds[2].contains(&"--filter=blob:none".to_string()));
+        assert!(cmds[2].contains(&"--prune-tags".to_string()));
     }
 
     #[test]

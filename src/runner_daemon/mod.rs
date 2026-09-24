@@ -43,10 +43,15 @@ impl executor::Restore for WorkspaceRestore<'_> {
 
 /// Values of the job's variables, for expanding cache keys
 fn job_variables(job: &Job) -> std::collections::HashMap<String, String> {
-    script::job_env(job, "", std::path::Path::new(""))
-        .vars
-        .into_iter()
-        .collect()
+    script::job_env(
+        job,
+        "",
+        std::path::Path::new(""),
+        &script::RunnerVars::default(),
+    )
+    .vars
+    .into_iter()
+    .collect()
 }
 
 fn project_id(job: &Job) -> u64 {
@@ -353,8 +358,11 @@ impl RunnerDaemon {
                 if cache_entry.policy != "pull" && cache_entry.policy != "pull-push" {
                     continue;
                 }
+                // CACHE_FALLBACK_KEY is the last resort, after the entry's own fallbacks
+                let fallback = variables.get("CACHE_FALLBACK_KEY").cloned();
                 let keys: Vec<String> = std::iter::once(&cache_entry.key)
                     .chain(&cache_entry.fallback_keys)
+                    .chain(fallback.as_ref())
                     .map(|key| job_cache::resolve_key(key, &variables))
                     .collect();
                 trace
@@ -829,6 +837,50 @@ mod tests {
             "output held back while the job was quiet"
         );
         running.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_fallback_key_restores_another_branch_cache() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let with_cache = |id: u64, key: &str, script: &str, vars: serde_json::Value| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "token": "t",
+                "job_info": {"name": "j", "stage": "s", "project_id": 9, "project_name": "p"},
+                "variables": vars,
+                "steps": [{"name": "script", "script": [script], "when": "on_success"}],
+                "cache": [{"key": key, "paths": ["vendor/"], "policy": "pull-push"}]
+            }))
+            .unwrap()
+        };
+
+        daemon
+            .execute_job(with_cache(
+                101,
+                "main-deps",
+                "mkdir -p vendor && echo from-main > vendor/x",
+                serde_json::json!([]),
+            ))
+            .await
+            .unwrap();
+        daemon
+            .execute_job(with_cache(
+                102,
+                "feature-deps",
+                "cat vendor/x",
+                serde_json::json!([{"key": "CACHE_FALLBACK_KEY", "value": "main-deps"}]),
+            ))
+            .await
+            .unwrap();
+
+        let trace = trace_of(&server, 102).await;
+        assert!(
+            trace.contains("Successfully restored cache main-deps"),
+            "{}",
+            trace
+        );
+        assert!(trace.contains("from-main"), "{}", trace);
     }
 
     #[tokio::test]

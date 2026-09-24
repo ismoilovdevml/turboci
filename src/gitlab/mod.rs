@@ -100,6 +100,21 @@ impl GitLabClient {
         self
     }
 
+    /// Also trust `pem` (the CA of a GitLab server with a private certificate)
+    pub fn with_root_certificate(mut self, pem: &[u8]) -> Result<Self> {
+        let certificates =
+            reqwest::Certificate::from_pem_bundle(pem).context("Invalid CA certificate (PEM)")?;
+        if certificates.is_empty() {
+            anyhow::bail!("The CA file contains no PEM certificate");
+        }
+        let builder = certificates.into_iter().fold(
+            crate::net::client_builder().timeout(std::time::Duration::from_secs(30)),
+            |builder, certificate| builder.add_root_certificate(certificate),
+        );
+        self.client = builder.build().context("Failed to build HTTP client")?;
+        Ok(self)
+    }
+
     /// Use a persisted system ID (see `runner_daemon::system_id`)
     pub fn with_system_id(mut self, system_id: String) -> Self {
         self.system_id = system_id;
@@ -1135,6 +1150,44 @@ mod tests {
 
         assert_eq!(patch.remote, RemoteState::Aborted);
         assert_eq!(patch.offset, 0);
+    }
+
+    #[test]
+    fn valid_ca_certificate_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, cert) = (dir.path().join("k.pem"), dir.path().join("c.pem"));
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=gitlab.test",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+
+        let pem = std::fs::read(&cert).unwrap();
+        assert!(GitLabClient::new("https://x".to_string(), "t".to_string())
+            .with_root_certificate(&pem)
+            .is_ok());
+    }
+
+    #[test]
+    fn invalid_ca_certificate_is_rejected() {
+        let result = GitLabClient::new("https://x".to_string(), "t".to_string())
+            .with_root_certificate(b"not a certificate");
+        assert!(result.is_err());
     }
 
     #[tokio::test]

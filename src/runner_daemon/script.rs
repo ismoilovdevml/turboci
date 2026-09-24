@@ -74,18 +74,51 @@ fn is_valid_key(key: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// What the runner itself adds to a job's environment
+#[derive(Debug, Default, Clone)]
+pub struct RunnerVars {
+    /// Docker (disposable) or shell (shared) environment
+    pub disposable: bool,
+    /// PEM of a custom CA for the GitLab server, exposed as CI_SERVER_TLS_CA_FILE
+    pub ca_pem: Option<String>,
+}
+
 /// Build the job environment.
 ///
 /// `builds_dir` is where the job sees its builds directory (e.g. `/builds` in a
 /// container); `host_job_dir` is the same directory on the runner host. File
 /// variables are written to `<project>.tmp/<KEY>` like gitlab-runner does.
-pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path) -> JobEnv {
+pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &RunnerVars) -> JobEnv {
     let project_dir = format!("{}/project", builds_dir);
     let tmp_dir = format!("{}/project.tmp", builds_dir);
 
     let mut env = JobEnv::default();
     env.set("CI_BUILDS_DIR", builds_dir.to_string());
     env.set("CI_PROJECT_DIR", project_dir);
+    // Variables gitlab-runner defines itself (common/build.go GetDefaultVariables)
+    env.set("CI_SERVER", "yes".to_string());
+    env.set("CI_JOB_STATUS", "running".to_string());
+    env.set(
+        "CI_JOB_TIMEOUT",
+        job.timeout_secs().unwrap_or(3600).to_string(),
+    );
+    if runner.disposable {
+        env.set("CI_DISPOSABLE_ENVIRONMENT", "true".to_string());
+        if let Some(image) = &job.image {
+            env.set("CI_JOB_IMAGE", image.name.clone());
+        }
+    } else {
+        env.set("CI_SHARED_ENVIRONMENT", "true".to_string());
+    }
+    if let Some(pem) = &runner.ca_pem {
+        let key = "CI_SERVER_TLS_CA_FILE";
+        env.files
+            .push((host_job_dir.join("project.tmp").join(key), pem.clone()));
+        let path = format!("{}/{}", tmp_dir, key);
+        // git (sources, submodules, LFS) trusts the same CA
+        env.set("GIT_SSL_CAINFO", path.clone());
+        env.set(key, path);
+    }
 
     // Every variable is visible to expansion, whatever its position
     let valid: Vec<_> = job
@@ -281,7 +314,12 @@ mod tests {
             {"key": "../../etc/evil", "value": "x", "file": true}
         ]));
 
-        let env = job_env(&j, "/builds", Path::new("/host/job-1"));
+        let env = job_env(
+            &j,
+            "/builds",
+            Path::new("/host/job-1"),
+            &RunnerVars::default(),
+        );
 
         assert_eq!(get(&env, "CI_PROJECT_DIR"), Some("/builds/project"));
         assert_eq!(get(&env, "URL"), Some("postgres://db:5432/app"));
@@ -302,13 +340,45 @@ mod tests {
     }
 
     #[test]
+    fn runner_adds_predefined_and_tls_variables() {
+        let j = job(serde_json::json!([]));
+        let runner = RunnerVars {
+            disposable: true,
+            ca_pem: Some("-----BEGIN CERTIFICATE-----".to_string()),
+        };
+
+        let env = job_env(&j, "/builds", Path::new("/h"), &runner);
+
+        assert_eq!(get(&env, "CI_SERVER"), Some("yes"));
+        assert_eq!(get(&env, "CI_JOB_TIMEOUT"), Some("3600"));
+        assert_eq!(get(&env, "CI_DISPOSABLE_ENVIRONMENT"), Some("true"));
+        assert_eq!(
+            get(&env, "CI_SERVER_TLS_CA_FILE"),
+            Some("/builds/project.tmp/CI_SERVER_TLS_CA_FILE")
+        );
+        assert_eq!(
+            get(&env, "GIT_SSL_CAINFO"),
+            get(&env, "CI_SERVER_TLS_CA_FILE")
+        );
+        assert_eq!(
+            env.files,
+            vec![(
+                PathBuf::from("/h/project.tmp/CI_SERVER_TLS_CA_FILE"),
+                "-----BEGIN CERTIFICATE-----".to_string()
+            )]
+        );
+        let shell = job_env(&j, "/b", Path::new("/h"), &RunnerVars::default());
+        assert_eq!(get(&shell, "CI_SHARED_ENVIRONMENT"), Some("true"));
+    }
+
+    #[test]
     fn later_variables_override_earlier_ones() {
         let j = job(serde_json::json!([
             {"key": "MODE", "value": "instance"},
             {"key": "MODE", "value": "job"}
         ]));
 
-        let env = job_env(&j, "/builds", Path::new("/h"));
+        let env = job_env(&j, "/builds", Path::new("/h"), &RunnerVars::default());
 
         assert_eq!(get(&env, "MODE"), Some("job"));
         assert_eq!(env.vars.iter().filter(|(k, _)| k == "MODE").count(), 1);

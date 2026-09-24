@@ -58,6 +58,7 @@ until the runner has reached GitLab.
 | `--concurrent N` | `4` | jobs run in parallel |
 | `--version vX.Y.Z` | latest | release to install |
 | `--binary PATH` | – | install a local binary instead of downloading one |
+| `--tls-ca-file PATH` | – | CA (PEM) of a GitLab with a self-signed or internal certificate |
 | `--no-start` | – | configure but do not start |
 
 Each option can also be given as an environment variable (`TURBOCI_URL`,
