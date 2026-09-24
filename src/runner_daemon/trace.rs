@@ -11,8 +11,12 @@ use crate::security::secret_scrubber::{SecretScrubber, StreamScrubber};
 
 /// Same default as gitlab-runner's `output_limit` (4 MiB)
 const DEFAULT_LIMIT: usize = 4 * 1024 * 1024;
-const FLUSH_BYTES: usize = 10 * 1024;
-const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+/// How often output is sent until GitLab asks for another interval
+const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(3);
+/// Upper bound for a server-requested interval, like gitlab-runner
+const MAX_UPDATE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Output sent sooner than the interval once this much is pending
+const FLUSH_BYTES: usize = 256 * 1024;
 const FINISH_ATTEMPTS: u32 = 5;
 
 pub struct TraceWriter<'a> {
@@ -24,6 +28,7 @@ pub struct TraceWriter<'a> {
     /// Bytes GitLab has acknowledged
     sent: usize,
     last_flush: Instant,
+    update_interval: Duration,
     limit: usize,
     truncated: bool,
     cancel: CancelSignal,
@@ -45,6 +50,7 @@ impl<'a> TraceWriter<'a> {
             trace: Vec::new(),
             sent: 0,
             last_flush: Instant::now(),
+            update_interval: DEFAULT_UPDATE_INTERVAL,
             limit: DEFAULT_LIMIT,
             truncated: false,
             cancel: CancelSignal::default(),
@@ -72,9 +78,33 @@ impl<'a> TraceWriter<'a> {
     pub async fn write(&mut self, text: &str) {
         let safe = self.scrubber.push(text);
         self.append(&safe);
-        if self.trace.len() - self.sent >= FLUSH_BYTES
-            || self.last_flush.elapsed() >= FLUSH_INTERVAL
-        {
+        if self.trace.len() - self.sent >= FLUSH_BYTES {
+            self.flush().await;
+        } else {
+            self.flush_if_due().await;
+        }
+    }
+
+    /// Open a collapsible section of the job log (`name` is [a-z0-9_]),
+    /// shown under a highlighted `header`
+    pub async fn section_start(&mut self, name: &str, header: &str) {
+        self.write(&format!(
+            "{}\x1b[0K\x1b[36;1m{}\x1b[0;m\n",
+            section_marker("start", name),
+            header
+        ))
+        .await;
+    }
+
+    /// Close the section opened with the same `name`
+    pub async fn section_end(&mut self, name: &str) {
+        self.write(&format!("{}\x1b[0K", section_marker("end", name)))
+            .await;
+    }
+
+    /// Send pending output once the update interval has passed
+    pub async fn flush_if_due(&mut self) {
+        if self.last_flush.elapsed() >= self.update_interval {
             self.flush().await;
         }
     }
@@ -103,6 +133,9 @@ impl<'a> TraceWriter<'a> {
             Ok(patch) => {
                 self.sent = patch.offset.min(self.trace.len());
                 self.cancel.update(patch.remote);
+                if let Some(interval) = patch.update_interval {
+                    self.update_interval = interval.min(MAX_UPDATE_INTERVAL);
+                }
                 if patch.remote == crate::gitlab::RemoteState::Aborted {
                     // GitLab no longer accepts output for this job
                     self.sent = self.trace.len();
@@ -160,6 +193,14 @@ impl<'a> TraceWriter<'a> {
         );
         self.truncated = true;
     }
+}
+
+fn section_marker(kind: &str, name: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("section_{}:{}:{}\r", kind, now, name)
 }
 
 #[cfg(test)]
@@ -232,6 +273,52 @@ mod tests {
         let sent = patches(&server).await;
         assert_eq!(sent[0], ("0-9".to_string(), "0123456789".to_string()));
         assert_eq!(sent[1], ("4-9".to_string(), "456789".to_string()));
+    }
+
+    #[tokio::test]
+    async fn follows_the_update_interval_gitlab_asks_for() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(
+                ResponseTemplate::new(202).insert_header("X-GitLab-Trace-Update-Interval", "30"),
+            )
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
+        assert_eq!(trace.update_interval, DEFAULT_UPDATE_INTERVAL);
+
+        trace.write("first\n").await;
+        trace.flush().await;
+        assert_eq!(trace.update_interval, Duration::from_secs(30));
+
+        // Not due yet: nothing more is sent until the interval passes
+        trace.write("second\n").await;
+        trace.flush_if_due().await;
+        assert_eq!(patches(&server).await.len(), 1);
+
+        trace.last_flush -= Duration::from_secs(31);
+        trace.flush_if_due().await;
+        assert_eq!(patches(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sections_use_gitlab_markers() {
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, 7, "job-token", &scrubber);
+
+        trace.section_start("get_sources", "Getting source").await;
+        trace.write("fetched\n").await;
+        trace.section_end("get_sources").await;
+        trace.finish().await;
+
+        let text = trace.text();
+        let (start, rest) = text.split_once('\r').unwrap();
+        assert!(start.starts_with("section_start:"));
+        assert!(start.ends_with(":get_sources"));
+        assert!(rest.starts_with("\x1b[0K\x1b[36;1mGetting source\x1b[0;m\nfetched\nsection_end:"));
+        assert!(text.ends_with(":get_sources\r\x1b[0K"));
     }
 
     #[tokio::test]

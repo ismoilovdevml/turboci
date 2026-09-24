@@ -39,8 +39,8 @@ const DEFAULT_AFTER_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
 const SHELL_DETECT: &str =
     r#"if command -v bash >/dev/null 2>&1; then exec bash -c "$1"; fi; exec sh -c "$1""#;
 
-/// How often output of a quiet script is pushed to GitLab
-const TRACE_FLUSH_INTERVAL: Duration = Duration::from_secs(3);
+/// How often a quiet script's pending output is checked for sending
+const TRACE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Upper bound for resetting workspace ownership after a job
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -260,7 +260,12 @@ async fn run_job_steps(
         cancel: &cancel,
         stop_at: RemoteState::Canceling,
     };
-    let mut failure = match get_sources(job, sources, trace, dirs, &script_limits).await {
+    trace
+        .section_start("get_sources", "Getting source from Git repository")
+        .await;
+    let fetched = get_sources(job, sources, trace, dirs, &script_limits).await;
+    trace.section_end("get_sources").await;
+    let mut failure = match fetched {
         Ok(()) => None,
         Err(RunError::TimedOut) => Some(timed_out()),
         Err(RunError::Canceled) => Some(canceled()),
@@ -296,8 +301,13 @@ async fn run_job_steps(
 
         // after_script still runs when the job is being canceled (canceling), and
         // only stops when it is aborted
+        let section = if is_after_script {
+            "after_script".to_string()
+        } else {
+            format!("step_{}", step.name)
+        };
         let limits = if is_after_script {
-            trace.write("\nRunning after_script\n").await;
+            trace.section_start(&section, "Running after_script").await;
             let secs = u64::from(step.timeout);
             Limits {
                 deadline: Instant::now()
@@ -311,10 +321,10 @@ async fn run_job_steps(
             }
         } else {
             trace
-                .write(&format!(
-                    "\nExecuting \"step_{}\" stage of the job script\n",
-                    step.name
-                ))
+                .section_start(
+                    &section,
+                    &format!("Executing \"step_{}\" stage of the job script", step.name),
+                )
                 .await;
             Limits {
                 deadline,
@@ -376,6 +386,7 @@ async fn run_job_steps(
                 failure.get_or_insert(JobFailure::system(format!("{:#}", e)));
             }
         }
+        trace.section_end(&section).await;
     }
 
     failure.map_or(Ok(()), Err)
@@ -1366,7 +1377,7 @@ impl ScriptRunner for DockerRunner<'_> {
                     }
                     // A quiet script must not keep its last lines from GitLab
                     _ = flush.tick() => {
-                        trace.flush().await;
+                        trace.flush_if_due().await;
                         continue;
                     }
                 };
@@ -1490,7 +1501,7 @@ impl ScriptRunner for ShellRunner {
         while out_open || err_open {
             tokio::select! {
                 _ = flush.tick() => {
-                    trace.flush().await;
+                    trace.flush_if_due().await;
                 }
                 n = out.read(&mut out_buf), if out_open => match n? {
                     0 => out_open = false,

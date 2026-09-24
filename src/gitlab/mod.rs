@@ -302,6 +302,7 @@ impl GitLabClient {
             return Ok(TracePatch {
                 offset,
                 remote: RemoteState::Running,
+                update_interval: None,
             });
         }
         let url = format!("{}/api/v4/jobs/{}/trace", self.url, job_id);
@@ -323,10 +324,15 @@ impl GitLabClient {
 
             let status = response.status();
             let remote = RemoteState::from_response(&response);
+            let update_interval = update_interval(&response);
 
             if status == StatusCode::FORBIDDEN {
                 // The job is no longer running (canceled, or not ours any more)
-                return Ok(TracePatch { offset, remote });
+                return Ok(TracePatch {
+                    offset,
+                    remote,
+                    update_interval,
+                });
             }
 
             // Handle 416 Range Not Satisfiable - parse server offset
@@ -347,6 +353,7 @@ impl GitLabClient {
                     return Ok(TracePatch {
                         offset: server_offset,
                         remote,
+                        update_interval,
                     });
                 }
                 warn!("Range mismatch but couldn't parse server offset");
@@ -366,6 +373,7 @@ impl GitLabClient {
             Ok(TracePatch {
                 offset: end_offset,
                 remote,
+                update_interval,
             })
         })
         .await
@@ -881,6 +889,21 @@ pub struct TracePatch {
     /// End of what GitLab has; after a 416 this is where to resend from
     pub offset: usize,
     pub remote: RemoteState,
+    /// How often GitLab wants trace updates (X-GitLab-Trace-Update-Interval):
+    /// longer while nobody watches the log, shorter while someone does
+    pub update_interval: Option<std::time::Duration>,
+}
+
+fn update_interval(response: &reqwest::Response) -> Option<std::time::Duration> {
+    response
+        .headers()
+        .get("X-GitLab-Trace-Update-Interval")?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
 }
 
 /// Why a job failed, as GitLab expects it in `failure_reason`

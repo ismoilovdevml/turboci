@@ -351,13 +351,49 @@ impl RunnerDaemon {
         if cancel.state() != RemoteState::Aborted {
             // An upload failure fails a job that otherwise succeeded (the next
             // stage would miss its inputs); the job's own failure takes precedence
+            let result = if outcome.is_ok() {
+                "successful"
+            } else {
+                "failed"
+            };
+            let section = if outcome.is_ok() {
+                "upload_artifacts_on_success"
+            } else {
+                "upload_artifacts_on_failure"
+            };
+            if job.artifacts.as_ref().is_some_and(|a| !a.is_empty()) {
+                trace
+                    .section_start(section, &format!("Uploading artifacts for {} job", result))
+                    .await;
+            }
             let uploaded = self
                 .upload_artifacts(&job, &mut trace, outcome.is_ok())
                 .await;
+            if job.artifacts.as_ref().is_some_and(|a| !a.is_empty()) {
+                trace.section_end(section).await;
+            }
             if outcome.is_ok() {
                 outcome = uploaded;
             }
+            let saves_cache = self.config.cache_enabled
+                && job
+                    .cache
+                    .iter()
+                    .any(|c| c.policy == "push" || c.policy == "pull-push");
+            if saves_cache {
+                let result = if outcome.is_ok() {
+                    "successful"
+                } else {
+                    "failed"
+                };
+                trace
+                    .section_start("archive_cache", &format!("Saving cache for {} job", result))
+                    .await;
+            }
             self.upload_cache(&job, &mut trace, outcome.is_ok()).await;
+            if saves_cache {
+                trace.section_end("archive_cache").await;
+            }
         }
         self.executor.cleanup(job.id).await;
         drop(_heartbeat);
@@ -428,7 +464,14 @@ impl RunnerDaemon {
         let project_dir = self.executor.job_dir(job.id).join("project");
         let workspace = project_dir.to_string_lossy();
 
-        if self.config.cache_enabled {
+        let pulls_cache = job
+            .cache
+            .iter()
+            .any(|c| c.policy == "pull" || c.policy == "pull-push");
+        if self.config.cache_enabled && pulls_cache {
+            trace
+                .section_start("restore_cache", "Restoring cache")
+                .await;
             let variables = job_variables(job);
             for cache_entry in &job.cache {
                 if cache_entry.policy != "pull" && cache_entry.policy != "pull-push" {
@@ -467,10 +510,29 @@ impl RunnerDaemon {
                     }
                 }
             }
+            trace.section_end("restore_cache").await;
         }
 
         // Jobs without artifacts have nothing to download; a failed download
         // fails the job, as the script would run without its inputs
+        if !job.dependencies.iter().any(|d| d.artifacts_file.is_some()) {
+            return Ok(());
+        }
+        trace
+            .section_start("download_artifacts", "Downloading artifacts")
+            .await;
+        let downloaded = self.download_dependencies(job, trace, &workspace).await;
+        trace.section_end("download_artifacts").await;
+        downloaded
+    }
+
+    /// Download and extract the artifacts of the jobs this one depends on
+    async fn download_dependencies(
+        &self,
+        job: &Job,
+        trace: &mut TraceWriter<'_>,
+        workspace: &str,
+    ) -> JobOutcome {
         for dependency in job
             .dependencies
             .iter()
@@ -492,7 +554,7 @@ impl RunnerDaemon {
                         &self.gitlab,
                         dependency.id,
                         &dependency.token,
-                        &workspace,
+                        workspace,
                         &job_dir,
                     )
                     .await;
