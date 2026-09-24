@@ -125,8 +125,17 @@ async fn main() -> Result<()> {
             let runner_config = runner_daemon::config::RunnerConfig::load(&config)?;
 
             // Initialize GitLab client with a system ID that survives restarts
+            // Kept in the state directory (the service can not write next to
+            // its config in /etc). Runners installed side by side get their
+            // own ID, so one never removes the other's containers.
+            let instance = if config == "/etc/turboci-runner.toml" {
+                ""
+            } else {
+                config.as_str()
+            };
             let system_id = runner_daemon::system_id::load_or_create(
-                &std::path::Path::new(&config).with_file_name(".runner_system_id"),
+                &std::path::Path::new(&runner_config.state_dir).join(".runner_system_id"),
+                instance,
             );
             info!("   System ID: {}", system_id);
             let gitlab = GitLabClient::new(

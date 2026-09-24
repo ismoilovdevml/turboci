@@ -70,6 +70,35 @@ pub fn credentials_for<'a>(image: &str, credentials: &'a [Credential]) -> Option
     })
 }
 
+/// Username and password for the registry of `image` from a Docker client
+/// config (`{"auths": {"<registry>": {"auth": "<base64 user:pass>"}}}`), the
+/// format of `DOCKER_AUTH_CONFIG` and ~/.docker/config.json. Credential
+/// helpers (`credsStore`, `credHelpers`) are not run.
+pub fn docker_config_auth(config: &str, image: &str) -> Option<(String, String)> {
+    use base64::Engine;
+
+    let registry = registry(image);
+    let config: serde_json::Value = serde_json::from_str(config).ok()?;
+    let (_, entry) = config.get("auths")?.as_object()?.iter().find(|(key, _)| {
+        let host = host_of(key);
+        host == registry || (is_docker_hub(host) && is_docker_hub(registry))
+    })?;
+    if let (Some(user), Some(password)) = (
+        entry.get("username").and_then(|v| v.as_str()),
+        entry.get("password").and_then(|v| v.as_str()),
+    ) {
+        return Some((user.to_string(), password.to_string()));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(entry.get("auth")?.as_str()?.trim())
+        .ok()?;
+    let (user, password) = String::from_utf8(decoded)
+        .ok()?
+        .split_once(':')
+        .map(|(u, p)| (u.to_string(), p.to_string()))?;
+    Some((user, password))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullPolicy {
     Always,
@@ -171,6 +200,26 @@ mod tests {
                 "redis"
             ]
         );
+    }
+
+    #[test]
+    fn reads_registry_logins_from_docker_config() {
+        // "user:secret" and "hub:pw" in base64
+        let config = r#"{"auths": {
+            "https://harbor.example.com": {"auth": "dXNlcjpzZWNyZXQ="},
+            "https://index.docker.io/v1/": {"auth": "aHViOnB3"},
+            "plain.example.com": {"username": "u", "password": "p"}
+        }, "credsStore": "desktop"}"#;
+        let auth = |image| docker_config_auth(config, image);
+
+        assert_eq!(
+            auth("harbor.example.com/library/app:1"),
+            Some(("user".into(), "secret".into()))
+        );
+        assert_eq!(auth("postgres:16"), Some(("hub".into(), "pw".into())));
+        assert_eq!(auth("plain.example.com/x"), Some(("u".into(), "p".into())));
+        assert_eq!(auth("quay.io/org/app"), None);
+        assert_eq!(docker_config_auth("not json", "postgres"), None);
     }
 
     #[test]

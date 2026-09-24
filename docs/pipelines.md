@@ -15,7 +15,7 @@ lists what a runner has to do, and how TurboCI does it.
 | `after_script` timeout | 5 minutes, or `RUNNER_AFTER_SCRIPT_TIMEOUT` |
 | `RUNNER_SCRIPT_TIMEOUT` | Caps the script steps inside the job timeout (Go duration: `10m`, `1h30m`) |
 | Cancel from the UI | The script is stopped, `after_script` still runs, then the job is cleaned up |
-| `hooks:pre_get_sources_script` | Runs before the checkout |
+| `hooks:pre_get_sources_script` | Runs before the checkout, after the runner's `pre_get_sources_script` |
 | `CI_DEBUG_TRACE: "true"` | Every command is echoed (`set -x`); masking still applies |
 | Collapsible log sections | `get_sources`, `restore_cache`, `download_artifacts`, `step_*`, `after_script`, `archive_cache`, `upload_artifacts_*` |
 
@@ -26,7 +26,8 @@ lists what a runner has to do, and how TurboCI does it.
 | `image:name`, `entrypoint` | The job image needs no `git`: sources are checked out by a helper container |
 | `image:pull_policy` | Honoured when listed in [`allowed_pull_policies`](configuration.md#docker) |
 | `services` | Own network per job; reachable by name-derived aliases and `alias`; `variables`, `command`, `entrypoint` per service. The script starts once service ports accept connections (up to 30 s) |
-| Private images | Credentials GitLab sends for its container registry |
+| Private images | `DOCKER_AUTH_CONFIG`, the runner's Docker `config.json`, or GitLab's registry credentials; see [private registries](configuration.md#private-registries) |
+| Runner services | Services from the runner config start for every job, e.g. Docker-in-Docker; see [services for every job](configuration.md#services-for-every-job) |
 
 ## Sources
 
@@ -36,6 +37,7 @@ lists what a runner has to do, and how TurboCI does it.
 | `GIT_DEPTH` | Shallow fetch depth; the project setting is the default |
 | `GIT_CHECKOUT` | `false` fetches without checking out |
 | `GIT_FETCH_EXTRA_FLAGS` | Extra `git fetch` flags, e.g. `--filter=blob:none` |
+| `GIT_CLONE_PATH` | Checks out into `$CI_BUILDS_DIR/<path>` (e.g. `$CI_BUILDS_DIR/$CI_PROJECT_PATH`); a path outside the builds directory fails the job |
 | `GIT_SUBMODULE_STRATEGY` | `none`, `normal`, `recursive` |
 | `GIT_SUBMODULE_DEPTH`, `GIT_SUBMODULE_PATHS`, `GIT_SUBMODULE_UPDATE_FLAGS` | As in gitlab-runner |
 | Git LFS | LFS objects are pulled after checkout when `git-lfs` is available; `GIT_LFS_SKIP_SMUDGE=1` skips them |
@@ -96,8 +98,8 @@ TurboCI adds the variables gitlab-runner adds:
 - Distributed cache (S3, GCS, Azure); the cache is local to the runner host
 - Interactive web terminal and the session server
 - External secrets (`secrets:` with Vault, Azure Key Vault, ...)
-- `DOCKER_AUTH_CONFIG` and credential helpers for other registries
-- `GIT_SUBMODULE_FORCE_HTTPS`, `GIT_CLONE_PATH`, `GIT_CLEAN_FLAGS`
+- Docker credential helpers (`credsStore`, `credHelpers`)
+- `GIT_SUBMODULE_FORCE_HTTPS`, `GIT_CLEAN_FLAGS`
 - Feature flags (`FF_*`)
 
 The runner tells GitLab which features it has, so jobs that need an

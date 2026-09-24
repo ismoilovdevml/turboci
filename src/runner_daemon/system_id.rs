@@ -30,18 +30,20 @@ fn random_id() -> String {
     )
 }
 
-fn generate() -> String {
+/// `instance` tells runners on the same machine apart (empty for the default
+/// install, which keeps the ID it always had)
+fn generate(instance: &str) -> String {
     MACHINE_ID_PATHS
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
         .map(|id| id.trim().to_string())
         .find(|id| !id.is_empty())
-        .map(|id| from_machine_id(&id))
+        .map(|id| from_machine_id(&format!("{}{}", id, instance)))
         .unwrap_or_else(random_id)
 }
 
 /// Read the system ID from `state_file`, creating it if missing or malformed
-pub fn load_or_create(state_file: &Path) -> String {
+pub fn load_or_create(state_file: &Path, instance: &str) -> String {
     if let Ok(contents) = std::fs::read_to_string(state_file) {
         let id = contents.trim();
         if is_valid(id) {
@@ -49,7 +51,7 @@ pub fn load_or_create(state_file: &Path) -> String {
         }
     }
 
-    let id = generate();
+    let id = generate(instance);
     match write_state(state_file, &id) {
         Ok(()) => info!("Created runner system ID {} in {:?}", id, state_file),
         // A machine-derived ID is the same after a restart, so not saving it is harmless
@@ -97,8 +99,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = dir.path().join(".runner_system_id");
 
-        let first = load_or_create(&file);
-        let second = load_or_create(&file);
+        let first = load_or_create(&file, "");
+        let second = load_or_create(&file, "");
 
         assert!(is_valid(&first));
         assert_eq!(first, second);
@@ -111,10 +113,10 @@ mod tests {
         let file = dir.path().join(".runner_system_id");
 
         std::fs::write(&file, "r_AbC123xyz789\n").unwrap();
-        assert_eq!(load_or_create(&file), "r_AbC123xyz789");
+        assert_eq!(load_or_create(&file, ""), "r_AbC123xyz789");
 
         std::fs::write(&file, "not-an-id").unwrap();
-        let replaced = load_or_create(&file);
+        let replaced = load_or_create(&file, "");
         assert!(is_valid(&replaced));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), replaced);
     }
@@ -124,6 +126,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = dir.path().join("missing-dir").join(".runner_system_id");
 
-        assert!(is_valid(&load_or_create(&file)));
+        assert!(is_valid(&load_or_create(&file, "")));
     }
 }

@@ -45,10 +45,12 @@ The runner then shows as **online** in GitLab.
 | `--binary PATH` | – | Install a local binary instead of downloading one |
 | `--tls-ca-file PATH` | – | CA (PEM) of a GitLab with a self-signed or internal certificate |
 | `--no-start` | – | Configure but do not start the service |
+| `--name NAME` | `turboci` | Install another runner next to the default one: service `NAME`, config `/etc/NAME-runner.toml`, state `/var/lib/NAME` |
+| `--user USER` | a new system user | Run the service as this existing user (it is not modified; not `root`) |
 
 Most options can also be set as environment variables: `TURBOCI_URL`,
-`TURBOCI_TOKEN`, `TURBOCI_EXECUTOR`, `TURBOCI_CONCURRENT`, `TURBOCI_VERSION` and
-`TURBOCI_TLS_CA_FILE`. Passing the token through the
+`TURBOCI_TOKEN`, `TURBOCI_EXECUTOR`, `TURBOCI_CONCURRENT`, `TURBOCI_VERSION`,
+`TURBOCI_TLS_CA_FILE`, `TURBOCI_NAME` and `TURBOCI_USER`. Passing the token through the
 environment keeps it out of the process list and shell history:
 
 ```bash
@@ -70,6 +72,33 @@ sudo turboci upgrade && sudo systemctl restart turboci
 ```
 
 `turboci upgrade` also verifies the download against `SHA256SUMS`.
+
+### A shell runner next to a docker runner
+
+A host can run several runners, each with its own GitLab token, service and
+config. A typical pair is a docker runner for most projects and a shell
+runner for builds that need tools installed on the host (mobile SDKs, for
+example), running as the user that owns them:
+
+```bash
+# docker runner: service turboci, config /etc/turboci-runner.toml
+curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh \
+  | sudo bash -s -- --url https://gitlab.example.com --token glrt-DOCKER
+
+# shell runner as the existing user "ci": service turboci-shell,
+# config /etc/turboci-shell-runner.toml
+curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh \
+  | sudo bash -s -- --url https://gitlab.example.com --token glrt-SHELL \
+      --executor shell --name turboci-shell --user ci
+```
+
+A shell runner's service can read and write home directories (jobs use the
+user's SDKs and package caches); `/usr`, `/boot` and `/etc` stay read-only.
+Put the variables the tools need in `environment` in its config.
+
+Each runner has its own system ID, so neither removes the other's containers.
+Remove one with `uninstall.sh --name NAME`; a user given with `--user` is
+never deleted.
 
 ## What gets installed
 
@@ -113,8 +142,12 @@ sudo install -m 0755 target/release/turboci /usr/local/bin/
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/uninstall.sh | sudo bash
+# a runner installed with --name:
+curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/uninstall.sh | sudo bash -s -- --name turboci-shell
 ```
 
-It stops the service and removes the binary, config (a `0600` backup is kept),
-state and workspaces, containers and networks the runner created, and the
-`turboci` user. Delete the runner in GitLab afterwards.
+It stops the service and removes the config (a `0600` backup is kept), the
+state directory, and the containers, networks and cache volumes the runner
+created. The service user is removed only if the installer created it. The
+binary and the shared workspace directory stay while other TurboCI runners
+are installed. Delete the runner in GitLab afterwards.

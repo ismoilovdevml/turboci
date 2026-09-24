@@ -75,8 +75,9 @@ finished before the runner exits.
 
 GitLab lists each runner host under the runner as a separate *runner
 manager*, identified by a system ID. TurboCI derives it from
-`/etc/machine-id` (`s_...`), so it stays the same across restarts and
-reinstalls on the same machine.
+`/etc/machine-id` (`s_...`) and keeps it in `state_dir/.runner_system_id`, so
+it stays the same across restarts and reinstalls on the same machine. Runners
+installed side by side with `--name` get different IDs.
 
 ## Troubleshooting
 

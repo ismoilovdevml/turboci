@@ -36,6 +36,38 @@ fn attempts(job: &Job, key: &str) -> u32 {
         .clamp(1, 10)
 }
 
+/// Add the runner config's `environment` and hook scripts to a job
+fn apply_runner_config(job: &mut Job, config: &config::RunnerConfig) {
+    for entry in &config.environment {
+        if let Some((key, value)) = entry.split_once('=') {
+            job.variables.push(
+                serde_json::from_value(serde_json::json!({
+                    "key": key.trim(), "value": value, "public": true, "internal": true
+                }))
+                .expect("valid variable"),
+            );
+        }
+    }
+    // Runner hooks run before the job's own hooks of the same name
+    for (name, script) in [
+        ("post_get_sources_script", &config.post_get_sources_script),
+        ("pre_get_sources_script", &config.pre_get_sources_script),
+    ] {
+        if let Some(script) = script {
+            job.hooks
+                .insert(0, serde_json::json!({ "name": name, "script": [script] }));
+        }
+    }
+    for step in job.steps.iter_mut().filter(|step| step.name == "script") {
+        if let Some(script) = &config.pre_build_script {
+            step.before_script.insert(0, script.clone());
+        }
+        if let Some(script) = &config.post_build_script {
+            step.script.push(script.clone());
+        }
+    }
+}
+
 /// Commit the binary was built from (set by CI builds), or the version
 fn revision() -> String {
     option_env!("GITHUB_SHA")
@@ -339,6 +371,13 @@ impl RunnerDaemon {
         Ok(())
     }
 
+    /// The checked-out project on the host (see `script::project_subdir`)
+    fn project_dir(&self, job: &Job) -> std::path::PathBuf {
+        self.executor
+            .job_dir(job.id)
+            .join(script::project_subdir(job).unwrap_or_else(|_| "project".to_string()))
+    }
+
     fn current_token(&self) -> String {
         self.runner_token
             .read()
@@ -447,6 +486,7 @@ impl RunnerDaemon {
                 .expect("valid variable"),
             );
         }
+        apply_runner_config(&mut job, &self.config);
         let result = self.run_job(&job).await;
         if let Ok(mut slots) = self.slots.lock() {
             slots.release(project, slot);
@@ -481,7 +521,7 @@ impl RunnerDaemon {
             ))
             .await;
 
-        let project_dir = self.executor.job_dir(job.id).join("project");
+        let project_dir = self.project_dir(&job);
         let mut outcome = tokio::fs::create_dir_all(&project_dir)
             .await
             .map_err(|e| JobFailure::system(format!("Failed to create workspace: {}", e)));
@@ -605,7 +645,7 @@ impl RunnerDaemon {
 
     /// Restore cache and dependency artifacts into the checked-out project
     async fn restore_workspace(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
-        let project_dir = self.executor.job_dir(job.id).join("project");
+        let project_dir = self.project_dir(job);
         let workspace = project_dir.to_string_lossy();
 
         let pulls_cache = job
@@ -756,7 +796,7 @@ impl RunnerDaemon {
                 .map(|item| script::expand(item, &variables))
                 .collect()
         };
-        let workspace = self.executor.job_dir(job.id).join("project");
+        let workspace = self.project_dir(job);
 
         for artifact in job_artifacts {
             let wanted = match artifact.when.as_deref() {
@@ -854,7 +894,7 @@ impl RunnerDaemon {
         if !wanted {
             return Vec::new();
         }
-        match self.executor.untracked_files(job.id).await {
+        match self.executor.untracked_files(job).await {
             // File names are matched literally, not as glob patterns
             Ok(files) => files.iter().map(|f| glob::Pattern::escape(f)).collect(),
             Err(e) => {
@@ -874,7 +914,7 @@ impl RunnerDaemon {
         if !self.config.cache_enabled {
             return;
         }
-        let workspace = self.executor.job_dir(job.id).join("project");
+        let workspace = self.project_dir(job);
         let variables = job_variables(job);
         let wants_untracked = job
             .cache
@@ -1324,6 +1364,48 @@ mod tests {
             .unwrap()
             .scrub("x glrt-rotated")
             .contains("[MASKED]"));
+    }
+
+    #[tokio::test]
+    async fn runner_environment_and_hooks_apply_to_jobs() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = daemon(&server, dir.path()).await;
+        let mut config = (*runner.config).clone();
+        config.environment = vec!["FROM_RUNNER=yes".into(), "OVERRIDDEN=runner".into()];
+        config.pre_get_sources_script = Some("echo pre-sources".into());
+        config.post_get_sources_script = Some("echo post-sources".into());
+        config.pre_build_script = Some("echo pre-build".into());
+        config.post_build_script = Some("echo post-build".into());
+        runner.config = Arc::new(config);
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 131, "token": "t",
+            "variables": [{"key": "OVERRIDDEN", "value": "job"}],
+            "steps": [{"name": "script", "when": "on_success",
+                       "before_script": ["echo before"],
+                       "script": ["echo env=$FROM_RUNNER/$OVERRIDDEN"]}]
+        }))
+        .unwrap();
+
+        runner.execute_job(job).await.unwrap();
+
+        let trace = trace_of(&server, 131).await;
+        let order: Vec<usize> = [
+            "pre-sources",
+            "post-sources",
+            "pre-build",
+            "before",
+            "env=yes/runner",
+            "post-build",
+        ]
+        .iter()
+        .map(|text| {
+            trace
+                .find(&format!("\n{}", text))
+                .unwrap_or_else(|| panic!("{} missing:\n{}", text, trace))
+        })
+        .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{}", trace);
     }
 
     #[test]

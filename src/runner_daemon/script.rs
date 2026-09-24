@@ -118,14 +118,64 @@ pub fn parse_duration(text: &str) -> Option<Duration> {
     Duration::try_from_secs_f64(total).ok()
 }
 
+/// Where the project is checked out, relative to the builds directory:
+/// `project`, or the part of `GIT_CLONE_PATH` after `$CI_BUILDS_DIR/` (which
+/// may use variables, e.g. `$CI_BUILDS_DIR/$CI_PROJECT_PATH`). A clone path
+/// outside the builds directory is an error, as in gitlab-runner.
+pub fn project_subdir(job: &Job) -> std::result::Result<String, String> {
+    let Some(clone_path) = job
+        .variables
+        .iter()
+        .rev()
+        .find(|v| v.key == "GIT_CLONE_PATH")
+        .and_then(|v| v.value.as_deref())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok("project".to_string());
+    };
+    let relative = clone_path
+        .strip_prefix("$CI_BUILDS_DIR/")
+        .or_else(|| clone_path.strip_prefix("${CI_BUILDS_DIR}/"))
+        .ok_or_else(|| {
+            format!(
+                "GIT_CLONE_PATH {:?} must start with $CI_BUILDS_DIR/",
+                clone_path
+            )
+        })?;
+    let values: HashMap<String, String> = job
+        .variables
+        .iter()
+        .filter_map(|v| Some((v.key.clone(), v.value.clone()?)))
+        .collect();
+    let relative = expand(relative, &values);
+    let valid = !relative.is_empty()
+        && relative.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        });
+    if !valid {
+        return Err(format!(
+            "GIT_CLONE_PATH {:?} gives {:?}, not a directory inside the builds directory",
+            clone_path, relative
+        ));
+    }
+    Ok(relative)
+}
+
 /// Build the job environment.
 ///
 /// `builds_dir` is where the job sees its builds directory (e.g. `/builds` in a
 /// container); `host_job_dir` is the same directory on the runner host. File
 /// variables are written to `<project>.tmp/<KEY>` like gitlab-runner does.
 pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &RunnerVars) -> JobEnv {
-    let project_dir = format!("{}/project", builds_dir);
-    let tmp_dir = format!("{}/project.tmp", builds_dir);
+    let subdir = project_subdir(job).unwrap_or_else(|_| "project".to_string());
+    let project_dir = format!("{}/{}", builds_dir, subdir);
+    let tmp_dir = format!("{}/{}.tmp", builds_dir, subdir);
 
     let mut env = JobEnv::default();
     env.set("CI_BUILDS_DIR", builds_dir.to_string());
@@ -264,6 +314,37 @@ pub fn expand(value: &str, values: &HashMap<String, String>) -> String {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn clone_path_stays_inside_the_builds_dir() {
+        let with = |value: &str| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "id": 1, "token": "t",
+                "variables": [
+                    {"key": "CI_PROJECT_PATH", "value": "group/app"},
+                    {"key": "GIT_CLONE_PATH", "value": value}
+                ]
+            }))
+            .unwrap()
+        };
+        assert_eq!(project_subdir(&with("")), Ok("project".to_string()));
+        assert_eq!(
+            project_subdir(&with("$CI_BUILDS_DIR/$CI_PROJECT_PATH")),
+            Ok("group/app".to_string())
+        );
+        assert_eq!(
+            project_subdir(&with("${CI_BUILDS_DIR}/src")),
+            Ok("src".to_string())
+        );
+        for bad in [
+            "/tmp/x",
+            "$CI_BUILDS_DIR/../etc",
+            "$CI_BUILDS_DIR/a//b",
+            "$CI_BUILDS_DIR/a b",
+        ] {
+            assert!(project_subdir(&with(bad)).is_err(), "{}", bad);
+        }
+    }
 
     #[test]
     fn parses_go_durations() {

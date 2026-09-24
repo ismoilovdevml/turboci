@@ -34,6 +34,15 @@ pub struct RunnerConfig {
     /// Where the runner keeps state it must write, like a rotated runner token
     pub state_dir: String,
 
+    /// `KEY=value` variables added to every job (they override the job's own)
+    pub environment: Vec<String>,
+    /// Scripts run for every job, as in gitlab-runner: before and after the
+    /// checkout, and before and after the job's script (in the same shell)
+    pub pre_get_sources_script: Option<String>,
+    pub post_get_sources_script: Option<String>,
+    pub pre_build_script: Option<String>,
+    pub post_build_script: Option<String>,
+
     /// Executor configuration
     pub executor: ExecutorConfig,
 }
@@ -65,36 +74,146 @@ pub struct DockerConfig {
     pub helper_image: String,
     /// Memory limit per container, e.g. "2g" or "512m"
     pub memory: Option<String>,
+    /// Memory plus swap per container ("-1" = unlimited swap)
+    pub memory_swap: Option<String>,
+    /// Soft memory limit per container
+    pub memory_reservation: Option<String>,
     /// CPU limit per container, e.g. 1.5
     pub cpus: Option<f64>,
+    /// Size of /dev/shm in job and service containers, e.g. "1g" (Docker's
+    /// default of 64m is too small for browsers and some test runners)
+    pub shm_size: Option<String>,
+    /// OOM killer preference of job and service containers (-1000 to 1000)
+    pub oom_score_adjust: Option<i64>,
+    /// Services started for every job, before the job's own `services:`
+    pub services: Vec<ServiceConfig>,
+    /// Docker client config (`auths`) with registry logins used for pulls,
+    /// like ~/.docker/config.json. Default: the service user's
+    /// ~/.docker/config.json when it exists
+    pub auth_config_file: Option<String>,
+}
+
+/// A service in `[[executor.docker.services]]`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceConfig {
+    pub name: String,
+    pub alias: Option<String>,
+    pub entrypoint: Option<Vec<String>>,
+    pub command: Option<Vec<String>>,
+}
+
+/// A size such as "512m", "2g" or "1073741824" in bytes; `field` names it in errors
+pub fn parse_size(field: &str, value: &str) -> Result<i64> {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "-1" {
+        return Ok(-1);
+    }
+    let (number, unit) = value.split_at(
+        value
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(value.len()),
+    );
+    let multiplier: i64 = match unit {
+        "" | "b" => 1,
+        "k" | "kb" => 1 << 10,
+        "m" | "mb" => 1 << 20,
+        "g" | "gb" => 1 << 30,
+        _ => anyhow::bail!("{}: unknown unit in {:?}", field, value),
+    };
+    let number: i64 = number
+        .parse()
+        .with_context(|| format!("{}: invalid value {:?}", field, value))?;
+    number
+        .checked_mul(multiplier)
+        .with_context(|| format!("{}: {:?} is too large", field, value))
 }
 
 impl DockerConfig {
     /// Memory limit in bytes
     pub fn memory_bytes(&self) -> Result<Option<i64>> {
-        let Some(memory) = self.memory.as_deref() else {
-            return Ok(None);
-        };
-        let memory = memory.trim().to_ascii_lowercase();
-        let (number, unit) = memory.split_at(
-            memory
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(memory.len()),
-        );
-        let multiplier: i64 = match unit {
-            "" | "b" => 1,
-            "k" | "kb" => 1 << 10,
-            "m" | "mb" => 1 << 20,
-            "g" | "gb" => 1 << 30,
-            _ => anyhow::bail!("executor.docker.memory: unknown unit in {:?}", memory),
-        };
-        let number: i64 = number
-            .parse()
-            .with_context(|| format!("executor.docker.memory: invalid value {:?}", memory))?;
-        let bytes = number
-            .checked_mul(multiplier)
-            .with_context(|| format!("executor.docker.memory: {:?} is too large", memory))?;
-        Ok(Some(bytes))
+        self.size("memory", &self.memory)
+    }
+
+    pub fn memory_swap_bytes(&self) -> Result<Option<i64>> {
+        self.size("memory_swap", &self.memory_swap)
+    }
+
+    pub fn memory_reservation_bytes(&self) -> Result<Option<i64>> {
+        self.size("memory_reservation", &self.memory_reservation)
+    }
+
+    pub fn shm_size_bytes(&self) -> Result<Option<i64>> {
+        self.size("shm_size", &self.shm_size)
+    }
+
+    fn size(&self, field: &str, value: &Option<String>) -> Result<Option<i64>> {
+        value
+            .as_deref()
+            .map(|value| parse_size(&format!("executor.docker.{}", field), value))
+            .transpose()
+    }
+
+    /// Check every setting that can be wrong
+    pub fn validate(&self) -> Result<()> {
+        for size in [
+            self.memory_bytes()?,
+            self.memory_reservation_bytes()?,
+            self.shm_size_bytes()?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if size < 0 {
+                anyhow::bail!(
+                    "executor.docker: sizes must not be negative (only memory_swap may be -1)"
+                );
+            }
+        }
+        if let (Some(swap), Some(memory)) = (self.memory_swap_bytes()?, self.memory_bytes()?) {
+            if swap != -1 && swap < memory {
+                anyhow::bail!("executor.docker.memory_swap must be at least memory (or -1)");
+            }
+        } else if self.memory_swap_bytes()?.is_some_and(|swap| swap != -1) {
+            anyhow::bail!("executor.docker.memory_swap needs memory to be set too");
+        }
+        if self
+            .cpus
+            .is_some_and(|cpus| !cpus.is_finite() || cpus <= 0.0 || cpus > 1024.0)
+        {
+            anyhow::bail!("executor.docker.cpus must be a number between 0 and 1024");
+        }
+        if self
+            .oom_score_adjust
+            .is_some_and(|score| !(-1000..=1000).contains(&score))
+        {
+            anyhow::bail!("executor.docker.oom_score_adjust must be between -1000 and 1000");
+        }
+        for policy in std::iter::once(&self.pull_policy).chain(&self.allowed_pull_policies) {
+            if !matches!(policy.as_str(), "always" | "if-not-present" | "never") {
+                anyhow::bail!(
+                    "executor.docker pull policies must be always, if-not-present or never, got {:?}",
+                    policy
+                );
+            }
+        }
+        if let Some(bad) = self.services.iter().find(|s| s.name.trim().is_empty()) {
+            anyhow::bail!(
+                "executor.docker.services: every service needs a name ({:?})",
+                bad
+            );
+        }
+        if let Some(bad) = self
+            .volumes
+            .iter()
+            .find(|v| !v.starts_with('/') && !v.contains(':'))
+        {
+            anyhow::bail!(
+                "executor.docker.volumes: {:?} must be an absolute container path or host:container",
+                bad
+            );
+        }
+        Ok(())
     }
 }
 
@@ -154,6 +273,11 @@ impl Default for RunnerConfig {
             cache_dir: default_cache_dir(),
             cache_max_age_days: 14,
             state_dir: "/var/lib/turboci".to_string(),
+            environment: Vec::new(),
+            pre_get_sources_script: None,
+            post_get_sources_script: None,
+            pre_build_script: None,
+            post_build_script: None,
             executor: ExecutorConfig::default(),
         }
     }
@@ -182,7 +306,13 @@ impl Default for DockerConfig {
             allowed_pull_policies: Vec::new(),
             helper_image: "alpine/git:latest".to_string(),
             memory: None,
+            memory_swap: None,
+            memory_reservation: None,
             cpus: None,
+            shm_size: None,
+            oom_score_adjust: None,
+            services: Vec::new(),
+            auth_config_file: None,
         }
     }
 }
@@ -225,21 +355,16 @@ impl RunnerConfig {
         if self.check_interval == 0 {
             anyhow::bail!("check_interval must be at least 1 second");
         }
-        let docker = &self.executor.docker;
-        docker.memory_bytes()?;
-        if docker
-            .cpus
-            .is_some_and(|cpus| !cpus.is_finite() || cpus <= 0.0 || cpus > 1024.0)
-        {
-            anyhow::bail!("executor.docker.cpus must be a number between 0 and 1024");
-        }
-        for policy in std::iter::once(&docker.pull_policy).chain(&docker.allowed_pull_policies) {
-            if !matches!(policy.as_str(), "always" | "if-not-present" | "never") {
-                anyhow::bail!(
-                    "executor.docker pull policies must be always, if-not-present or never, got {:?}",
-                    policy
-                );
-            }
+        self.executor.docker.validate()?;
+        if let Some(bad) = self.environment.iter().find(|entry| {
+            entry
+                .split_once('=')
+                .is_none_or(|(key, _)| key.trim().is_empty())
+        }) {
+            anyhow::bail!(
+                "environment entries must look like KEY=value, got {:?}",
+                bad
+            );
         }
         match self.executor.executor_type.as_str() {
             "docker" | "shell" => Ok(()),

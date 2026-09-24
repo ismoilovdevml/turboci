@@ -13,9 +13,10 @@ REPO="ismoilovdevml/turboci"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc"
 BIN_NAME="turboci"
-SERVICE_NAME="turboci"
-SERVICE_USER="turboci"
-STATE_DIR="/var/lib/turboci"
+# --name installs another runner next to the default one, e.g. a shell runner
+# beside a docker runner: its own service, config and state directory
+INSTANCE="${TURBOCI_NAME:-turboci}"
+SERVICE_USER="${TURBOCI_USER:-}"
 # The Docker executor currently uses this fixed host path for job workspaces.
 DOCKER_BUILDS_DIR="/tmp/turboci-builds"
 # Settings: command line options, or the TURBOCI_* environment variables
@@ -42,10 +43,16 @@ Usage: install.sh [options]
   --tls-ca-file PATH CA certificate (PEM) of a GitLab with a self-signed or
                      internal certificate
   --no-start         Configure but do not start the service
+  --name NAME        Install a second runner under this name (service NAME,
+                     config /etc/NAME-runner.toml, state /var/lib/NAME);
+                     default: turboci
+  --user USER        Run the service as this existing user instead of a new
+                     system user named after the runner (e.g. the user that
+                     owns the SDKs a shell runner needs)
   -h, --help         Show this help
 
 Environment: TURBOCI_URL, TURBOCI_TOKEN, TURBOCI_EXECUTOR, TURBOCI_CONCURRENT,
-TURBOCI_VERSION.
+TURBOCI_VERSION, TURBOCI_NAME, TURBOCI_USER.
 USAGE
 }
 
@@ -59,10 +66,27 @@ while [ $# -gt 0 ]; do
         --binary) LOCAL_BINARY="${2:?--binary needs a value}"; shift 2 ;;
         --tls-ca-file) TLS_CA_FILE="${2:?--tls-ca-file needs a value}"; shift 2 ;;
         --no-start) START_SERVICE=0; shift ;;
+        --name) INSTANCE="${2:?--name needs a value}"; shift 2 ;;
+        --user) SERVICE_USER="${2:?--user needs a value}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
+
+if ! [[ "$INSTANCE" =~ ^[a-z][a-z0-9-]{0,30}$ ]]; then
+    echo "--name must be lowercase letters, digits and dashes" >&2
+    exit 1
+fi
+SERVICE_NAME="$INSTANCE"
+STATE_DIR="/var/lib/$INSTANCE"
+CONFIG_FILE="$CONFIG_DIR/$INSTANCE-runner.toml"
+TMPFILES_FILE="/etc/tmpfiles.d/$INSTANCE.conf"
+# Without --user the runner gets a system user of its own, named after it
+CREATE_USER=0
+if [ -z "$SERVICE_USER" ]; then
+    SERVICE_USER="$INSTANCE"
+    CREATE_USER=1
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -161,6 +185,15 @@ validate_options() {
         echo -e "${RED}❌ --tls-ca-file: $TLS_CA_FILE is not a PEM certificate${NC}"
         exit 1
     fi
+    if [ "$CREATE_USER" -eq 0 ] && ! id -u "$SERVICE_USER" > /dev/null 2>&1; then
+        echo -e "${RED}❌ --user: user $SERVICE_USER does not exist${NC}"
+        exit 1
+    fi
+    if [ "$SERVICE_USER" = "root" ]; then
+        echo -e "${RED}❌ --user root is not allowed; use an unprivileged user${NC}"
+        exit 1
+    fi
+    SERVICE_GROUP=$(id -gn "$SERVICE_USER" 2>/dev/null || echo "$SERVICE_USER")
 }
 
 # Install Docker for the docker executor when it is missing
@@ -294,13 +327,22 @@ create_service_user() {
             --shell /usr/sbin/nologin "$SERVICE_USER"
         echo -e "${GREEN}✓${NC} User created: ${BLUE}$SERVICE_USER${NC}"
     fi
+    SERVICE_GROUP=$(id -gn "$SERVICE_USER")
 
     # Membership in the docker group is required to use the Docker socket.
-    # Note: docker group access is equivalent to root on this host.
-    if getent group docker > /dev/null 2>&1; then
+    # Note: docker group access is equivalent to root on this host. A shell
+    # runner does not need it, and an existing --user is left as it is.
+    [ "$EXECUTOR" = "docker" ] || return 0
+    if id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx docker; then
+        echo -e "${GREEN}✓${NC} $SERVICE_USER is in the docker group"
+    elif [ "$CREATE_USER" -eq 0 ]; then
+        echo -e "${RED}❌ --user $SERVICE_USER is not in the docker group; add it first:${NC}"
+        echo -e "${RED}   usermod -aG docker $SERVICE_USER${NC}"
+        exit 1
+    elif getent group docker > /dev/null 2>&1; then
         usermod -aG docker "$SERVICE_USER"
         echo -e "${GREEN}✓${NC} Added $SERVICE_USER to the docker group"
-    elif [ "$EXECUTOR" = "docker" ]; then
+    else
         echo -e "${YELLOW}⚠️  Docker group not found - is Docker installed?${NC}"
         echo -e "${YELLOW}   After installing Docker run: usermod -aG docker $SERVICE_USER${NC}"
     fi
@@ -310,18 +352,21 @@ create_service_user() {
 create_directories() {
     echo -e "\n${YELLOW}📁 Creating directories...${NC}"
 
-    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STATE_DIR" "$STATE_DIR/builds"
+    install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR" "$STATE_DIR/builds"
     echo -e "${GREEN}✓${NC} State directory: ${BLUE}$STATE_DIR${NC}"
+
+    # The shell executor does not use the Docker workspace directory
+    [ "$EXECUTOR" = "docker" ] || return 0
 
     # Job containers run as root, so files they create in the workspace can
     # not always be removed by the service user. Let systemd-tmpfiles create
     # the workspace root with the right owner and age out leftovers.
     if [ -d /etc/tmpfiles.d ]; then
-        echo "d $DOCKER_BUILDS_DIR 0750 $SERVICE_USER $SERVICE_USER 1d" > /etc/tmpfiles.d/turboci.conf
+        echo "d $DOCKER_BUILDS_DIR 0750 $SERVICE_USER $SERVICE_GROUP 1d" > "$TMPFILES_FILE"
         if command -v systemd-tmpfiles > /dev/null 2>&1; then
-            systemd-tmpfiles --create /etc/tmpfiles.d/turboci.conf || true
+            systemd-tmpfiles --create "$TMPFILES_FILE" || true
         fi
-        echo -e "${GREEN}✓${NC} tmpfiles rule: ${BLUE}/etc/tmpfiles.d/turboci.conf${NC}"
+        echo -e "${GREEN}✓${NC} tmpfiles rule: ${BLUE}$TMPFILES_FILE${NC}"
     fi
 
     # Workspaces left behind by an earlier root-run install cannot be
@@ -337,8 +382,6 @@ create_directories() {
 # Create TurboCI config
 create_config() {
     echo -e "\n${YELLOW}📝 Creating configuration...${NC}"
-
-    CONFIG_FILE="$CONFIG_DIR/turboci-runner.toml"
 
     if [ -f "$CONFIG_FILE" ] && [ -n "$RUNNER_TOKEN" ]; then
         # A token on the command line replaces the config; keep the old one
@@ -366,7 +409,7 @@ create_config() {
     fi
 
     # Create the file with restrictive permissions before writing the token field
-    install -m 0640 -o root -g "$SERVICE_USER" /dev/null "$CONFIG_FILE"
+    install -m 0640 -o root -g "$SERVICE_GROUP" /dev/null "$CONFIG_FILE"
 
     TLS_CA_LINE=""
     if [ -n "$TLS_CA_FILE" ]; then
@@ -384,6 +427,7 @@ gitlab_url = "$GITLAB_URL"
 $TLS_CA_LINE
 cache_enabled = true
 cache_dir = "$STATE_DIR/cache"
+state_dir = "$STATE_DIR"
 
 [executor]
 # "docker" isolates each job in a container. "shell" runs job scripts
@@ -410,9 +454,9 @@ EOF
 
 # The config holds the runner token: readable by the service group only
 secure_config() {
-    chown "root:$SERVICE_USER" "$CONFIG_FILE"
+    chown "root:$SERVICE_GROUP" "$CONFIG_FILE"
     chmod 0640 "$CONFIG_FILE"
-    echo -e "${GREEN}✓${NC} Config permissions: root:$SERVICE_USER 0640"
+    echo -e "${GREEN}✓${NC} Config permissions: root:$SERVICE_GROUP 0640"
 }
 
 # Create systemd service
@@ -421,18 +465,30 @@ create_service() {
 
     SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 
+    # Shell jobs run as the service user and use its home (SDKs, package
+    # caches), so the home directories stay reachable and only /usr, /boot
+    # and /etc are read-only. Docker jobs only need the state directory.
+    if [ "$EXECUTOR" = "shell" ]; then
+        PROTECT="ProtectSystem=full
+ProtectHome=false"
+    else
+        PROTECT="ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$STATE_DIR /tmp"
+    fi
+
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=TurboCI Runner
+Description=TurboCI Runner ($INSTANCE)
 Documentation=https://github.com/$REPO
 After=network.target docker.service
 
 [Service]
 Type=simple
 User=$SERVICE_USER
-Group=$SERVICE_USER
+Group=$SERVICE_GROUP
 WorkingDirectory=$STATE_DIR
-ExecStart=$INSTALL_DIR/$BIN_NAME runner-start -c $CONFIG_DIR/turboci-runner.toml
+ExecStart=$INSTALL_DIR/$BIN_NAME runner-start -c $CONFIG_FILE
 Restart=always
 RestartSec=10
 # SIGTERM stops running jobs and reports them; give that time before SIGKILL
@@ -446,9 +502,7 @@ NoNewPrivileges=true
 # from $DOCKER_BUILDS_DIR, and dockerd resolves that path in the host's /tmp.
 # A private /tmp would hand every job container an empty workspace.
 PrivateTmp=false
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$STATE_DIR /tmp
+$PROTECT
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -523,7 +577,7 @@ print_next_steps() {
 
     if [ "$STARTED" -eq 1 ]; then
         echo -e "\n${GREEN}🚀 TurboCI is running.${NC} Jobs for this runner will start automatically."
-        echo -e "   Logs: ${BLUE}journalctl -u turboci -f${NC}\n"
+        echo -e "   Logs: ${BLUE}journalctl -u $SERVICE_NAME -f${NC}\n"
         return
     fi
 
@@ -536,27 +590,27 @@ print_next_steps() {
     echo -e "   • Copy the token (starts with glrt-)"
 
     echo -e "\n${YELLOW}2. Configure TurboCI:${NC}"
-    echo -e "   ${BLUE}nano $CONFIG_DIR/turboci-runner.toml${NC}"
+    echo -e "   ${BLUE}nano $CONFIG_FILE${NC}"
     echo -e "   Set: ${BLUE}runner_token = \"glrt-YOUR-TOKEN-HERE\"${NC}"
 
     echo -e "\n${YELLOW}3. Start TurboCI:${NC}"
-    echo -e "   ${BLUE}systemctl start turboci${NC}"
-    echo -e "   ${BLUE}systemctl status turboci${NC}"
+    echo -e "   ${BLUE}systemctl start $SERVICE_NAME${NC}"
+    echo -e "   ${BLUE}systemctl status $SERVICE_NAME${NC}"
 
     echo -e "\n${YELLOW}4. Check Logs:${NC}"
-    echo -e "   ${BLUE}journalctl -u turboci -f${NC}"
+    echo -e "   ${BLUE}journalctl -u $SERVICE_NAME -f${NC}"
 
     echo -e "\n${BLUE}📊 Installed Components:${NC}"
     echo -e "   ✓ TurboCI:       ${GREEN}$LATEST_VERSION${NC}"
-    echo -e "   ✓ Config:        ${BLUE}$CONFIG_DIR/turboci-runner.toml${NC} (executor: $EXECUTOR)"
+    echo -e "   ✓ Config:        ${BLUE}$CONFIG_FILE${NC} (executor: $EXECUTOR)"
     echo -e "   ✓ Runs as:       ${BLUE}$SERVICE_USER${NC} (work dir $STATE_DIR)"
     echo -e "   ✓ Service:       ${GREEN}Enabled${NC} (not started)"
 
     echo -e "\n${BLUE}🔧 Management Commands:${NC}"
-    echo -e "   ${BLUE}systemctl status turboci${NC}   # Check status"
-    echo -e "   ${BLUE}systemctl restart turboci${NC}  # Restart"
-    echo -e "   ${BLUE}systemctl stop turboci${NC}     # Stop"
-    echo -e "   ${BLUE}journalctl -u turboci -f${NC}   # View logs"
+    echo -e "   ${BLUE}systemctl status $SERVICE_NAME${NC}   # Check status"
+    echo -e "   ${BLUE}systemctl restart $SERVICE_NAME${NC}  # Restart"
+    echo -e "   ${BLUE}systemctl stop $SERVICE_NAME${NC}     # Stop"
+    echo -e "   ${BLUE}journalctl -u $SERVICE_NAME -f${NC}   # View logs"
 
     echo -e "\n${BLUE}📚 Documentation:${NC}"
     echo -e "   https://github.com/$REPO"

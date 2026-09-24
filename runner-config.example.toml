@@ -22,6 +22,14 @@ gitlab_url = "https://gitlab.com"
 # token here (runner_token.json); a different runner_token above replaces it.
 state_dir = "/var/lib/turboci"
 
+# Variables added to every job (they override the job's own), and scripts run
+# for every job, as in gitlab-runner's [[runners]] section
+# environment = ["KEY=value"]
+# pre_get_sources_script = "echo before the checkout"
+# post_get_sources_script = "echo after the checkout"
+# pre_build_script = "echo before before_script"
+# post_build_script = "echo after script"
+
 # ===== CACHE CONFIGURATION =====
 cache_enabled = true
 # Local job cache (`cache:` in .gitlab-ci.yml), one directory per project
@@ -49,7 +57,8 @@ default_image = "alpine:latest"
 # Run containers in privileged mode (needed for Docker-in-Docker)
 privileged = false
 
-# Mount volumes
+# "host:container[:mode]" binds, or a bare container path such as "/cache"
+# for a volume that keeps its content between a project's jobs
 volumes = []
 
 # Docker network for jobs without services (jobs with services get their own network)
@@ -67,4 +76,19 @@ helper_image = "alpine/git:latest"
 
 # Resource limits per container (job and services); unset = no limit
 # memory = "2g"
+# memory_swap = "3g"
+# memory_reservation = "1g"
 # cpus = 2.0
+# shm_size = "1g"
+# oom_score_adjust = 500
+
+# Docker config.json whose "auths" logins are used to pull private images
+# (default: ~/.docker/config.json of the service user)
+# auth_config_file = "/var/lib/turboci/.docker/config.json"
+
+# Services started for every job, e.g. a Docker daemon for image builds
+# (needs privileged = true)
+# [[executor.docker.services]]
+# name = "docker:27-dind"
+# alias = "docker"
+# command = ["--host=tcp://0.0.0.0:2375", "--tls=false"]

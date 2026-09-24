@@ -48,7 +48,20 @@ work_dir = "/var/lib/turboci/builds"
 | `concurrent` | `4` | Jobs run at the same time. The runner only asks GitLab for a job when a slot is free |
 | `check_interval` | `3` | Seconds between job requests while idle |
 | `tls_ca_file` | – | PEM CA for a GitLab with a self-signed or internal certificate; also given to jobs as `CI_SERVER_TLS_CA_FILE` and `GIT_SSL_CAINFO` |
-| `state_dir` | `/var/lib/turboci` | Where the runner keeps state it writes, such as a [rotated token](operations.md#runner-token-rotation) |
+| `state_dir` | `/var/lib/turboci` | Where the runner keeps state it writes: its system ID and a [rotated token](operations.md#runner-token-rotation) |
+| `environment` | `[]` | `KEY=value` variables added to every job; they override the job's own |
+| `pre_get_sources_script` | – | Script run before the checkout of every job (before the job's `hooks:pre_get_sources_script`) |
+| `post_get_sources_script` | – | Script run after the checkout |
+| `pre_build_script` | – | Script run before `before_script`, in the same shell as the job's script |
+| `post_build_script` | – | Script run after `script`, in the same shell |
+
+These work as the settings of the same names in gitlab-runner's
+`[[runners]]`, so a gitlab-runner config can be carried over:
+
+```toml
+environment = ["ANDROID_HOME=/home/ci/Android/Sdk", "GIT_STRATEGY=clone"]
+pre_get_sources_script = "export PATH=$PATH:/opt/flutter/bin"
+```
 
 ## Cache
 
@@ -83,12 +96,52 @@ aliases.
 | `volumes` | `[]` | Extra binds for job containers, e.g. `"/srv/cache:/cache:rw"` |
 | `network_mode` | `bridge` | Network for jobs without services |
 | `memory` | – | Memory limit per container, e.g. `"2g"`, `"512m"` |
+| `memory_swap` | – | Memory plus swap per container, at least `memory`; `"-1"` for unlimited swap |
+| `memory_reservation` | – | Soft memory limit per container |
 | `cpus` | – | CPU limit per container, e.g. `1.5` |
+| `shm_size` | – | Size of `/dev/shm`, e.g. `"1g"`. Docker's 64 MB is too small for browsers and some test runners |
+| `oom_score_adjust` | – | OOM killer preference of containers (-1000 to 1000) |
+| `auth_config_file` | `~/.docker/config.json` of the service user | Docker client config whose `auths` are used to pull private images |
+| `services` | `[]` | Services started for every job (see below) |
+
+`volumes` takes `host:container[:mode]` binds and bare container paths. A
+bare path such as `"/cache"` becomes a Docker volume that keeps its content
+between the jobs of a project (one per project and concurrent slot), like
+gitlab-runner's cache volumes. The same volume is mounted in the job's
+services, so `"/certs/client"` shares Docker-in-Docker TLS certificates.
+
+### Services for every job
+
+Services listed here start before the job's own `services:`, for example a
+Docker daemon for jobs that build images:
+
+```toml
+[executor.docker]
+privileged = true
+
+[[executor.docker.services]]
+name = "docker:27-dind"
+alias = "docker"
+command = ["--host=tcp://0.0.0.0:2375", "--tls=false"]
+```
+
+Jobs then reach it as `tcp://docker:2375` (`DOCKER_HOST`).
+
+### Private registries
+
+An image is pulled with the first login found, in gitlab-runner's order:
+
+1. the job's `DOCKER_AUTH_CONFIG` variable (a Docker `config.json`, usually a
+   masked project or group variable);
+2. `auth_config_file`, by default the service user's `~/.docker/config.json`
+   (`/var/lib/turboci/.docker/config.json` for an installed runner);
+3. the credentials GitLab sends for its own container registry.
+
+Only `auths` entries are read; credential helpers (`credsStore`,
+`credHelpers`) are not run.
 
 Workspaces live under `/tmp/turboci-builds/job-<id>` on the host and are
-removed when the job ends. Registry credentials GitLab sends with the job (for
-the GitLab container registry) are used to pull from that registry;
-`DOCKER_AUTH_CONFIG` is not read yet.
+removed when the job ends.
 
 !!! warning "The docker group is root-equivalent"
     The `turboci` user is in the `docker` group, which can start privileged
@@ -105,4 +158,7 @@ the GitLab container registry) are used to pull from that registry;
 |---|---|---|
 | `work_dir` | `/var/lib/turboci/builds` | Where job workspaces are created |
 
-Jobs run with `bash` when it is installed, otherwise `sh`.
+Jobs run with `bash` when it is installed, otherwise `sh`, as the service
+user. To run them as a user that already has the tools (SDKs in its home, for
+example), install the runner with `--user`; see
+[a shell runner next to a docker runner](installation.md#a-shell-runner-next-to-a-docker-runner).

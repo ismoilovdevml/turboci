@@ -67,6 +67,9 @@ impl JobFailure {
 
 pub type JobOutcome = std::result::Result<(), JobFailure>;
 
+// One executor exists per runner process, so the size of the Docker variant
+// does not matter
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ExecutorType {
     Docker(DockerExecutor),
@@ -113,7 +116,9 @@ impl ExecutorType {
     /// Files in the checked-out project that git does not track (including
     /// ignored ones), relative to the project, for `artifacts:untracked` and
     /// `cache:untracked`
-    pub async fn untracked_files(&self, job_id: u64) -> Result<Vec<String>> {
+    pub async fn untracked_files(&self, job: &Job) -> Result<Vec<String>> {
+        let job_id = job.id;
+        let subdir = script::project_subdir(job).unwrap_or_else(|_| "project".to_string());
         const LIST: &str = "git -c safe.directory='*' -C {dir} ls-files --others -z";
         let output = match self {
             ExecutorType::Docker(executor) => {
@@ -121,7 +126,7 @@ impl ExecutorType {
                 executor
                     .run_helper(
                         &format!("turboci-job-{}-untracked", job_id),
-                        &LIST.replace("{dir}", "/builds/project"),
+                        &LIST.replace("{dir}", &format!("/builds/{}", subdir)),
                         HostConfig {
                             binds: Some(vec![format!("{}:/builds", job_dir.display())]),
                             network_mode: Some("none".to_string()),
@@ -132,7 +137,7 @@ impl ExecutorType {
                     .await?
             }
             ExecutorType::Shell(_) => {
-                let project = self.job_dir(job_id).join("project");
+                let project = self.job_dir(job_id).join(&subdir);
                 let out = Command::new("git")
                     .args(["-c", "safe.directory=*", "-C"])
                     .arg(&project)
@@ -429,28 +434,66 @@ async fn get_sources(
     dirs: &JobDirs,
     limits: &Limits<'_>,
 ) -> std::result::Result<(), RunError> {
-    // hooks:pre_get_sources_script runs before the checkout, where it happens
-    let hook = pre_get_sources_script(job);
-    if !hook.is_empty() {
-        trace.write("Running pre_get_sources_script\n").await;
-        match runner
-            .run(&script::step_script(&hook), &dirs.builds, trace, limits)
-            .await
-        {
-            Ok(RunStatus::Exited(0)) => {}
-            Ok(RunStatus::Exited(code)) => {
-                return Err(RunError::Failed(JobFailure {
-                    reason: FailureReason::ScriptFailure,
-                    exit_code: Some(code),
-                    message: format!("pre_get_sources_script failed with exit code {}", code),
-                }))
-            }
-            Ok(RunStatus::TimedOut) => return Err(RunError::TimedOut),
-            Ok(RunStatus::Canceled) => return Err(RunError::Canceled),
-            Err(e) => return Err(RunError::Failed(JobFailure::system(format!("{:#}", e)))),
-        }
-    }
+    // The runner's and the job's pre_get_sources_script run before the
+    // checkout, post_get_sources_script after it
+    run_hook(
+        job,
+        "pre_get_sources_script",
+        &dirs.builds,
+        runner,
+        trace,
+        limits,
+    )
+    .await?;
+    checkout(job, runner, trace, dirs, limits).await?;
+    run_hook(
+        job,
+        "post_get_sources_script",
+        &dirs.project,
+        runner,
+        trace,
+        limits,
+    )
+    .await
+}
 
+/// Run the lines of hook `name` (see `hook_lines`) in `dir`; a failing hook fails the job
+async fn run_hook(
+    job: &Job,
+    name: &str,
+    dir: &str,
+    runner: &dyn ScriptRunner,
+    trace: &mut TraceWriter<'_>,
+    limits: &Limits<'_>,
+) -> std::result::Result<(), RunError> {
+    let lines = hook_lines(job, name);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    trace.write(&format!("Running {}\n", name)).await;
+    match runner
+        .run(&script::step_script(&lines), dir, trace, limits)
+        .await
+    {
+        Ok(RunStatus::Exited(0)) => Ok(()),
+        Ok(RunStatus::Exited(code)) => Err(RunError::Failed(JobFailure {
+            reason: FailureReason::ScriptFailure,
+            exit_code: Some(code),
+            message: format!("{} failed with exit code {}", name, code),
+        })),
+        Ok(RunStatus::TimedOut) => Err(RunError::TimedOut),
+        Ok(RunStatus::Canceled) => Err(RunError::Canceled),
+        Err(e) => Err(RunError::Failed(JobFailure::system(format!("{:#}", e)))),
+    }
+}
+
+async fn checkout(
+    job: &Job,
+    runner: &dyn ScriptRunner,
+    trace: &mut TraceWriter<'_>,
+    dirs: &JobDirs,
+    limits: &Limits<'_>,
+) -> std::result::Result<(), RunError> {
     let Some(ref git_info) = job.git_info else {
         return Ok(());
     };
@@ -538,11 +581,12 @@ async fn get_sources(
     Ok(())
 }
 
-/// Lines of the job's `hooks:pre_get_sources_script`
-fn pre_get_sources_script(job: &Job) -> Vec<String> {
+/// Lines of hook `name` (e.g. `pre_get_sources_script`), from the job's
+/// `hooks:` and the runner's config (added to `hooks` by the daemon)
+fn hook_lines(job: &Job, name: &str) -> Vec<String> {
     job.hooks
         .iter()
-        .filter(|hook| hook["name"] == "pre_get_sources_script")
+        .filter(|hook| hook["name"] == name)
         .filter_map(|hook| hook["script"].as_array())
         .flatten()
         .filter_map(|line| line.as_str().map(str::to_string))
@@ -637,7 +681,7 @@ impl DockerExecutor {
     pub fn new(config: DockerConfig) -> Result<Self> {
         let docker =
             Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
-        config.memory_bytes()?;
+        config.validate()?;
 
         Ok(Self {
             docker: Arc::new(docker),
@@ -749,7 +793,8 @@ impl DockerExecutor {
         write_variable_files(&env)
             .await
             .map_err(JobFailure::system)?;
-        tokio::fs::create_dir_all(job_dir.join("project"))
+        let subdir = script::project_subdir(job).map_err(JobFailure::system)?;
+        tokio::fs::create_dir_all(job_dir.join(&subdir))
             .await
             .map_err(|e| JobFailure::system(format!("Failed to create host workspace: {}", e)))?;
 
@@ -763,15 +808,35 @@ impl DockerExecutor {
             containers.helper = Some(id);
         }
 
+        let volumes = self
+            .job_volumes(job)
+            .await
+            .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+        // Services from the runner config come first, then the job's own
+        let services: Vec<crate::gitlab::Service> = self
+            .config
+            .services
+            .iter()
+            .map(|s| crate::gitlab::Service {
+                name: s.name.clone(),
+                alias: s.alias.clone(),
+                entrypoint: s.entrypoint.clone(),
+                command: s.command.clone(),
+                pull_policy: Vec::new(),
+                variables: Vec::new(),
+            })
+            .chain(job.services.iter().cloned())
+            .collect();
+
         // Services need a network of their own to be reachable by alias
-        if !job.services.is_empty() {
+        if !services.is_empty() {
             let network = format!("turboci-job-{}", job.id);
             self.create_network(&network)
                 .await
                 .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
             containers.network = Some(network);
         }
-        for (index, service) in job.services.iter().enumerate() {
+        for (index, service) in services.iter().enumerate() {
             let service_image = expand(&service.name);
             trace
                 .write(&format!("Starting service {} ...\n", service_image))
@@ -781,11 +846,12 @@ impl DockerExecutor {
             let id = self
                 .create_service(
                     job,
-                    index,
+                    &format!("turboci-job-{}-svc-{}", job.id, index),
                     &service_image,
                     service,
                     &values,
-                    containers.network.as_deref(),
+                    // Configured volumes too, e.g. /certs/client for docker:dind with TLS
+                    self.host_config(volumes.clone(), containers.network.as_deref()),
                 )
                 .await
                 .map_err(|e| JobFailure::system(format!("service {}: {:#}", service.name, e)))?;
@@ -818,7 +884,7 @@ impl DockerExecutor {
             host_config: Some(
                 self.host_config(
                     std::iter::once(format!("{}:/builds", job_dir.display()))
-                        .chain(self.config.volumes.iter().cloned())
+                        .chain(volumes.iter().cloned())
                         .collect(),
                     containers.network.as_deref(),
                 ),
@@ -851,7 +917,7 @@ impl DockerExecutor {
         };
         let dirs = JobDirs {
             builds: "/builds".to_string(),
-            project: "/builds/project".to_string(),
+            project: format!("/builds/{}", subdir),
         };
         run_job_steps(job, &sources, &runner, trace, &dirs, restore).await
     }
@@ -895,9 +961,69 @@ impl DockerExecutor {
             privileged: Some(self.config.privileged),
             // Validated when the executor is created
             memory: self.config.memory_bytes().ok().flatten(),
+            memory_swap: self.config.memory_swap_bytes().ok().flatten(),
+            memory_reservation: self.config.memory_reservation_bytes().ok().flatten(),
+            shm_size: self.config.shm_size_bytes().ok().flatten(),
+            oom_score_adj: self.config.oom_score_adjust,
             nano_cpus: self.config.cpus.map(|cpus| (cpus * 1e9) as i64),
             ..Default::default()
         }
+    }
+
+    /// Binds for `volumes`: `host:container[:mode]` entries as they are, and a
+    /// bare container path (e.g. "/cache") as a volume that persists between
+    /// the project's jobs, like gitlab-runner's cache volumes. Each concurrent
+    /// slot of a project gets its own, so parallel jobs do not share one.
+    async fn job_volumes(&self, job: &Job) -> Result<Vec<String>> {
+        let project = job.job_info.as_ref().map_or(0, |info| info.project_id);
+        let slot = variable_value(job, "CI_CONCURRENT_PROJECT_ID").unwrap_or("0");
+        let mut binds = Vec::new();
+        for volume in &self.config.volumes {
+            if volume.contains(':') {
+                binds.push(volume.clone());
+                continue;
+            }
+            let hash = blake3::hash(volume.as_bytes()).to_hex();
+            let name = format!("turboci-cache-p{}-c{}-{}", project, slot, &hash[..12]);
+            if self.docker.inspect_volume(&name).await.is_err() {
+                let mut labels = self.labels();
+                labels.insert("turboci.volume".to_string(), volume.clone());
+                self.docker
+                    .create_volume(bollard::models::VolumeCreateOptions {
+                        name: Some(name.clone()),
+                        labels: Some(labels),
+                        ..Default::default()
+                    })
+                    .await
+                    .with_context(|| format!("Failed to create volume for {}", volume))?;
+            }
+            binds.push(format!("{}:{}", name, volume));
+        }
+        Ok(binds)
+    }
+
+    /// Registry login for `image`, in gitlab-runner's order: the job's
+    /// DOCKER_AUTH_CONFIG, the runner's Docker config file, then the
+    /// credentials GitLab sent (its container registry)
+    fn registry_login(&self, image: &str, job: &Job) -> Option<(String, String)> {
+        if let Some(login) = variable_value(job, "DOCKER_AUTH_CONFIG")
+            .and_then(|config| image::docker_config_auth(config, image))
+        {
+            return Some(login);
+        }
+        let file = self.config.auth_config_file.clone().or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| format!("{}/.docker/config.json", home))
+        });
+        if let Some(login) = file
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .and_then(|config| image::docker_config_auth(&config, image))
+        {
+            return Some(login);
+        }
+        image::credentials_for(image, &job.credentials)
+            .map(|c| (c.username.clone(), c.password.clone()))
     }
 
     /// Make `image` available according to the pull policy, using the registry
@@ -945,10 +1071,10 @@ impl DockerExecutor {
         }
 
         trace.write(&format!("Pulling image {} ...\n", image)).await;
-        let credentials = image::credentials_for(image, &job.credentials).map(|c| {
+        let credentials = self.registry_login(image, job).map(|(username, password)| {
             bollard::auth::DockerCredentials {
-                username: Some(c.username.clone()),
-                password: Some(c.password.clone()),
+                username: Some(username),
+                password: Some(password),
                 serveraddress: Some(image::registry(image).to_string()),
                 ..Default::default()
             }
@@ -1001,36 +1127,38 @@ impl DockerExecutor {
     async fn create_service(
         &self,
         job: &Job,
-        index: usize,
+        name: &str,
         image: &str,
         service: &crate::gitlab::Service,
         values: &std::collections::HashMap<String, String>,
-        network: Option<&str>,
+        host_config: HostConfig,
     ) -> Result<String> {
         use bollard::models::{EndpointSettings, NetworkingConfig};
 
         let aliases = image::service_aliases(image, service.alias.as_deref());
-        let networking_config = network.map(|network| NetworkingConfig {
-            endpoints_config: Some(std::collections::HashMap::from([(
-                network.to_string(),
-                EndpointSettings {
-                    aliases: Some(aliases),
-                    ..Default::default()
-                },
-            )])),
-        });
+        // Services run on the job's network, reachable there by their aliases
+        let networking_config = host_config
+            .network_mode
+            .clone()
+            .map(|network| NetworkingConfig {
+                endpoints_config: Some(std::collections::HashMap::from([(
+                    network,
+                    EndpointSettings {
+                        aliases: Some(aliases),
+                        ..Default::default()
+                    },
+                )])),
+            });
         let config = ContainerCreateBody {
             image: Some(image.to_string()),
             env: Some(script::service_env(job, &service.variables, values)),
             entrypoint: service.entrypoint.clone(),
             cmd: service.command.clone(),
-            // Configured volumes too, e.g. /certs/client for docker:dind with TLS
-            host_config: Some(self.host_config(self.config.volumes.clone(), network)),
+            host_config: Some(host_config),
             networking_config,
             ..Default::default()
         };
-        self.create_named(&format!("turboci-job-{}-svc-{}", job.id, index), config)
-            .await
+        self.create_named(name, config).await
     }
 
     /// Wait until the services' exposed TCP ports accept connections, like
@@ -1463,7 +1591,10 @@ impl ShellExecutor {
         let job_dir = self.job_dir(job.id);
         let dirs = JobDirs {
             builds: job_dir.to_string_lossy().into_owned(),
-            project: job_dir.join("project").to_string_lossy().into_owned(),
+            project: job_dir
+                .join(script::project_subdir(job).map_err(JobFailure::system)?)
+                .to_string_lossy()
+                .into_owned(),
         };
         tokio::fs::create_dir_all(&dirs.project)
             .await
@@ -1864,6 +1995,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_clone_path_moves_the_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 14, "token": "t",
+            "variables": [
+                {"key": "CI_PROJECT_PATH", "value": "group/app"},
+                {"key": "GIT_CLONE_PATH", "value": "$CI_BUILDS_DIR/$CI_PROJECT_PATH"}
+            ],
+            "steps": steps(&["echo \"dir=$PWD project=${CI_PROJECT_DIR#$CI_BUILDS_DIR/}\""], &[])
+        }));
+        let (outcome, log) = run_shell(&j, dir.path()).await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(
+            log.contains("/job-14/group/app project=group/app"),
+            "{}",
+            log
+        );
+
+        let bad = job(serde_json::json!({
+            "id": 15, "token": "t",
+            "variables": [{"key": "GIT_CLONE_PATH", "value": "/etc"}],
+            "steps": steps(&["echo never"], &[])
+        }));
+        let (outcome, log) = run_shell(&bad, dir.path()).await;
+        assert!(outcome.is_err(), "{}", log);
+        assert!(!log.contains("\nnever"), "{}", log);
+    }
+
+    #[tokio::test]
     async fn allow_failure_step_does_not_fail_job() {
         let dir = tempfile::tempdir().unwrap();
         let j = job(serde_json::json!({
@@ -2002,6 +2162,88 @@ mod tests {
             .await
             .is_err());
         executor.cleanup(job_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_runner_services_shm_and_persistent_volumes() {
+        use crate::runner_daemon::config::ServiceConfig;
+
+        let owner = format!("test-volumes-{}", std::process::id());
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                shm_size: Some("256m".to_string()),
+                volumes: vec!["/persist".to_string()],
+                services: vec![ServiceConfig {
+                    name: "redis:7-alpine".to_string(),
+                    alias: Some("runnercache".to_string()),
+                    ..ServiceConfig::default()
+                }],
+                ..DockerConfig::default()
+            })
+            .unwrap()
+            .with_owner(&owner),
+        );
+        let project = 900_000 + u64::from(std::process::id());
+        let run = |id: u64, script: &'static [&'static str]| {
+            job(serde_json::json!({
+                "id": id, "token": "t",
+                "job_info": {"name": "t", "stage": "test", "project_id": project, "project_name": "p"},
+                "image": {"name": "redis:7-alpine"},
+                "steps": steps(script, &[])
+            }))
+        };
+        let first_id = 980_000_000 + u64::from(std::process::id());
+        let first = run(
+            first_id,
+            &[
+                "for i in $(seq 1 20); do redis-cli -h runnercache ping >/dev/null 2>&1 && break; sleep 0.5; done",
+                "echo \"runner-service $(redis-cli -h runnercache ping)\"",
+                "echo \"shm $(df -k /dev/shm | awk 'NR==2{print $2}')\"",
+                "echo kept > /persist/marker",
+            ],
+        );
+        let second = run(first_id + 1, &["echo \"persisted $(cat /persist/marker)\""]);
+
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut log = String::new();
+        for j in [&first, &second] {
+            let mut trace = TraceWriter::new(None, j.id, "t", &scrubber);
+            let outcome = executor.execute(j, &mut trace, &NoRestore).await;
+            trace.finish().await;
+            assert!(outcome.is_ok(), "{:?}\n{}", outcome, trace.text());
+            log.push_str(&trace.text());
+            executor.cleanup(j.id).await;
+        }
+
+        assert!(log.contains("runner-service PONG"), "{}", log);
+        assert!(log.contains("shm 262144"), "{}", log);
+        assert!(log.contains("persisted kept"), "{}", log);
+
+        // The volume is labelled with the runner, so it can be found and removed
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let volumes = docker
+            .list_volumes(Some(bollard::volume::ListVolumesOptions {
+                filters: std::collections::HashMap::from([(
+                    "label".to_string(),
+                    vec![format!("{}={}", OWNER_LABEL, owner)],
+                )]),
+            }))
+            .await
+            .unwrap()
+            .volumes
+            .unwrap_or_default();
+        assert_eq!(volumes.len(), 1, "{:?}", volumes);
+        for volume in volumes {
+            docker
+                .remove_volume(
+                    &volume.name,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2336,7 +2578,8 @@ mod tests {
         git(&project, &["commit", "-q", "-m", "init"]);
         std::fs::write(project.join("new.txt"), "n").unwrap();
 
-        let files = executor.untracked_files(job_id).await.unwrap();
+        let j = job(serde_json::json!({"id": job_id, "token": "t"}));
+        let files = executor.untracked_files(&j).await.unwrap();
 
         executor.cleanup(job_id).await;
         assert_eq!(files, vec!["new.txt".to_string()]);
