@@ -442,6 +442,9 @@ impl RunnerDaemon {
         let mut failure = None;
         // Paths, exclude patterns and names may use variables
         let variables = job_variables(job);
+        let untracked = self
+            .untracked_if_needed(job, job_artifacts.iter().any(|a| a.untracked), trace)
+            .await;
         let expand_all = |items: &[String]| -> Vec<String> {
             items
                 .iter()
@@ -456,7 +459,11 @@ impl RunnerDaemon {
                 Some("on_failure") => !succeeded,
                 _ => succeeded,
             };
-            if !wanted || artifact.paths.is_empty() {
+            let mut paths = expand_all(&artifact.paths);
+            if artifact.untracked {
+                paths.extend(untracked.iter().cloned());
+            }
+            if !wanted || paths.is_empty() {
                 continue;
             }
             let name = artifact
@@ -478,7 +485,7 @@ impl RunnerDaemon {
             // Staged next to the workspace (same disk, not a possibly RAM-backed /tmp)
             let result = match artifacts::create_archive(
                 &workspace.to_string_lossy(),
-                &expand_all(&artifact.paths),
+                &paths,
                 &expand_all(&artifact.exclude),
                 format,
                 &self.executor.job_dir(job.id),
@@ -532,6 +539,31 @@ impl RunnerDaemon {
         failure.map_or(Ok(()), Err)
     }
 
+    /// Untracked files as literal path patterns, when some entry asks for them
+    async fn untracked_if_needed(
+        &self,
+        job: &Job,
+        wanted: bool,
+        trace: &mut TraceWriter<'_>,
+    ) -> Vec<String> {
+        if !wanted {
+            return Vec::new();
+        }
+        match self.executor.untracked_files(job.id).await {
+            // File names are matched literally, not as glob patterns
+            Ok(files) => files.iter().map(|f| glob::Pattern::escape(f)).collect(),
+            Err(e) => {
+                trace
+                    .write(&format!(
+                        "WARNING: Could not list untracked files: {:#}\n",
+                        e
+                    ))
+                    .await;
+                Vec::new()
+            }
+        }
+    }
+
     /// Save cache entries whose policy pushes and whose `when` matches the result
     async fn upload_cache(&self, job: &Job, trace: &mut TraceWriter<'_>, succeeded: bool) {
         if !self.config.cache_enabled {
@@ -539,6 +571,11 @@ impl RunnerDaemon {
         }
         let workspace = self.executor.job_dir(job.id).join("project");
         let variables = job_variables(job);
+        let wants_untracked = job
+            .cache
+            .iter()
+            .any(|entry| entry.untracked.unwrap_or(false));
+        let untracked = self.untracked_if_needed(job, wants_untracked, trace).await;
 
         for cache_entry in &job.cache {
             let wanted = match cache_entry.when.as_deref() {
@@ -546,8 +583,16 @@ impl RunnerDaemon {
                 Some("on_failure") => !succeeded,
                 _ => succeeded,
             };
+            let mut paths: Vec<String> = cache_entry
+                .paths
+                .iter()
+                .map(|path| script::expand(path, &variables))
+                .collect();
+            if cache_entry.untracked.unwrap_or(false) {
+                paths.extend(untracked.iter().cloned());
+            }
             if !wanted
-                || cache_entry.paths.is_empty()
+                || paths.is_empty()
                 || (cache_entry.policy != "push" && cache_entry.policy != "pull-push")
             {
                 continue;
@@ -556,16 +601,7 @@ impl RunnerDaemon {
             trace.write(&format!("Saving cache {}...\n", key)).await;
             match self
                 .cache
-                .save(
-                    project_id(job),
-                    &key,
-                    &workspace.to_string_lossy(),
-                    &cache_entry
-                        .paths
-                        .iter()
-                        .map(|path| script::expand(path, &variables))
-                        .collect::<Vec<_>>(),
-                )
+                .save(project_id(job), &key, &workspace.to_string_lossy(), &paths)
                 .await
             {
                 Ok(Some(size)) => {
@@ -881,6 +917,66 @@ mod tests {
             trace
         );
         assert!(trace.contains("from-main"), "{}", trace);
+    }
+
+    #[tokio::test]
+    async fn untracked_artifacts_contain_files_git_does_not_track() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let origin = dir.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("README"), "tracked").unwrap();
+        std::fs::write(origin.join(".gitignore"), "*.log").unwrap();
+        git(&origin, &["add", "README", ".gitignore"]);
+        git(&origin, &["commit", "-q", "-m", "init"]);
+        let sha = git(&origin, &["rev-parse", "HEAD"]);
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 111, "token": "t",
+            "git_info": {"repo_url": format!("file://{}", origin.display()), "ref": "main",
+                         "ref_type": "branch", "sha": sha, "before_sha": "",
+                         "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]},
+            "steps": [{"name": "script", "when": "on_success",
+                       "script": ["mkdir -p sub", "echo out > build.out", "echo gen > 'sub/gen [1].txt'", "echo log > debug.log"]}],
+            "artifacts": [{"name": "untracked", "untracked": true}]
+        }))
+        .unwrap();
+
+        daemon.execute_job(job).await.unwrap();
+
+        assert_eq!(final_update(&server, 111).await["state"], "success");
+        let uploads = requests(&server, "POST", 111).await;
+        assert_eq!(uploads.len(), 1, "{}", trace_of(&server, 111).await);
+        let body = String::from_utf8_lossy(&uploads[0].body);
+        assert!(body.contains("build.out"));
+        assert!(
+            body.contains("sub/gen [1].txt"),
+            "glob characters in names are literal"
+        );
+        assert!(
+            body.contains("debug.log"),
+            "ignored files are untracked too"
+        );
+        assert!(!body.contains("README"));
     }
 
     #[tokio::test]

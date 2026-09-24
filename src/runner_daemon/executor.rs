@@ -110,6 +110,52 @@ impl ExecutorType {
         self
     }
 
+    /// Files in the checked-out project that git does not track (including
+    /// ignored ones), relative to the project, for `artifacts:untracked` and
+    /// `cache:untracked`
+    pub async fn untracked_files(&self, job_id: u64) -> Result<Vec<String>> {
+        const LIST: &str = "git -c safe.directory='*' -C {dir} ls-files --others -z";
+        let output = match self {
+            ExecutorType::Docker(executor) => {
+                let job_dir = self.job_dir(job_id);
+                executor
+                    .run_helper(
+                        &format!("turboci-job-{}-untracked", job_id),
+                        &LIST.replace("{dir}", "/builds/project"),
+                        HostConfig {
+                            binds: Some(vec![format!("{}:/builds", job_dir.display())]),
+                            network_mode: Some("none".to_string()),
+                            ..Default::default()
+                        },
+                        true,
+                    )
+                    .await?
+            }
+            ExecutorType::Shell(_) => {
+                let project = self.job_dir(job_id).join("project");
+                let out = Command::new("git")
+                    .args(["-c", "safe.directory=*", "-C"])
+                    .arg(&project)
+                    .args(["ls-files", "--others", "-z"])
+                    .output()
+                    .await
+                    .context("Failed to run git")?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "git ls-files failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            }
+        };
+        Ok(output
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Remove what a previous run of this runner left behind
     pub async fn sweep_orphans(&self) {
         if let ExecutorType::Docker(executor) = self {
@@ -962,7 +1008,15 @@ impl DockerExecutor {
             .write("Waiting for services to be up and running (timeout 30 seconds)...\n")
             .await;
         match self
-            .run_on_network(job_id, network, &checks.join("\n"))
+            .run_helper(
+                &format!("turboci-job-{}-svc-wait", job_id),
+                &checks.join("\n"),
+                HostConfig {
+                    network_mode: Some(network.to_string()),
+                    ..Default::default()
+                },
+                false,
+            )
             .await
         {
             Ok(output) => trace.write(&output).await,
@@ -970,8 +1024,15 @@ impl DockerExecutor {
         }
     }
 
-    /// Run a shell script in a short-lived helper container on `network`
-    async fn run_on_network(&self, job_id: u64, network: &str, script: &str) -> Result<String> {
+    /// Run a shell script in a short-lived container of the helper image and
+    /// return its output (only stdout when `stdout_only`)
+    async fn run_helper(
+        &self,
+        name: &str,
+        script: &str,
+        host_config: HostConfig,
+        stdout_only: bool,
+    ) -> Result<String> {
         use bollard::container::{LogsOptions, StartContainerOptions, WaitContainerOptions};
 
         self.pull_if_missing(&self.config.helper_image).await?;
@@ -979,15 +1040,10 @@ impl DockerExecutor {
             image: Some(self.config.helper_image.clone()),
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
             cmd: Some(vec![script.to_string()]),
-            host_config: Some(HostConfig {
-                network_mode: Some(network.to_string()),
-                ..Default::default()
-            }),
+            host_config: Some(host_config),
             ..Default::default()
         };
-        let id = self
-            .create_named(&format!("turboci-job-{}-svc-wait", job_id), config)
-            .await?;
+        let id = self.create_named(name, config).await?;
         let result = async {
             self.docker
                 .start_container(&id, None::<StartContainerOptions<String>>)
@@ -1007,7 +1063,7 @@ impl DockerExecutor {
                 &id,
                 Some(LogsOptions::<String> {
                     stdout: true,
-                    stderr: true,
+                    stderr: !stdout_only,
                     ..Default::default()
                 }),
             );
@@ -2126,6 +2182,49 @@ mod tests {
         );
         assert!(log.contains("script-stopped"), "{}", log);
         executor.cleanup(job_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_lists_untracked_files_with_the_helper() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 970_000_000 + u64::from(std::process::id());
+        let project = executor.job_dir(job_id).join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&project, &["init", "-q"]);
+        std::fs::write(project.join("tracked"), "t").unwrap();
+        git(&project, &["add", "tracked"]);
+        git(&project, &["commit", "-q", "-m", "init"]);
+        std::fs::write(project.join("new.txt"), "n").unwrap();
+
+        let files = executor.untracked_files(job_id).await.unwrap();
+
+        executor.cleanup(job_id).await;
+        assert_eq!(files, vec!["new.txt".to_string()]);
     }
 
     #[test]
