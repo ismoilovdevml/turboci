@@ -31,29 +31,22 @@ Redis, no database, no helper daemon.
 
 ## How it works
 
-```mermaid
-sequenceDiagram
-    participant R as TurboCI
-    participant G as GitLab
-    participant D as Docker
-    R->>G: POST /jobs/request (every check_interval)
-    G-->>R: job payload (script, variables, artifacts, cache)
-    R->>D: helper container: git checkout
-    R->>R: restore cache, download dependency artifacts
-    R->>D: job container: run steps
-    R-->>G: PATCH /jobs/:id/trace (live log, masked)
-    R->>G: upload artifacts
-    R->>G: PUT /jobs/:id (success / failed)
-```
+![How TurboCI runs a job: it polls GitLab, checks out sources in a helper container, restores the cache, runs the steps in the job container next to its services, streams the log and uploads artifacts](assets/diagrams/how-it-works.svg)
 
-1. The runner asks GitLab for a job whenever it has a free slot (`concurrent`).
-2. Sources are checked out by a small helper container, so job images need no
-   `git`.
-3. Cache and dependency artifacts are restored into the workspace.
-4. Each step (`before_script` + `script`, then `after_script`) runs in the job
-   container; output streams to GitLab with secrets masked.
-5. Artifacts and cache are saved, the result is reported, and every container,
-   network and workspace of the job is removed.
+1. **Request.** Whenever it has a free slot (`concurrent`), the runner asks
+   GitLab for a job.
+2. **Payload.** GitLab answers with the script, variables, image, services,
+   cache and artifact settings.
+3. **Checkout.** A small helper container checks out the pipeline's exact
+   commit, so job images need no `git`.
+4. **Restore.** The cache and the artifacts of earlier jobs are put into the
+   workspace.
+5. **Run.** Each step runs in the job container; services are reachable by
+   their aliases on the job's own network.
+6. **Live log.** Output streams to GitLab while the job runs, with secrets
+   masked.
+7. **Finish.** Artifacts are uploaded, the cache is saved and the result is
+   reported. Every container, network and workspace of the job is removed.
 
 ## Status
 
