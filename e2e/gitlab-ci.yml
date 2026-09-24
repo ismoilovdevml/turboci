@@ -125,6 +125,18 @@ test:clone-path:
     - test "$CI_PROJECT_DIR" = "$CI_BUILDS_DIR/$CI_PROJECT_PATH"
     - test "$PWD" = "$CI_PROJECT_DIR" && test -f VERSION && echo "cloned into $CI_PROJECT_PATH"
 
+# A shell runner (tag E2E_SHELL_TAG) running the host tools E2E_SHELL_CHECK
+# needs, e.g. a mobile SDK in the service user's home
+test:shell-runner:
+  stage: test
+  rules:
+    - if: $E2E_SHELL_TAG
+  tags: [$E2E_SHELL_TAG]
+  script:
+    - echo "user=$(id -un) home=$HOME dir=$CI_PROJECT_DIR"
+    - test -f VERSION
+    - eval "$E2E_SHELL_CHECK"
+
 test:cancel:
   stage: test
   rules:

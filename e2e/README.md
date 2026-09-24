@@ -34,7 +34,8 @@ alias, masked/file/nested variables, a failing job with `after_script`, and
 2. Add project CI/CD variables `E2E_SECRET` (masked) and `E2E_FILE` (type: file).
    Set `E2E_DOCKER_IMAGE` to use another image with the docker CLI than
    `docker:27`. Set `E2E_PRIVATE_IMAGE` to an image of a private registry
-   (not yet on the host) to check registry logins.
+   (not yet on the host) to check registry logins. For a shell runner, set `E2E_SHELL_TAG`
+   to its tag and `E2E_SHELL_CHECK` to a command that needs the host's tools.
 3. Push `gitlab-ci.yml` as `.gitlab-ci.yml` together with `VERSION`.
 4. Expect every job to pass except `test:failure` (allowed to fail with exit
    code 3 after `after_script` runs). Run a pipeline with `E2E_CANCEL=1` and
