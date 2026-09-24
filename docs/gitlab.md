@@ -52,8 +52,8 @@ curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.s
   | sudo bash -s -- --url https://gitlab.example.com --token glrt-XXXX
 ```
 
-After a few seconds the runner is **online** under **Settings → CI/CD →
-Runners**, reporting its version and the `docker` (or `shell`) executor:
+After a few seconds the runner is **Online** under **Settings → CI/CD →
+Runners**, and its page lists the jobs it ran:
 
 ![The runner online in GitLab](assets/screenshots/runner-online.png)
 
