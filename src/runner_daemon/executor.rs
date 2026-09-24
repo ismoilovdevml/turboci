@@ -1909,7 +1909,7 @@ mod tests {
             "services": [{
                 "name": "redis:7-alpine",
                 "command": ["sh", "-c",
-                    "echo \"svc=$SVC_ONLY public=$PUBLIC_VAR secret=$SECRET_VAR\" > /shared/env.txt; sleep 3; exec redis-server"],
+                    "umask 022; echo \"svc=$SVC_ONLY public=$PUBLIC_VAR secret=$SECRET_VAR\" > /shared/env.txt; sleep 3; exec redis-server"],
                 "variables": [{"key": "SVC_ONLY", "value": "svc-value"}]
             }],
             // No retry loop: the runner must wait for the service's port
