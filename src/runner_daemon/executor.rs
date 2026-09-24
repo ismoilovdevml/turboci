@@ -667,6 +667,32 @@ impl std::fmt::Debug for DockerExecutor {
     }
 }
 
+/// TCP ports that show a service is up: its HEALTHCHECK_TCP_PORT, or its
+/// exposed TCP ports (lowest 20), as gitlab-runner checks them
+fn service_ports(config: Option<&bollard::models::ContainerConfig>) -> Vec<u16> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let health_check = config.env.iter().flatten().find_map(|entry| {
+        let (key, value) = entry.split_once('=')?;
+        key.eq_ignore_ascii_case("HEALTHCHECK_TCP_PORT")
+            .then(|| value.trim().parse::<u16>().ok())
+            .flatten()
+    });
+    if let Some(port) = health_check {
+        return vec![port];
+    }
+    let mut ports: Vec<u16> = config
+        .exposed_ports
+        .iter()
+        .flat_map(|ports| ports.keys())
+        .filter_map(|port| port.strip_suffix("/tcp")?.parse().ok())
+        .collect();
+    ports.sort_unstable();
+    ports.truncate(20);
+    ports
+}
+
 /// Containers and network created for one job, removed when it ends
 #[derive(Default)]
 struct JobContainers {
@@ -1188,20 +1214,27 @@ impl DockerExecutor {
                 .unwrap_or_default()
                 .trim_start_matches('/')
                 .to_string();
-            let ports = info
-                .config
-                .and_then(|config| config.exposed_ports)
-                .map(|ports| ports.into_keys().collect::<Vec<_>>())
-                .unwrap_or_default();
-            for port in ports.iter().filter_map(|p| p.strip_suffix("/tcp")) {
-                checks.push(format!(
-                    "i=0; until nc -z -w1 {host} {port}; do i=$((i+1)); \
-                     if [ $i -ge 30 ]; then echo \"WARNING: service {host}:{port} did not respond within 30s\"; break; fi; \
-                     sleep 1; done",
-                ));
+            let ports = service_ports(info.config.as_ref());
+            if ports.is_empty() {
+                continue;
             }
+            // Like gitlab-runner: the service is up once any of its ports
+            // accepts connections (docker:dind exposes 2376 for TLS even when
+            // it only listens on 2375). Services are checked in parallel.
+            let any_port = ports
+                .iter()
+                .map(|port| format!("nc -z -w1 {} {}", host, port))
+                .collect::<Vec<_>>()
+                .join(" || ");
+            checks.push(format!(
+                "( i=0; until {any_port}; do i=$((i+1)); \
+                 if [ $i -ge 30 ]; then echo \"WARNING: service {host} (port {ports}) did not respond within 30s\"; break; fi; \
+                 sleep 1; done ) &",
+                ports = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", "),
+            ));
         }
-        if checks.is_empty() {
+        checks.push("wait".to_string());
+        if checks.len() == 1 {
             return;
         }
         trace
@@ -2583,6 +2616,32 @@ mod tests {
 
         executor.cleanup(job_id).await;
         assert_eq!(files, vec!["new.txt".to_string()]);
+    }
+
+    #[test]
+    fn service_ports_follow_gitlab_runner() {
+        let config = |env: Vec<&str>, ports: &[&str]| bollard::models::ContainerConfig {
+            env: Some(env.into_iter().map(str::to_string).collect()),
+            exposed_ports: Some(
+                ports
+                    .iter()
+                    .map(|p| (p.to_string(), std::collections::HashMap::new()))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            service_ports(Some(&config(vec![], &["2376/tcp", "2375/tcp", "53/udp"]))),
+            vec![2375, 2376]
+        );
+        assert_eq!(
+            service_ports(Some(&config(
+                vec!["HEALTHCHECK_TCP_PORT=8080"],
+                &["80/tcp"]
+            ))),
+            vec![8080]
+        );
+        assert!(service_ports(None).is_empty());
     }
 
     #[test]

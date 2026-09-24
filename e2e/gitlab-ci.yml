@@ -5,6 +5,9 @@ default:
 variables:
   GREETING: "hello"
   NESTED: "${GREETING}-world"
+  # Image with the docker CLI for test:docker-build (a project variable can
+  # point it at a mirror)
+  E2E_DOCKER_IMAGE: "docker:27"
 
 stages: [build, test]
 
@@ -79,6 +82,38 @@ test:bash:
   script:
     - '[[ "$CI_COMMIT_REF_NAME" == main ]] && echo "bash syntax ok"'
     - arr=(a b c); echo "array=${arr[2]}"
+
+# Needs the runner setup of e2e/README.md: a Docker daemon service for every
+# job, a /cache volume, shm_size and an `environment` entry
+test:docker-build:
+  stage: test
+  image:
+    name: $E2E_DOCKER_IMAGE
+    entrypoint: [""]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    # Reaches the service too: the daemon listens without TLS on 2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker info --format 'daemon {{.ServerVersion}}'
+    - printf 'FROM scratch\nCOPY VERSION /VERSION\n' > Dockerfile.e2e
+    - docker build -q -f Dockerfile.e2e -t "e2e-build:$CI_PIPELINE_ID" .
+    - docker image inspect "e2e-build:$CI_PIPELINE_ID" --format 'built {{.Id}}'
+
+test:runner-config:
+  stage: test
+  script:
+    - test "$E2E_RUNNER_ENV" = "from-runner" && echo "runner environment ok"
+    - shm=$(df -k /dev/shm | awk 'NR==2 {print $2}'); test "$shm" -ge 1000000 && echo "shm ${shm}k"
+    - echo "$CI_JOB_ID" > /cache/e2e-last-job && echo "cache volume writable"
+
+test:clone-path:
+  stage: test
+  variables:
+    GIT_CLONE_PATH: $CI_BUILDS_DIR/$CI_PROJECT_PATH
+  script:
+    - test "$CI_PROJECT_DIR" = "$CI_BUILDS_DIR/$CI_PROJECT_PATH"
+    - test "$PWD" = "$CI_PROJECT_DIR" && test -f VERSION && echo "cloned into $CI_PROJECT_PATH"
 
 test:cancel:
   stage: test
