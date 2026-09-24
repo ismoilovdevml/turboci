@@ -36,6 +36,37 @@ fn attempts(job: &Job, key: &str) -> u32 {
         .clamp(1, 10)
 }
 
+/// Commit the binary was built from (set by CI builds), or the version
+fn revision() -> String {
+    option_env!("GITHUB_SHA")
+        .map(|sha| sha.chars().take(8).collect())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Platform in Go's naming, e.g. linux/amd64
+fn executable_arch() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "386",
+        other => other,
+    };
+    format!("{}/{}", std::env::consts::OS, arch)
+}
+
+/// First 9 characters of the runner token after its prefix (glrt-, t1_, ...):
+/// identifies the runner without revealing the token
+fn short_token(token: &str) -> String {
+    let mut rest = token
+        .strip_prefix("glrtr-")
+        .or_else(|| token.strip_prefix("glrt-"))
+        .unwrap_or(token);
+    if let [b't', b'1'..=b'3', b'_', ..] = rest.as_bytes() {
+        rest = &rest[3..];
+    }
+    rest.chars().take(9).collect()
+}
+
 /// Hands out CI_CONCURRENT_ID (lowest free slot on this runner) and
 /// CI_CONCURRENT_PROJECT_ID (lowest free slot among the project's jobs)
 #[derive(Default)]
@@ -398,14 +429,20 @@ impl RunnerDaemon {
             .lock()
             .map(|mut slots| slots.acquire(project))
             .unwrap_or_default();
+        // Variables the runner adds, as gitlab-runner does; the job's own come later
+        // and win
         for (key, value) in [
-            ("CI_CONCURRENT_ID", slot.0),
-            ("CI_CONCURRENT_PROJECT_ID", slot.1),
+            ("CI_CONCURRENT_ID", slot.0.to_string()),
+            ("CI_CONCURRENT_PROJECT_ID", slot.1.to_string()),
+            ("CI_RUNNER_VERSION", env!("CARGO_PKG_VERSION").to_string()),
+            ("CI_RUNNER_REVISION", revision()),
+            ("CI_RUNNER_EXECUTABLE_ARCH", executable_arch()),
+            ("CI_RUNNER_SHORT_TOKEN", short_token(&self.current_token())),
         ] {
             job.variables.insert(
                 0,
                 serde_json::from_value(serde_json::json!({
-                    "key": key, "value": value.to_string(), "public": true, "internal": true
+                    "key": key, "value": value, "public": true, "internal": true
                 }))
                 .expect("valid variable"),
             );
@@ -1290,6 +1327,14 @@ mod tests {
     }
 
     #[test]
+    fn short_token_skips_prefixes() {
+        assert_eq!(short_token("glrt-t1_AbCdEfGhIjKl"), "AbCdEfGhI");
+        assert_eq!(short_token("glrt-AbCdEfGhIjKl"), "AbCdEfGhI");
+        assert_eq!(short_token("t2_xyz"), "xyz");
+        assert!(executable_arch().contains('/'));
+    }
+
+    #[test]
     fn concurrency_slots_reuse_the_lowest_free_ids() {
         let mut slots = ConcurrencySlots::default();
         let a = slots.acquire(1);
@@ -1310,13 +1355,19 @@ mod tests {
         let job: Job = serde_json::from_value(serde_json::json!({
             "id": 121, "token": "t",
             "steps": [{"name": "script", "when": "on_success",
-                       "script": ["echo ids=$CI_CONCURRENT_ID/$CI_CONCURRENT_PROJECT_ID"]}]
+                       "script": ["echo ids=$CI_CONCURRENT_ID/$CI_CONCURRENT_PROJECT_ID runner=$CI_RUNNER_VERSION/$CI_RUNNER_SHORT_TOKEN"]}]
         }))
         .unwrap();
 
         daemon.execute_job(job).await.unwrap();
 
-        assert!(trace_of(&server, 121).await.contains("ids=0/0"));
+        let trace = trace_of(&server, 121).await;
+        assert!(trace.contains("ids=0/0"), "{}", trace);
+        assert!(
+            trace.contains(&format!("runner={}/test", env!("CARGO_PKG_VERSION"))),
+            "{}",
+            trace
+        );
     }
 
     #[tokio::test]

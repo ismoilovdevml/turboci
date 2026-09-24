@@ -127,16 +127,50 @@ pub fn checkout_commands(
         commands.push(git(&["checkout", "-q", "-f", &git_info.sha]));
     }
 
-    match submodule_strategy(variables) {
-        SubmoduleStrategy::None => {}
-        SubmoduleStrategy::Normal => {
-            commands.push(git(&["submodule", "sync"]));
-            commands.push(git(&["submodule", "update", "--init"]));
+    let recursive = match submodule_strategy(variables) {
+        SubmoduleStrategy::None => None,
+        SubmoduleStrategy::Normal => Some(false),
+        SubmoduleStrategy::Recursive => Some(true),
+    };
+    if let Some(recursive) = recursive {
+        // GIT_SUBMODULE_PATHS limits which submodules are updated; being
+        // pathspecs after "--" they can never be read as options
+        let paths: Vec<String> = variable(variables, "GIT_SUBMODULE_PATHS")
+            .map(|paths| paths.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default();
+        if paths.iter().any(|path| path == ":(exclude)") {
+            bail!(
+                "GIT_SUBMODULE_PATHS: invalid submodule pathspec {:?}",
+                paths
+            );
         }
-        SubmoduleStrategy::Recursive => {
-            commands.push(git(&["submodule", "sync", "--recursive"]));
-            commands.push(git(&["submodule", "update", "--init", "--recursive"]));
+        let with_paths = |mut args: Vec<String>| {
+            if !paths.is_empty() {
+                args.push("--".to_string());
+                args.extend(paths.iter().cloned());
+            }
+            args
+        };
+
+        commands.push(git(&["submodule", "init"]));
+        let mut sync = git(&["submodule", "sync"]);
+        let mut update = git(&["submodule", "update", "--init"]);
+        if recursive {
+            sync.push("--recursive".to_string());
+            update.push("--recursive".to_string());
         }
+        // GIT_SUBMODULE_DEPTH defaults to the depth of the main repository
+        let submodule_depth = variable(variables, "GIT_SUBMODULE_DEPTH")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(depth);
+        if submodule_depth > 0 {
+            update.push(format!("--depth={}", submodule_depth));
+        }
+        if let Some(flags) = variable(variables, "GIT_SUBMODULE_UPDATE_FLAGS") {
+            update.extend(flags.split_whitespace().map(str::to_string));
+        }
+        commands.push(with_paths(sync));
+        commands.push(with_paths(update));
     }
 
     Ok(commands)
@@ -336,6 +370,47 @@ mod tests {
                 "--recursive"
             ]
         );
+    }
+
+    #[test]
+    fn submodule_depth_flags_and_paths_follow_variables() {
+        let sha = "d".repeat(40);
+        let info = git_info("https://x/r.git", &sha, &[], Some(10));
+        let vars = [
+            var("GIT_SUBMODULE_STRATEGY", "normal"),
+            var("GIT_SUBMODULE_DEPTH", "1"),
+            var("GIT_SUBMODULE_UPDATE_FLAGS", "--remote --jobs 4"),
+            var("GIT_SUBMODULE_PATHS", "libs/a :(exclude)libs/b"),
+        ];
+
+        let cmds = checkout_commands(&info, &vars, "/w").unwrap();
+        let tail: Vec<String> = cmds.last().unwrap()[5..].to_vec();
+        assert_eq!(
+            tail,
+            [
+                "submodule",
+                "update",
+                "--init",
+                "--depth=1",
+                "--remote",
+                "--jobs",
+                "4",
+                "--",
+                "libs/a",
+                ":(exclude)libs/b"
+            ]
+        );
+        assert_eq!(cmds[cmds.len() - 3][5..], ["submodule", "init"]);
+
+        // Without GIT_SUBMODULE_DEPTH submodules use the repository depth
+        let cmds = checkout_commands(&info, &vars[..1], "/w").unwrap();
+        assert!(cmds.last().unwrap().contains(&"--depth=10".to_string()));
+
+        let bad = [
+            var("GIT_SUBMODULE_STRATEGY", "normal"),
+            var("GIT_SUBMODULE_PATHS", ":(exclude) libs/b"),
+        ];
+        assert!(checkout_commands(&info, &bad, "/w").is_err());
     }
 
     #[test]

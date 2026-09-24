@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::gitlab::Job;
 
@@ -81,6 +82,40 @@ pub struct RunnerVars {
     pub disposable: bool,
     /// PEM of a custom CA for the GitLab server, exposed as CI_SERVER_TLS_CA_FILE
     pub ca_pem: Option<String>,
+}
+
+/// Parse a Go duration ("90s", "10m", "1h30m", "1.5h", "250ms")
+pub fn parse_duration(text: &str) -> Option<Duration> {
+    if text == "0" {
+        return Some(Duration::ZERO);
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let mut total = 0f64;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let number_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let number: f64 = rest[..number_len].parse().ok()?;
+        rest = &rest[number_len..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let seconds = match &rest[..unit_len] {
+            "h" => 3600.0,
+            "m" => 60.0,
+            "s" => 1.0,
+            "ms" => 0.001,
+            "us" | "µs" => 0.000_001,
+            "ns" => 0.000_000_001,
+            _ => return None,
+        };
+        rest = &rest[unit_len..];
+        total += number * seconds;
+    }
+    Duration::try_from_secs_f64(total).ok()
 }
 
 /// Build the job environment.
@@ -229,6 +264,19 @@ pub fn expand(value: &str, values: &HashMap<String, String>) -> String {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn parses_go_durations() {
+        let secs = |text| parse_duration(text).map(|d| d.as_secs_f64());
+        assert_eq!(secs("90s"), Some(90.0));
+        assert_eq!(secs("1h30m"), Some(5400.0));
+        assert_eq!(secs("1.5h"), Some(5400.0));
+        assert_eq!(secs("250ms"), Some(0.25));
+        assert_eq!(secs("0"), Some(0.0));
+        for bad in ["", "10", "5x", "m", "-1s", "1h 30m"] {
+            assert_eq!(parse_duration(bad), None, "{:?}", bad);
+        }
+    }
 
     fn sh(script: &str, dir: &Path) -> (i32, String) {
         let out = Command::new("sh")

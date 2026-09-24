@@ -275,6 +275,11 @@ async fn run_job_steps(
         failure = restore.restore(job, trace).await.err();
     }
 
+    // RUNNER_SCRIPT_TIMEOUT caps the script steps within the job timeout
+    let script_timeout = stage_timeout(job, "RUNNER_SCRIPT_TIMEOUT", trace).await;
+    let script_deadline = script_timeout.map_or(deadline, |t| deadline.min(Instant::now() + t));
+    let after_script_timeout = stage_timeout(job, "RUNNER_AFTER_SCRIPT_TIMEOUT", trace).await;
+
     for step in &job.steps {
         if cancel.state() == RemoteState::Aborted {
             failure.get_or_insert_with(canceled);
@@ -311,10 +316,10 @@ async fn run_job_steps(
             let secs = u64::from(step.timeout);
             Limits {
                 deadline: Instant::now()
-                    + if secs > 0 {
-                        Duration::from_secs(secs)
-                    } else {
-                        DEFAULT_AFTER_SCRIPT_TIMEOUT
+                    + match after_script_timeout {
+                        Some(timeout) => timeout,
+                        None if secs > 0 => Duration::from_secs(secs),
+                        None => DEFAULT_AFTER_SCRIPT_TIMEOUT,
                     },
                 cancel: &cancel,
                 stop_at: RemoteState::Aborted,
@@ -327,7 +332,7 @@ async fn run_job_steps(
                 )
                 .await;
             Limits {
-                deadline,
+                deadline: script_deadline,
                 cancel: &cancel,
                 stop_at: RemoteState::Canceling,
             }
@@ -390,6 +395,25 @@ async fn run_job_steps(
     }
 
     failure.map_or(Ok(()), Err)
+}
+
+/// A stage timeout from a job variable (RUNNER_SCRIPT_TIMEOUT or
+/// RUNNER_AFTER_SCRIPT_TIMEOUT), in Go duration syntax like "10m" or "1h30m"
+async fn stage_timeout(job: &Job, key: &str, trace: &mut TraceWriter<'_>) -> Option<Duration> {
+    let raw = variable_value(job, key)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match script::parse_duration(raw) {
+        Some(timeout) if !timeout.is_zero() => Some(timeout),
+        Some(_) => None,
+        None => {
+            trace
+                .write(&format!("WARNING: Ignoring malformed {}: {:?}\n", key, raw))
+                .await;
+            None
+        }
+    }
 }
 
 enum RunError {
@@ -1794,6 +1818,30 @@ mod tests {
         assert!(log.contains("(attempt 1/3), retrying"), "{}", log);
         assert!(log.contains("(attempt 2/3), retrying"), "{}", log);
         assert!(!log.contains("attempt 3/3"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn runner_script_timeout_limits_the_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = job(serde_json::json!({
+            "id": 1, "token": "t",
+            "variables": [
+                {"key": "RUNNER_SCRIPT_TIMEOUT", "value": "1s"},
+                {"key": "RUNNER_AFTER_SCRIPT_TIMEOUT", "value": "bogus"}
+            ],
+            "steps": [
+                {"name": "script", "script": ["sleep 5"], "when": "on_success", "timeout": 3600},
+                {"name": "after_script", "script": ["echo after=$CI_JOB_STATUS"], "when": "always"}
+            ]
+        }));
+        let (outcome, text) = run_shell(&job, dir.path()).await;
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::JobExecutionTimeout
+        );
+        assert!(text.contains("after=failed"), "{}", text);
+        assert!(text.contains("Ignoring malformed RUNNER_AFTER_SCRIPT_TIMEOUT"));
     }
 
     #[tokio::test]
