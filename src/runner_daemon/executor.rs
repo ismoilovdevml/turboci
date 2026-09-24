@@ -98,6 +98,13 @@ impl ExecutorType {
         }
     }
 
+    /// Remove what a previous run of this runner left behind
+    pub async fn sweep_orphans(&self) {
+        if let ExecutorType::Docker(executor) = self {
+            executor.sweep_orphans().await;
+        }
+    }
+
     /// Remove the job's host directory
     pub async fn cleanup(&self, job_id: u64) {
         let dir = self.job_dir(job_id);
@@ -422,7 +429,13 @@ impl Utf8Decoder {
 pub struct DockerExecutor {
     docker: Arc<Docker>,
     config: DockerConfig,
+    /// Value of the `turboci.runner` label on every container and network this
+    /// runner creates, so leftovers of a crash can be found and removed
+    owner: String,
 }
+
+/// Label marking containers and networks with the runner that created them
+const OWNER_LABEL: &str = "turboci.runner";
 
 impl std::fmt::Debug for DockerExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -451,7 +464,59 @@ impl DockerExecutor {
         Ok(Self {
             docker: Arc::new(docker),
             config,
+            owner: "turboci".to_string(),
         })
+    }
+
+    /// Identify this runner (its system ID) in container and network labels
+    pub fn with_owner(mut self, owner: &str) -> Self {
+        self.owner = owner.to_string();
+        self
+    }
+
+    fn labels(&self) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([(OWNER_LABEL.to_string(), self.owner.clone())])
+    }
+
+    /// Remove containers and networks this runner left behind (crash, kill,
+    /// power loss); other runners on the same Docker host are not touched
+    pub async fn sweep_orphans(&self) {
+        use bollard::container::ListContainersOptions;
+        use bollard::network::ListNetworksOptions;
+
+        let filter = std::collections::HashMap::from([(
+            "label".to_string(),
+            vec![format!("{}={}", OWNER_LABEL, self.owner)],
+        )]);
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: filter.clone(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_or_default();
+        for container in containers {
+            if let Some(id) = container.id {
+                match self.force_remove(&id).await {
+                    Ok(()) => info!("🧹 Removed leftover container {}", id),
+                    Err(e) => warn!("Failed to remove leftover container {}: {}", id, e),
+                }
+            }
+        }
+        let networks = self
+            .docker
+            .list_networks(Some(ListNetworksOptions { filters: filter }))
+            .await
+            .unwrap_or_default();
+        for network in networks {
+            if let Some(name) = network.name {
+                if self.docker.remove_network(&name).await.is_ok() {
+                    info!("🧹 Removed leftover network {}", name);
+                }
+            }
+        }
     }
 
     async fn execute(
@@ -707,7 +772,19 @@ impl DockerExecutor {
             ..Default::default()
         });
         let mut stream = self.docker.create_image(options, None, credentials);
-        while let Some(progress) = stream.next().await {
+        let cancel = trace.cancel();
+        loop {
+            let progress = tokio::select! {
+                progress = stream.next() => progress,
+                _ = cancel.reached(RemoteState::Aborted) => {
+                    return Err(JobFailure {
+                        reason: FailureReason::JobCanceled,
+                        exit_code: None,
+                        message: "canceled".to_string(),
+                    });
+                }
+            };
+            let Some(progress) = progress else { break };
             if let Err(e) = progress {
                 return Err(pull_failure(format!(
                     "failed to pull image {}: {}",
@@ -725,6 +802,7 @@ impl DockerExecutor {
             .create_network(bollard::models::NetworkCreateRequest {
                 name: name.to_string(),
                 driver: Some("bridge".to_string()),
+                labels: Some(self.labels()),
                 ..Default::default()
             })
             .await
@@ -876,8 +954,13 @@ impl DockerExecutor {
     }
 
     /// Create a container under a fixed name, replacing a leftover one
-    async fn create_named(&self, name: &str, config: ContainerCreateBody) -> Result<String> {
+    async fn create_named(&self, name: &str, mut config: ContainerCreateBody) -> Result<String> {
         use bollard::container::{CreateContainerOptions, RemoveContainerOptions};
+
+        config
+            .labels
+            .get_or_insert_with(Default::default)
+            .extend(self.labels());
 
         let _ = self
             .docker
@@ -1776,6 +1859,68 @@ mod tests {
             "svc=svc-value public=pub secret=\n"
         );
         executor.cleanup(job_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_sweep_removes_only_own_leftovers() {
+        let owner = format!("sweep-test-{}", std::process::id());
+        let mine = DockerExecutor::new(DockerConfig::default())
+            .unwrap()
+            .with_owner(&owner);
+        let other = DockerExecutor::new(DockerConfig::default())
+            .unwrap()
+            .with_owner(&format!("{}-other", owner));
+        mine.pull_if_missing("alpine:3.20").await.unwrap();
+        let idle = |name: &str| ContainerCreateBody {
+            image: Some("alpine:3.20".to_string()),
+            cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+            labels: Some(std::collections::HashMap::from([(
+                "name".to_string(),
+                name.to_string(),
+            )])),
+            ..Default::default()
+        };
+        let leftover = mine
+            .create_named(&format!("{}-a", owner), idle("a"))
+            .await
+            .unwrap();
+        mine.create_network(&format!("{}-net", owner))
+            .await
+            .unwrap();
+        let foreign = other
+            .create_named(&format!("{}-b", owner), idle("b"))
+            .await
+            .unwrap();
+
+        mine.sweep_orphans().await;
+
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let gone = docker
+            .inspect_container(
+                &leftover,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .is_err();
+        let kept = docker
+            .inspect_container(
+                &foreign,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .is_ok();
+        let net_gone = docker
+            .inspect_network(
+                &format!("{}-net", owner),
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .is_err();
+        let _ = other.force_remove(&foreign).await;
+        assert!(gone, "own leftover container not removed");
+        assert!(net_gone, "own leftover network not removed");
+        assert!(kept, "another runner's container was removed");
     }
 
     #[test]

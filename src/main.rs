@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
                 runner_config.gitlab_url.clone(),
                 runner_config.runner_token.clone(),
             )
-            .with_system_id(system_id)
+            .with_system_id(system_id.clone())
             .with_executor(&runner_config.executor.executor_type);
 
             // Initialize executor based on config
@@ -151,9 +151,10 @@ async fn main() -> Result<()> {
                 }
                 "docker" => {
                     info!("🐳 Using Docker executor (isolated containers)");
-                    ExecutorType::Docker(DockerExecutor::new(
-                        runner_config.executor.docker.clone(),
-                    )?)
+                    ExecutorType::Docker(
+                        DockerExecutor::new(runner_config.executor.docker.clone())?
+                            .with_owner(&system_id),
+                    )
                 }
                 _ => {
                     return Err(anyhow::anyhow!(

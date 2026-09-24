@@ -417,6 +417,8 @@ WorkingDirectory=$STATE_DIR
 ExecStart=$INSTALL_DIR/$BIN_NAME runner-start -c $CONFIG_DIR/turboci-runner.toml
 Restart=always
 RestartSec=10
+# SIGTERM stops running jobs and reports them; give that time before SIGKILL
+TimeoutStopSec=180
 StandardOutput=journal
 StandardError=journal
 

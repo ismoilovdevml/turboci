@@ -166,6 +166,8 @@ impl RunnerDaemon {
         info!("   Check interval: {}s", self.config.check_interval);
         info!("   Cache enabled: {}", self.config.cache_enabled);
 
+        self.executor.sweep_orphans().await;
+
         let mut connected = false;
         loop {
             // Wait for a free slot; a shutdown interrupts only this wait and the
@@ -252,15 +254,18 @@ impl RunnerDaemon {
                 .execute(&job, &mut trace, &WorkspaceRestore(self))
                 .await;
         }
-        // An upload failure fails a job that otherwise succeeded (the next stage
-        // would miss its inputs); the job's own failure takes precedence
-        let uploaded = self
-            .upload_artifacts(&job, &mut trace, outcome.is_ok())
-            .await;
-        if outcome.is_ok() {
-            outcome = uploaded;
+        // Aborted jobs (runner shutdown, or gone from GitLab) upload nothing
+        if cancel.state() != RemoteState::Aborted {
+            // An upload failure fails a job that otherwise succeeded (the next
+            // stage would miss its inputs); the job's own failure takes precedence
+            let uploaded = self
+                .upload_artifacts(&job, &mut trace, outcome.is_ok())
+                .await;
+            if outcome.is_ok() {
+                outcome = uploaded;
+            }
+            self.upload_cache(&job, &mut trace, outcome.is_ok()).await;
         }
-        self.upload_cache(&job, &mut trace, outcome.is_ok()).await;
         self.executor.cleanup(job.id).await;
         heartbeat.abort();
 
@@ -373,14 +378,24 @@ impl RunnerDaemon {
                     dependency.id, dependency.name
                 ))
                 .await;
-            artifacts::download_and_extract_artifacts(
+            let cancel = trace.cancel();
+            let download = artifacts::download_and_extract_artifacts(
                 &self.gitlab,
                 dependency.id,
                 &dependency.token,
                 &workspace,
-            )
-            .await
-            .map_err(|e| JobFailure {
+            );
+            let result = tokio::select! {
+                result = download => result,
+                _ = cancel.reached(RemoteState::Aborted) => {
+                    return Err(JobFailure {
+                        reason: FailureReason::JobCanceled,
+                        exit_code: None,
+                        message: "canceled".to_string(),
+                    });
+                }
+            };
+            result.map_err(|e| JobFailure {
                 reason: FailureReason::ScriptFailure,
                 exit_code: None,
                 message: format!(
@@ -917,7 +932,7 @@ mod tests {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let daemon = daemon(&server, dir.path()).await;
-        let job = lifecycle_job(51, &["sleep 30"], "on_success");
+        let job = lifecycle_job(51, &["sleep 30"], "always");
         let handle = daemon.shutdown_handle();
         tokio::spawn(async move {
             sleep(Duration::from_millis(500)).await;
@@ -934,6 +949,10 @@ mod tests {
         assert!(trace_of(&server, 51)
             .await
             .contains("the runner is shutting down"));
+        assert!(
+            requests(&server, "POST", 51).await.is_empty(),
+            "aborted jobs upload nothing, even artifacts with when: always"
+        );
     }
 
     #[tokio::test]
