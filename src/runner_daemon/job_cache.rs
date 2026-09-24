@@ -12,16 +12,25 @@ use super::script;
 #[derive(Debug, Clone)]
 pub struct LocalCache {
     root: PathBuf,
+    /// Archives unused for longer are deleted; `None` keeps them forever
+    max_age: Option<std::time::Duration>,
 }
 
-/// Percent-encode a cache key into a single safe file name component
+/// Percent-encode a cache key into a single safe file name component; long keys
+/// are hashed so the name stays within file system limits
 fn encode_key(key: &str) -> String {
-    key.bytes()
+    let encoded: String = key
+        .bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => (b as char).to_string(),
             _ => format!("%{:02X}", b),
         })
-        .collect()
+        .collect();
+    if encoded.len() <= 200 {
+        encoded
+    } else {
+        format!("h-{}", blake3::hash(key.as_bytes()).to_hex())
+    }
 }
 
 /// Expand variables in a cache key; an empty key means `default`, as in GitLab
@@ -37,7 +46,35 @@ pub fn resolve_key(key: &str, variables: &HashMap<String, String>) -> String {
 
 impl LocalCache {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            max_age: None,
+        }
+    }
+
+    /// Delete archives not used for `days` days (0 keeps them forever)
+    pub fn with_max_age_days(mut self, days: u64) -> Self {
+        self.max_age = (days > 0).then(|| std::time::Duration::from_secs(days * 24 * 3600));
+        self
+    }
+
+    /// Remove archives of a project that were not used within `max_age`
+    fn evict(&self, dir: &Path) {
+        let Some(max_age) = self.max_age else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > max_age);
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     fn archive_path(&self, project_id: u64, key: &str) -> PathBuf {
@@ -69,6 +106,10 @@ impl LocalCache {
             let path = self.archive_path(project_id, key);
             match tokio::fs::read(&path).await {
                 Ok(data) => {
+                    // Mark the archive as used, so eviction keeps it
+                    if let Ok(file) = std::fs::File::options().append(true).open(&path) {
+                        let _ = file.set_modified(std::time::SystemTime::now());
+                    }
                     artifacts::extract_archive(data, workspace).await?;
                     return Ok(Some(key.clone()));
                 }
@@ -105,8 +146,16 @@ impl LocalCache {
             encode_key(key),
             uuid::Uuid::new_v4().simple()
         ));
-        tokio::fs::write(&tmp, &data).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        let written = async {
+            tokio::fs::write(&tmp, &data).await?;
+            tokio::fs::rename(&tmp, &path).await
+        }
+        .await;
+        if let Err(e) = written {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        self.evict(dir);
         Ok(Some(data.len()))
     }
 }
@@ -181,6 +230,44 @@ mod tests {
             .collect();
         assert_eq!(entries, vec!["%2E%2E%2F%2E%2E%2Fescaped.zip".to_string()]);
         assert!(!root.path().join("escaped.zip").exists());
+    }
+
+    #[test]
+    fn long_keys_are_hashed_into_short_file_names() {
+        let long = "k".repeat(1000);
+        let name = encode_key(&long);
+        assert!(name.starts_with("h-") && name.len() < 100, "{}", name);
+        assert_eq!(encode_key("main"), "main");
+    }
+
+    #[tokio::test]
+    async fn old_archives_are_evicted_on_save() {
+        let cache_root = tempdir().unwrap();
+        let cache = LocalCache::new(cache_root.path()).with_max_age_days(1);
+        let ws = tempdir().unwrap();
+        std::fs::write(ws.path().join("f"), b"x").unwrap();
+        let ws_path = ws.path().to_str().unwrap();
+
+        cache
+            .save(1, "stale", ws_path, &["f".to_string()])
+            .await
+            .unwrap();
+        let stale = cache.archive_path(1, "stale");
+        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        std::fs::File::options()
+            .append(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+
+        cache
+            .save(1, "fresh", ws_path, &["f".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!stale.exists(), "stale archive kept");
+        assert!(cache.archive_path(1, "fresh").exists());
     }
 
     #[test]

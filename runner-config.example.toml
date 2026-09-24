@@ -17,6 +17,8 @@ gitlab_url = "https://gitlab.com"
 cache_enabled = true
 # Local job cache (`cache:` in .gitlab-ci.yml), one directory per project
 cache_dir = "/var/lib/turboci/cache"
+# Cache archives not used for this many days are deleted (0 = keep forever)
+cache_max_age_days = 14
 
 # ===== EXECUTOR CONFIGURATION =====
 [executor]

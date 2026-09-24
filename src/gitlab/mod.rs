@@ -86,7 +86,7 @@ impl GitLabClient {
             client: crate::net::client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("HTTP client with the default TLS backend"),
             url,
             token,
             system_id: format!("r_{}", &Uuid::new_v4().simple().to_string()[..12]),

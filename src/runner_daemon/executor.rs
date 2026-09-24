@@ -965,6 +965,25 @@ impl DockerExecutor {
             .get_or_insert_with(Default::default)
             .extend(self.labels());
 
+        // A container with this name from another runner on the same Docker host
+        // (same job id, different GitLab) must not be killed
+        if let Ok(existing) = self
+            .docker
+            .inspect_container(
+                name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            let owner = existing
+                .config
+                .and_then(|config| config.labels)
+                .and_then(|labels| labels.get(OWNER_LABEL).cloned());
+            if owner.as_deref() != Some(self.owner.as_str()) {
+                anyhow::bail!("container name {} is used by another runner", name);
+            }
+        }
+
         let _ = self
             .docker
             .remove_container(

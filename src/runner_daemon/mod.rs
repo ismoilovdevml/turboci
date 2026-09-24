@@ -148,7 +148,8 @@ impl RunnerDaemon {
         }
 
         Self {
-            cache: job_cache::LocalCache::new(&config.cache_dir),
+            cache: job_cache::LocalCache::new(&config.cache_dir)
+                .with_max_age_days(config.cache_max_age_days),
             config: Arc::new(config),
             gitlab: Arc::new(gitlab),
             executor: Arc::new(executor),

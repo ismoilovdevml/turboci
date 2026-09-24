@@ -25,6 +25,8 @@ pub struct RunnerConfig {
     /// Directory of the local job cache (`cache:` in .gitlab-ci.yml)
     #[serde(default = "default_cache_dir")]
     pub cache_dir: String,
+    /// Cache archives not used for this many days are deleted (0 = keep forever)
+    pub cache_max_age_days: u64,
 
     /// Executor configuration
     pub executor: ExecutorConfig,
@@ -83,7 +85,10 @@ impl DockerConfig {
         let number: i64 = number
             .parse()
             .with_context(|| format!("executor.docker.memory: invalid value {:?}", memory))?;
-        Ok(Some(number * multiplier))
+        let bytes = number
+            .checked_mul(multiplier)
+            .with_context(|| format!("executor.docker.memory: {:?} is too large", memory))?;
+        Ok(Some(bytes))
     }
 }
 
@@ -140,6 +145,7 @@ impl Default for RunnerConfig {
             gitlab_url: "https://gitlab.com".to_string(),
             cache_enabled: true,
             cache_dir: default_cache_dir(),
+            cache_max_age_days: 14,
             executor: ExecutorConfig::default(),
         }
     }
@@ -213,8 +219,11 @@ impl RunnerConfig {
         }
         let docker = &self.executor.docker;
         docker.memory_bytes()?;
-        if docker.cpus.is_some_and(|cpus| cpus <= 0.0) {
-            anyhow::bail!("executor.docker.cpus must be greater than 0");
+        if docker
+            .cpus
+            .is_some_and(|cpus| !cpus.is_finite() || cpus <= 0.0 || cpus > 1024.0)
+        {
+            anyhow::bail!("executor.docker.cpus must be a number between 0 and 1024");
         }
         for policy in std::iter::once(&docker.pull_policy).chain(&docker.allowed_pull_policies) {
             if !matches!(policy.as_str(), "always" | "if-not-present" | "never") {
@@ -344,6 +353,9 @@ mod tests {
             "runner_token = \"t\"\ncheck_interval = 0",
             "runner_token = \"t\"\ngitlab_url = \"gitlab.com\"",
             "runner_token = \"t\"\n[executor]\nexecutor_type = \"kubernetes\"",
+            "runner_token = \"t\"\n[executor.docker]\ncpus = nan",
+            "runner_token = \"t\"\n[executor.docker]\ncpus = inf",
+            "runner_token = \"t\"\n[executor.docker]\nmemory = \"99999999999g\"",
         ] {
             let config = RunnerConfig::parse(bad).unwrap();
             assert!(config.validate().is_err(), "accepted: {}", bad);

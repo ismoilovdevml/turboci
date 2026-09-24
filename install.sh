@@ -458,7 +458,13 @@ enable_service() {
 
     if [ -z "$RUNNER_TOKEN" ] || [ "$START_SERVICE" -eq 0 ]; then
         STARTED=0
-        echo -e "${YELLOW}ℹ️  Service NOT started${NC}"
+        if [ "$START_SERVICE" -eq 1 ] && systemctl is-active --quiet $SERVICE_NAME; then
+            # Upgrade of a configured runner: run the new binary
+            systemctl restart $SERVICE_NAME
+            echo -e "${GREEN}✓${NC} Running service restarted with the new binary"
+        else
+            echo -e "${YELLOW}ℹ️  Service NOT started${NC}"
+        fi
         return
     fi
 
