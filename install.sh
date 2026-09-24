@@ -531,9 +531,12 @@ enable_service() {
     if [ -z "$RUNNER_TOKEN" ] || [ "$START_SERVICE" -eq 0 ]; then
         STARTED=0
         if [ "$START_SERVICE" -eq 1 ] && systemctl is-active --quiet $SERVICE_NAME; then
-            # Upgrade of a configured runner: run the new binary
-            systemctl restart $SERVICE_NAME
-            echo -e "${GREEN}✓${NC} Running service restarted with the new binary"
+            # Upgrade of a configured runner. SIGQUIT lets running jobs finish
+            # (no new ones are taken); systemd then starts the new binary
+            # (Restart=always). A plain restart would fail running jobs.
+            systemctl kill -s SIGQUIT $SERVICE_NAME
+            echo -e "${GREEN}✓${NC} Service draining: running jobs finish, then it restarts with the new binary"
+            echo -e "   Follow it with: ${BLUE}journalctl -u $SERVICE_NAME -f${NC}"
         else
             echo -e "${YELLOW}ℹ️  Service NOT started${NC}"
         fi

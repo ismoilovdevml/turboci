@@ -1226,10 +1226,12 @@ impl DockerExecutor {
                 .map(|port| format!("nc -z -w1 {} {}", host, port))
                 .collect::<Vec<_>>()
                 .join(" || ");
+            // Polled every 0.2s (150 tries = 30s): a service that is ready
+            // after 1.1s must not hold the job until the next full second
             checks.push(format!(
                 "( i=0; until {any_port}; do i=$((i+1)); \
-                 if [ $i -ge 30 ]; then echo \"WARNING: service {host} (port {ports}) did not respond within 30s\"; break; fi; \
-                 sleep 1; done ) &",
+                 if [ $i -ge 150 ]; then echo \"WARNING: service {host} (port {ports}) did not respond within 30s\"; break; fi; \
+                 sleep 0.2; done ) &",
                 ports = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", "),
             ));
         }
