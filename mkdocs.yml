@@ -37,7 +37,6 @@ nav:
       - Configuration: configuration.md
       - Pipeline support: pipelines.md
       - Operations: operations.md
-  - Benchmarks: benchmarks.md
 
 markdown_extensions:
   - admonition

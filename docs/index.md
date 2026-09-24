@@ -20,10 +20,11 @@ Redis, no database, no helper daemon.
     Artifacts, cache, services, `needs`, masked variables, cancellation and
     timeouts behave as on gitlab-runner. [Pipeline support →](pipelines.md)
 
-- **Small footprint**
+- **One small binary**
 
-    11 MB of memory while idle against 88 MB for gitlab-runner, and 19%
-    faster pipelines on the same host. [Benchmarks →](benchmarks.md)
+    A static Linux binary with no external services. It runs next to
+    gitlab-runner on the same host and Docker daemon without touching its
+    containers. [Operations →](operations.md)
 
 </div>
 

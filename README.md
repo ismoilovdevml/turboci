@@ -7,16 +7,6 @@ single static binary with no external services: no Redis, no database.
 
 **Documentation:** https://ismoilovdevml.github.io/turboci/
 
-| | TurboCI 0.6.0 | gitlab-runner 18.5.0 |
-|---|---:|---:|
-| Pipeline duration (5 jobs, median of 16) | **9.6 s** | 11.9 s |
-| Memory while idle | **10.8 MB** | 87.9 MB |
-| Binary size | **11.5 MB** | 92.0 MB |
-
-Same host, same GitLab, same settings; see the
-[benchmarks](https://ismoilovdevml.github.io/turboci/benchmarks/) for the
-setup and how to reproduce them.
-
 ## ✅ What is supported
 
 - **Executors:** `docker` (one container per job) and `shell`
