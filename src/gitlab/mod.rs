@@ -379,6 +379,55 @@ impl GitLabClient {
         .await
     }
 
+    /// Check the runner token; returns when it expires (unix seconds), `None`
+    /// for a token that does not expire
+    pub async fn verify_runner(&self, runner_token: &str) -> Result<Option<i64>> {
+        let response = self
+            .client
+            .post(format!("{}/api/v4/runners/verify", self.url))
+            .json(&serde_json::json!({ "token": runner_token, "system_id": self.system_id }))
+            .send()
+            .await
+            .context("Failed to verify the runner token")?;
+        match response.status() {
+            StatusCode::OK | StatusCode::CREATED => {}
+            StatusCode::FORBIDDEN => anyhow::bail!("GitLab rejected the runner token"),
+            status => anyhow::bail!("Runner verification failed: {}", status),
+        }
+        let body: TokenResponse = response
+            .json()
+            .await
+            .context("Invalid runner verification response")?;
+        body.expires_at()
+    }
+
+    /// Replace the runner token with a new one; the old token stops working
+    pub async fn reset_runner_token(&self, runner_token: &str) -> Result<(String, Option<i64>)> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/v4/runners/reset_authentication_token",
+                self.url
+            ))
+            .json(&serde_json::json!({ "token": runner_token }))
+            .send()
+            .await
+            .context("Failed to reset the runner token")?;
+        if response.status() != StatusCode::CREATED && response.status() != StatusCode::OK {
+            anyhow::bail!("Runner token reset failed: {}", response.status());
+        }
+        let body: TokenResponse = response
+            .json()
+            .await
+            .context("Invalid runner token reset response")?;
+        let token = body
+            .token
+            .clone()
+            .filter(|token| !token.is_empty())
+            .context("GitLab returned no new runner token")?;
+        Ok((token, body.expires_at()?))
+    }
+
     /// Tell GitLab the job is still running (a keep-alive for jobs with no new
     /// output) and learn whether it has been canceled meanwhile
     pub async fn touch_job(&self, job_id: u64, token: &str) -> Result<RemoteState> {
@@ -828,6 +877,27 @@ pub struct RetryConfig {
 /// Timeout for artifact transfers (the client default of 30s is for API calls)
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// Body of the runner verify and token reset responses
+#[derive(Deserialize)]
+struct TokenResponse {
+    token: Option<String>,
+    token_expires_at: Option<String>,
+}
+
+impl TokenResponse {
+    fn expires_at(&self) -> Result<Option<i64>> {
+        self.token_expires_at
+            .as_deref()
+            .filter(|at| !at.is_empty())
+            .map(|at| {
+                chrono::DateTime::parse_from_rfc3339(at)
+                    .map(|at| at.timestamp())
+                    .with_context(|| format!("Invalid token_expires_at {:?}", at))
+            })
+            .transpose()
+    }
+}
+
 /// An error that retrying cannot fix (4xx responses)
 #[derive(Debug)]
 struct Permanent(String);
@@ -1012,6 +1082,38 @@ mod tests {
 
     fn client(server: &MockServer) -> GitLabClient {
         GitLabClient::new(server.uri(), "runner-token".to_string())
+    }
+
+    #[tokio::test]
+    async fn verifies_and_resets_the_runner_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/runners/verify"))
+            .and(body_partial_json(serde_json::json!({"token": "glrt-old"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 67, "token": "glrt-old", "token_expires_at": "2026-10-01T00:00:00.000Z"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/runners/reset_authentication_token"))
+            .and(body_partial_json(serde_json::json!({"token": "glrt-old"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "glrt-new", "token_expires_at": null
+            })))
+            .mount(&server)
+            .await;
+        let gitlab = client(&server);
+
+        assert_eq!(
+            gitlab.verify_runner("glrt-old").await.unwrap(),
+            Some(1_790_812_800)
+        );
+        assert_eq!(
+            gitlab.reset_runner_token("glrt-old").await.unwrap(),
+            ("glrt-new".to_string(), None)
+        );
+        assert!(gitlab.verify_runner("glrt-unknown").await.is_err());
     }
 
     #[tokio::test]

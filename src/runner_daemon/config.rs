@@ -31,6 +31,8 @@ pub struct RunnerConfig {
     pub cache_dir: String,
     /// Cache archives not used for this many days are deleted (0 = keep forever)
     pub cache_max_age_days: u64,
+    /// Where the runner keeps state it must write, like a rotated runner token
+    pub state_dir: String,
 
     /// Executor configuration
     pub executor: ExecutorConfig,
@@ -151,6 +153,7 @@ impl Default for RunnerConfig {
             cache_enabled: true,
             cache_dir: default_cache_dir(),
             cache_max_age_days: 14,
+            state_dir: "/var/lib/turboci".to_string(),
             executor: ExecutorConfig::default(),
         }
     }

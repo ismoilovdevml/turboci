@@ -20,6 +20,7 @@ pub mod image;
 pub mod job_cache;
 pub mod script;
 pub mod system_id;
+pub mod token;
 pub mod trace;
 
 /// Retry count for a transfer, from a job variable such as
@@ -177,10 +178,15 @@ pub struct RunnerDaemon {
     gitlab: Arc<GitLabClient>,
     executor: Arc<executor::ExecutorType>,
     semaphore: Arc<Semaphore>,
-    scrubber: Arc<SecretScrubber>,
+    scrubber: Arc<std::sync::RwLock<SecretScrubber>>,
     shutdown: Arc<watch::Sender<Shutdown>>,
     heartbeat_interval: Duration,
     slots: Arc<std::sync::Mutex<ConcurrencySlots>>,
+    /// The runner token in use: the config's, or the one it was rotated to
+    runner_token: Arc<std::sync::RwLock<String>>,
+    tokens: Arc<token::TokenStore>,
+    /// Held while a token is reset and saved, so shutdown never cuts it short
+    rotating: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RunnerDaemon {
@@ -191,8 +197,18 @@ impl RunnerDaemon {
     ) -> Self {
         let concurrent = config.concurrent as usize;
 
+        let tokens = token::TokenStore::new(&config.state_dir, &config.runner_token);
+        let runner_token = match tokens.load() {
+            Some(stored) => {
+                info!("   Using the rotated runner token from {:?}", tokens.path());
+                stored.token
+            }
+            None => config.runner_token.clone(),
+        };
+
         // Create secret scrubber with runner token
         let mut scrubber = SecretScrubber::new(vec![config.runner_token.clone()]);
+        scrubber.add_secret(runner_token.clone());
 
         // Add GitLab URL as potential secret location
         if config.gitlab_url.contains('@') {
@@ -206,10 +222,13 @@ impl RunnerDaemon {
             gitlab: Arc::new(gitlab),
             executor: Arc::new(executor),
             semaphore: Arc::new(Semaphore::new(concurrent)),
-            scrubber: Arc::new(scrubber),
+            scrubber: Arc::new(std::sync::RwLock::new(scrubber)),
             shutdown: Arc::new(watch::Sender::new(Shutdown::Running)),
             heartbeat_interval: HEARTBEAT_INTERVAL,
             slots: Arc::default(),
+            runner_token: Arc::new(std::sync::RwLock::new(runner_token)),
+            tokens: Arc::new(tokens),
+            rotating: Arc::default(),
         }
     }
 
@@ -230,6 +249,7 @@ impl RunnerDaemon {
         info!("   Cache enabled: {}", self.config.cache_enabled);
 
         self.executor.sweep_orphans().await;
+        let rotation = AbortOnDrop(tokio::spawn(self.clone().rotate_token()));
 
         let mut connected = false;
         loop {
@@ -239,7 +259,7 @@ impl RunnerDaemon {
                 permit = self.semaphore.clone().acquire_owned() => permit?,
                 _ = self.shutdown_requested() => break,
             };
-            let claimed = claim_with_permit(permit, &self.gitlab, &self.config.runner_token).await;
+            let claimed = claim_with_permit(permit, &self.gitlab, &self.current_token()).await;
             if claimed.is_ok() && !connected {
                 connected = true;
                 info!(
@@ -281,8 +301,92 @@ impl RunnerDaemon {
 
         info!("⏳ Waiting for running jobs to finish...");
         let _ = self.semaphore.acquire_many(self.config.concurrent).await;
+        // Let a token reset in flight be saved, or the new token would be lost
+        let _rotating = self.rotating.lock().await;
+        drop(rotation);
         info!("✅ Runner stopped");
         Ok(())
+    }
+
+    fn current_token(&self) -> String {
+        self.runner_token
+            .read()
+            .map(|token| token.clone())
+            .unwrap_or_default()
+    }
+
+    /// Reset the runner token after 3/4 of its lifetime, as long as GitLab
+    /// gives it an expiry
+    async fn rotate_token(self) {
+        const RETRY: Duration = Duration::from_secs(10 * 60);
+
+        let mut expiry = self
+            .tokens
+            .load()
+            .and_then(|stored| Some((stored.obtained_at, stored.expires_at?)));
+        loop {
+            let (obtained_at, expires_at) = match expiry {
+                Some(expiry) => expiry,
+                None => match self.gitlab.verify_runner(&self.current_token()).await {
+                    Ok(Some(expires_at)) => (token::now(), expires_at),
+                    // The token does not expire: nothing to rotate
+                    Ok(None) => return,
+                    Err(e) => {
+                        tracing::debug!("Could not check the runner token expiry: {:#}", e);
+                        sleep(Duration::from_secs(60 * 60)).await;
+                        continue;
+                    }
+                },
+            };
+            expiry = Some((obtained_at, expires_at));
+            let wait = token::reset_time(obtained_at, expires_at) - token::now();
+            if wait > 0 {
+                info!(
+                    "Runner token expires at {}, resetting it at {}",
+                    token::display(expires_at),
+                    token::display(token::reset_time(obtained_at, expires_at))
+                );
+                sleep(Duration::from_secs(wait as u64)).await;
+            }
+
+            let _rotating = self.rotating.lock().await;
+            let old = self.current_token();
+            // GitLab invalidates the old token right away: only reset when the
+            // new one can be kept, or the runner would lose it on restart
+            if let Err(e) = self.tokens.save(&old, obtained_at, Some(expires_at)) {
+                error!(
+                    "Runner token expires at {} but cannot be rotated: {:#}. \
+                     Put a new token in the config before it expires.",
+                    token::display(expires_at),
+                    e
+                );
+                return;
+            }
+            match self.gitlab.reset_runner_token(&old).await {
+                Ok((new, new_expiry)) => {
+                    let now = token::now();
+                    if let Err(e) = self.tokens.save(&new, now, new_expiry) {
+                        error!("Failed to save the rotated runner token: {:#}", e);
+                    }
+                    if let Ok(mut scrubber) = self.scrubber.write() {
+                        scrubber.add_secret(new.clone());
+                    }
+                    if let Ok(mut token) = self.runner_token.write() {
+                        *token = new;
+                    }
+                    info!("🔑 Runner token rotated");
+                    match new_expiry {
+                        Some(expires_at) => expiry = Some((now, expires_at)),
+                        None => return,
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to reset the runner token: {:#}", e);
+                    drop(_rotating);
+                    sleep(RETRY).await;
+                }
+            }
+        }
     }
 
     /// Run a job end to end and always report a final state to GitLab
@@ -323,7 +427,10 @@ impl RunnerDaemon {
         info!("▶️  Starting job #{}: {}", job.id, job_name);
 
         // Mask the job token, dependency tokens and masked variables
-        let scrubber = self.scrubber.with_job_secrets(&job);
+        let scrubber = match self.scrubber.read() {
+            Ok(scrubber) => scrubber.with_job_secrets(&job),
+            Err(poisoned) => poisoned.into_inner().with_job_secrets(&job),
+        };
         let cancel = CancelSignal::default();
         let mut trace = TraceWriter::new(Some(&self.gitlab), job.id, &job.token, &scrubber)
             .with_cancel(cancel.clone());
@@ -844,6 +951,7 @@ mod tests {
             runner_token: "glrt-test".to_string(),
             gitlab_url: server.uri(),
             cache_dir: dir.join("cache").to_string_lossy().into_owned(),
+            state_dir: dir.to_string_lossy().into_owned(),
             ..config::RunnerConfig::default()
         };
         let executor = executor::ExecutorType::Shell(executor::ShellExecutor::new(Some(
@@ -1138,6 +1246,47 @@ mod tests {
             "ignored files are untracked too"
         );
         assert!(!body.contains("README"));
+    }
+
+    #[tokio::test]
+    async fn rotates_the_runner_token_before_it_expires() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let expires = chrono::Utc::now() + chrono::Duration::seconds(2);
+        Mock::given(method("POST"))
+            .and(path("/api/v4/runners/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "glrt-test", "token_expires_at": expires.to_rfc3339()
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/runners/reset_authentication_token"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"token": "glrt-test"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "glrt-rotated", "token_expires_at": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let runner = daemon(&server, dir.path()).await;
+
+        tokio::time::timeout(Duration::from_secs(10), runner.clone().rotate_token())
+            .await
+            .expect("rotation finishes once the new token does not expire");
+
+        assert_eq!(runner.current_token(), "glrt-rotated");
+        // A restart picks up the rotated token instead of the config's old one
+        let restarted = daemon(&server, dir.path()).await;
+        assert_eq!(restarted.current_token(), "glrt-rotated");
+        assert!(restarted
+            .scrubber
+            .read()
+            .unwrap()
+            .scrub("x glrt-rotated")
+            .contains("[MASKED]"));
     }
 
     #[test]
