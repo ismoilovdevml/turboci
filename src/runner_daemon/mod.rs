@@ -391,11 +391,13 @@ impl RunnerDaemon {
                 ))
                 .await;
             let cancel = trace.cancel();
+            let job_dir = self.executor.job_dir(job.id);
             let download = artifacts::download_and_extract_artifacts(
                 &self.gitlab,
                 dependency.id,
                 &dependency.token,
                 &workspace,
+                &job_dir,
             );
             let result = tokio::select! {
                 result = download => result,
@@ -465,11 +467,13 @@ impl RunnerDaemon {
                 ))
                 .await;
 
+            // Staged next to the workspace (same disk, not a possibly RAM-backed /tmp)
             let result = match artifacts::create_archive(
                 &workspace.to_string_lossy(),
                 &expand_all(&artifact.paths),
                 &expand_all(&artifact.exclude),
                 format,
+                &self.executor.job_dir(job.id),
             )
             .await
             {
@@ -479,7 +483,7 @@ impl RunnerDaemon {
                         .await;
                     continue;
                 }
-                Ok(Some(data)) => {
+                Ok(Some(archive)) => {
                     let extension = match format {
                         "gzip" => ".gz",
                         "zip" => ".zip",
@@ -490,7 +494,8 @@ impl RunnerDaemon {
                             job.id,
                             &job.token,
                             ArtifactUpload {
-                                data,
+                                path: archive.file.path().to_path_buf(),
+                                len: archive.len,
                                 file_name: format!("{}{}", name, extension),
                                 format: format.to_string(),
                                 artifact_type: artifact_type.to_string(),

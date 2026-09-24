@@ -6,26 +6,40 @@ use zip::{ZipArchive, ZipWriter};
 
 use crate::gitlab::GitLabClient;
 
-/// Download a dependency's artifacts archive and extract it into the workspace.
-/// Returns the archive size.
+/// An archive staged in a temporary file (archives are never held in memory)
+pub struct Archive {
+    pub file: tempfile::NamedTempFile,
+    pub len: u64,
+}
+
+/// Download a dependency's artifacts archive to a file in `staging_dir` and
+/// extract it into the workspace. Returns the archive size.
 pub async fn download_and_extract_artifacts(
     gitlab: &GitLabClient,
     job_id: u64,
     token: &str,
     workspace_path: &str,
-) -> Result<usize> {
-    let data = gitlab.download_artifacts(job_id, token).await?;
-    let size = data.len();
-    extract_archive(data, workspace_path).await?;
+    staging_dir: &Path,
+) -> Result<u64> {
+    let staged = tempfile::NamedTempFile::new_in(staging_dir)?;
+    let size = gitlab
+        .download_artifacts_to(job_id, token, staged.path())
+        .await?;
+    extract_archive_file(staged.path(), workspace_path).await?;
     Ok(size)
 }
 
-/// Extract an untrusted ZIP archive into the workspace, off the async runtime
-pub async fn extract_archive(data: Vec<u8>, workspace_path: &str) -> Result<()> {
+/// Extract an untrusted ZIP file into the workspace, off the async runtime
+pub async fn extract_archive_file(path: &Path, workspace_path: &str) -> Result<()> {
+    let path = path.to_path_buf();
     let workspace = workspace_path.to_string();
-    tokio::task::spawn_blocking(move || extract_zip_to_workspace(&data, &workspace))
-        .await
-        .context("Extraction task panicked")?
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("Failed to open {}", path.display()))?;
+        extract_zip_reader(file, &workspace, ExtractLimits::default())
+    })
+    .await
+    .context("Extraction task panicked")?
 }
 
 /// Limits applied when extracting untrusted archives (zip bomb protection)
@@ -45,21 +59,30 @@ impl Default for ExtractLimits {
 }
 
 /// Extract ZIP archive to workspace directory
+#[cfg(test)]
 fn extract_zip_to_workspace(zip_data: &[u8], workspace_path: &str) -> Result<()> {
     extract_zip_with_limits(zip_data, workspace_path, ExtractLimits::default())
+}
+
+#[cfg(test)]
+fn extract_zip_with_limits(
+    zip_data: &[u8],
+    workspace_path: &str,
+    limits: ExtractLimits,
+) -> Result<()> {
+    extract_zip_reader(std::io::Cursor::new(zip_data), workspace_path, limits)
 }
 
 /// Extract an untrusted ZIP archive into `workspace_path`.
 ///
 /// The whole archive is rejected if any entry would land outside the workspace
 /// (`..`, absolute names, or writing through a symlink), or if limits are exceeded.
-fn extract_zip_with_limits(
-    zip_data: &[u8],
+fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
+    reader: R,
     workspace_path: &str,
     limits: ExtractLimits,
 ) -> Result<()> {
-    let cursor = std::io::Cursor::new(zip_data);
-    let mut archive = ZipArchive::new(cursor).context("Failed to read ZIP archive")?;
+    let mut archive = ZipArchive::new(reader).context("Failed to read ZIP archive")?;
 
     if archive.len() > limits.max_entries {
         anyhow::bail!(
@@ -186,48 +209,56 @@ fn symlink_stays_inside(link: &Path, target: &Path) -> bool {
 pub async fn create_zip_from_paths(
     workspace_path: &str,
     paths: &[String],
-) -> Result<Option<Vec<u8>>> {
-    create_archive(workspace_path, paths, &[], "zip").await
+    staging_dir: &Path,
+) -> Result<Option<Archive>> {
+    create_archive(workspace_path, paths, &[], "zip", staging_dir).await
 }
 
 /// Archive the files matching `paths` in the format GitLab expects for the
 /// artifact: `zip` (archives), `gzip` (reports; one gzip member per file) or
-/// `raw` (a single file as is). `None` when no file matches.
+/// `raw` (a single file as is), written to a temporary file in `staging_dir`.
+/// `None` when no file matches.
 pub async fn create_archive(
     workspace_path: &str,
     paths: &[String],
     exclude: &[String],
     format: &str,
-) -> Result<Option<Vec<u8>>> {
+    staging_dir: &Path,
+) -> Result<Option<Archive>> {
     let workspace = workspace_path.to_string();
     let patterns = paths.to_vec();
     let exclude = exclude.to_vec();
     let format = format.to_string();
+    let staging_dir = staging_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let files = collect_paths(&workspace, &patterns, &exclude)?;
         if files.is_empty() {
             return Ok(None);
         }
-        let data = match format.as_str() {
-            "zip" => build_zip(Path::new(&workspace), &files),
-            "gzip" => build_gzip(&files),
+        let mut file = tempfile::NamedTempFile::new_in(&staging_dir)
+            .with_context(|| format!("Failed to create a file in {}", staging_dir.display()))?;
+        match format.as_str() {
+            "zip" => build_zip(Path::new(&workspace), &files, file.as_file_mut())?,
+            "gzip" => build_gzip(&files, file.as_file_mut())?,
             "raw" => match files.as_slice() {
-                [file] => read_regular_file(file, MAX_RAW_ARTIFACT_BYTES),
+                [path] => copy_regular_file(path, MAX_RAW_ARTIFACT_BYTES, file.as_file_mut())?,
                 _ => anyhow::bail!("raw artifacts need exactly one file, got {}", files.len()),
             },
             other => anyhow::bail!("Unsupported artifact format {:?}", other),
-        }?;
-        Ok(Some(data))
+        };
+        file.as_file_mut().flush()?;
+        let len = file.as_file().metadata()?.len();
+        Ok(Some(Archive { file, len }))
     })
     .await
     .context("Archive task panicked")?
 }
 
-/// Largest `raw` report artifact read into memory
+/// Largest `raw` report artifact
 const MAX_RAW_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Read a regular file (never a symlink, FIFO or device) of at most `max` bytes
-fn read_regular_file(path: &Path, max: u64) -> Result<Vec<u8>> {
+/// Copy a regular file (never a symlink, FIFO or device) of at most `max` bytes
+fn copy_regular_file(path: &Path, max: u64, out: &mut impl Write) -> Result<()> {
     use std::io::Read;
 
     let before = std::fs::symlink_metadata(path)?;
@@ -244,12 +275,11 @@ fn read_regular_file(path: &Path, max: u64) -> Result<Vec<u8>> {
             anyhow::bail!("{} changed while it was being read", path.display());
         }
     }
-    let mut data = Vec::new();
-    file.take(max + 1).read_to_end(&mut data)?;
-    if data.len() as u64 > max {
+    let copied = std::io::copy(&mut file.take(max + 1), out)?;
+    if copied > max {
         anyhow::bail!("{} is larger than {} bytes", path.display(), max);
     }
-    Ok(data)
+    Ok(())
 }
 
 /// Files matching `patterns` inside the workspace.
@@ -328,30 +358,28 @@ fn collect_paths(
         .collect())
 }
 
-fn build_zip(root: &Path, files: &[PathBuf]) -> Result<Vec<u8>> {
-    let mut zip_buffer = Vec::new();
-    let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
+fn build_zip<W: Write + std::io::Seek>(root: &Path, files: &[PathBuf], out: W) -> Result<()> {
+    let mut zip = ZipWriter::new(out);
     for path in files {
         add_path_to_zip(&mut zip, path, root)?;
     }
     zip.finish()?;
-    Ok(zip_buffer)
+    Ok(())
 }
 
 /// Concatenated gzip members, one per regular file (symlinks are skipped)
-fn build_gzip(files: &[PathBuf]) -> Result<Vec<u8>> {
+fn build_gzip(files: &[PathBuf], out: &mut impl Write) -> Result<()> {
     use flate2::write::GzEncoder;
 
-    let mut out = Vec::new();
     for path in files {
         if !std::fs::symlink_metadata(path)?.is_file() {
             continue;
         }
-        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = GzEncoder::new(&mut *out, flate2::Compression::default());
         std::io::copy(&mut std::fs::File::open(path)?, &mut encoder)?;
-        out.extend(encoder.finish()?);
+        encoder.finish()?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A glob match is inside the workspace if its parent directory canonicalizes under the root
@@ -409,6 +437,15 @@ mod tests {
     use std::io::Read;
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
+
+    /// Archive contents, for assertions
+    fn bytes(archive: Archive) -> Vec<u8> {
+        std::fs::read(archive.file.path()).unwrap()
+    }
+
+    fn staging() -> tempfile::TempDir {
+        tempdir().unwrap()
+    }
 
     /// Build a ZIP in memory from (name, content, unix mode) entries, names written verbatim
     fn zip_of(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
@@ -558,9 +595,11 @@ mod tests {
                 "*.xml".to_string(),
                 "dist/js/*".to_string(),
             ],
+            staging().path(),
         )
         .await
         .unwrap()
+        .map(bytes)
         .expect("files matched");
 
         assert_eq!(zip_names(&data), vec!["dist/js/app.js", "report.xml"]);
@@ -582,6 +621,7 @@ mod tests {
                     .to_string_lossy()
                     .to_string(),
             ],
+            staging().path(),
         )
         .await
         .unwrap();
@@ -603,9 +643,11 @@ mod tests {
             &["dist".to_string()],
             &["dist/**/*.map".to_string(), "dist/tmp/**".to_string()],
             "zip",
+            staging().path(),
         )
         .await
         .unwrap()
+        .map(bytes)
         .expect("files matched");
 
         assert_eq!(zip_names(&data), vec!["dist/js/app.js"]);
@@ -623,9 +665,11 @@ mod tests {
             &["*.xml".to_string()],
             &[],
             "gzip",
+            staging().path(),
         )
         .await
         .unwrap()
+        .map(bytes)
         .expect("files matched");
 
         let mut decoded = String::new();
@@ -645,8 +689,14 @@ mod tests {
         std::os::unix::fs::symlink(&secret, ws.path().join("gl-sast-report.json")).unwrap();
         let ws_path = ws.path().to_str().unwrap();
 
-        let leaked =
-            create_archive(ws_path, &["gl-sast-report.json".to_string()], &[], "raw").await;
+        let leaked = create_archive(
+            ws_path,
+            &["gl-sast-report.json".to_string()],
+            &[],
+            "raw",
+            staging().path(),
+        )
+        .await;
         assert!(leaked.is_err(), "symlink target was read");
 
         let fifo = ws.path().join("report.json");
@@ -657,7 +707,13 @@ mod tests {
             .success());
         let blocked = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            create_archive(ws_path, &["report.json".to_string()], &[], "raw"),
+            create_archive(
+                ws_path,
+                &["report.json".to_string()],
+                &[],
+                "raw",
+                staging().path(),
+            ),
         )
         .await
         .expect("reading a FIFO must not block");
@@ -671,11 +727,25 @@ mod tests {
         std::fs::write(ws.path().join("other.json"), b"[]").unwrap();
         let ws_path = ws.path().to_str().unwrap();
 
-        let one = create_archive(ws_path, &["report.json".to_string()], &[], "raw").await;
-        assert_eq!(one.unwrap().unwrap(), b"{}");
-        assert!(create_archive(ws_path, &["*.json".to_string()], &[], "raw")
-            .await
-            .is_err());
+        let stage = staging();
+        let one = create_archive(
+            ws_path,
+            &["report.json".to_string()],
+            &[],
+            "raw",
+            stage.path(),
+        )
+        .await;
+        assert_eq!(bytes(one.unwrap().unwrap()), b"{}");
+        assert!(create_archive(
+            ws_path,
+            &["*.json".to_string()],
+            &[],
+            "raw",
+            staging().path()
+        )
+        .await
+        .is_err());
     }
 
     #[cfg(unix)]
@@ -687,10 +757,15 @@ mod tests {
         std::fs::write(&secret, b"runner-token").unwrap();
         std::os::unix::fs::symlink(&secret, ws.path().join("leak")).unwrap();
 
-        let data = create_zip_from_paths(ws.path().to_str().unwrap(), &["leak".to_string()])
-            .await
-            .unwrap()
-            .expect("files matched");
+        let data = create_zip_from_paths(
+            ws.path().to_str().unwrap(),
+            &["leak".to_string()],
+            staging().path(),
+        )
+        .await
+        .unwrap()
+        .map(bytes)
+        .expect("files matched");
 
         let mut archive = ZipArchive::new(std::io::Cursor::new(&data)).unwrap();
         let mut entry = archive.by_name("leak").unwrap();
@@ -708,9 +783,13 @@ mod tests {
         std::fs::write(outside.path().join("passwd"), b"root:x:0:0").unwrap();
         std::os::unix::fs::symlink(outside.path(), ws.path().join("etc")).unwrap();
 
-        let data = create_zip_from_paths(ws.path().to_str().unwrap(), &["etc/*".to_string()])
-            .await
-            .unwrap();
+        let data = create_zip_from_paths(
+            ws.path().to_str().unwrap(),
+            &["etc/*".to_string()],
+            staging().path(),
+        )
+        .await
+        .unwrap();
 
         assert!(data.is_none());
     }

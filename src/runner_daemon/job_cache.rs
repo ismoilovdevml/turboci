@@ -104,13 +104,13 @@ impl LocalCache {
     ) -> Result<Option<String>> {
         for key in keys {
             let path = self.archive_path(project_id, key);
-            match tokio::fs::read(&path).await {
-                Ok(data) => {
+            match tokio::fs::metadata(&path).await {
+                Ok(_) => {
                     // Mark the archive as used, so eviction keeps it
                     if let Ok(file) = std::fs::File::options().append(true).open(&path) {
                         let _ = file.set_modified(std::time::SystemTime::now());
                     }
-                    artifacts::extract_archive(data, workspace).await?;
+                    artifacts::extract_archive_file(&path, workspace).await?;
                     return Ok(Some(key.clone()));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -131,32 +131,23 @@ impl LocalCache {
         workspace: &str,
         paths: &[String],
     ) -> Result<Option<usize>> {
-        let Some(data) = artifacts::create_zip_from_paths(workspace, paths).await? else {
-            return Ok(None);
-        };
         let path = self.archive_path(project_id, key);
         let dir = path.parent().unwrap_or(Path::new("."));
         tokio::fs::create_dir_all(dir)
             .await
             .with_context(|| format!("Failed to create cache directory {}", dir.display()))?;
-
-        // Write then rename, so concurrent jobs never read a partial archive
-        let tmp = dir.join(format!(
-            ".{}.{}.tmp",
-            encode_key(key),
-            uuid::Uuid::new_v4().simple()
-        ));
-        let written = async {
-            tokio::fs::write(&tmp, &data).await?;
-            tokio::fs::rename(&tmp, &path).await
-        }
-        .await;
-        if let Err(e) = written {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e.into());
-        }
+        // Staged in the cache directory and renamed into place, so concurrent
+        // jobs never read a partial archive and nothing is held in memory
+        let Some(archive) = artifacts::create_zip_from_paths(workspace, paths, dir).await? else {
+            return Ok(None);
+        };
+        let len = archive.len;
+        archive
+            .file
+            .persist(&path)
+            .with_context(|| format!("Failed to save {}", path.display()))?;
         self.evict(dir);
-        Ok(Some(data.len()))
+        Ok(Some(len as usize))
     }
 }
 

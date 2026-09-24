@@ -118,6 +118,8 @@ impl GitLabClient {
         for attempt in 1..=max_attempts {
             match operation().await {
                 Ok(result) => return Ok(result),
+                // e.g. 413 or 403: the same request will fail the same way again
+                Err(e) if e.is::<Permanent>() => return Err(e),
                 Err(e) => {
                     last_error = Some(e);
                     if attempt < max_attempts {
@@ -385,7 +387,10 @@ impl GitLabClient {
         }
 
         self.retry_with_backoff(|| async {
-            let part = reqwest::multipart::Part::bytes(upload.data.clone())
+            let file = tokio::fs::File::open(&upload.path)
+                .await
+                .with_context(|| format!("Failed to open {}", upload.path.display()))?;
+            let part = reqwest::multipart::Part::stream_with_length(file, upload.len)
                 .file_name(upload.file_name.clone())
                 .mime_str("application/octet-stream")?;
             let response = self
@@ -401,16 +406,19 @@ impl GitLabClient {
 
             match response.status() {
                 StatusCode::CREATED | StatusCode::OK => Ok(()),
-                StatusCode::PAYLOAD_TOO_LARGE => Err(anyhow::anyhow!(
+                StatusCode::PAYLOAD_TOO_LARGE => Err(Permanent(
                     "Artifact upload rejected: archive is larger than the instance limit"
-                )),
+                        .to_string(),
+                )
+                .into()),
                 status => {
                     let error = response.text().await.unwrap_or_default();
-                    Err(anyhow::anyhow!(
-                        "Artifact upload failed: {} {}",
-                        status,
-                        error
-                    ))
+                    let message = format!("Artifact upload failed: {} {}", status, error);
+                    if status.is_client_error() {
+                        Err(Permanent(message).into())
+                    } else {
+                        Err(anyhow::anyhow!(message))
+                    }
                 }
             }
         })
@@ -422,7 +430,15 @@ impl GitLabClient {
 
     /// Download the artifacts archive of job `job_id` (a dependency), authenticated
     /// with that dependency's token. Redirects to object storage are followed.
-    pub async fn download_artifacts(&self, job_id: u64, token: &str) -> Result<Vec<u8>> {
+    pub async fn download_artifacts_to(
+        &self,
+        job_id: u64,
+        token: &str,
+        dest: &std::path::Path,
+    ) -> Result<u64> {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
         let url = format!("{}/api/v4/jobs/{}/artifacts", self.url, job_id);
 
         let response = self
@@ -435,14 +451,23 @@ impl GitLabClient {
             .context("Failed to download artifacts")?;
 
         match response.status() {
-            StatusCode::OK => Ok(response
-                .bytes()
-                .await
-                .context("Failed to read artifact bytes")?
-                .to_vec()),
-            StatusCode::NOT_FOUND => Err(anyhow::anyhow!("job #{} has no artifacts", job_id)),
-            status => Err(anyhow::anyhow!("Artifact download failed: {}", status)),
+            StatusCode::OK => {}
+            StatusCode::NOT_FOUND => anyhow::bail!("job #{} has no artifacts", job_id),
+            status => anyhow::bail!("Artifact download failed: {}", status),
         }
+        // Streamed to disk: archives can be larger than the runner's memory
+        let mut file = tokio::fs::File::create(dest)
+            .await
+            .with_context(|| format!("Failed to create {}", dest.display()))?;
+        let mut body = response.bytes_stream();
+        let mut size = 0u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.context("Failed to read artifact bytes")?;
+            size += chunk.len() as u64;
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok(size)
     }
 }
 
@@ -780,10 +805,24 @@ pub struct RetryConfig {
 /// Timeout for artifact transfers (the client default of 30s is for API calls)
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// An error that retrying cannot fix (4xx responses)
+#[derive(Debug)]
+struct Permanent(String);
+
+impl std::fmt::Display for Permanent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Permanent {}
+
 /// An archive to upload as job artifacts
 #[derive(Debug, Clone)]
 pub struct ArtifactUpload {
-    pub data: Vec<u8>,
+    /// Archive file on disk; it is streamed, never loaded into memory
+    pub path: std::path::PathBuf,
+    pub len: u64,
     /// File name of the archive, e.g. `artifacts.zip`
     pub file_name: String,
     /// `zip`, `gzip` or `raw`
@@ -1183,12 +1222,15 @@ mod tests {
             .mount(&server)
             .await;
 
+        let staged = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(staged.path(), b"PK-zip-bytes").unwrap();
         client(&server)
             .upload_artifacts(
                 7,
                 "job-token",
                 ArtifactUpload {
-                    data: b"PK-zip-bytes".to_vec(),
+                    path: staged.path().to_path_buf(),
+                    len: 12,
                     file_name: "artifacts.zip".to_string(),
                     format: "zip".to_string(),
                     artifact_type: "archive".to_string(),
@@ -1215,6 +1257,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_artifact_upload_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(413))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let staged = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(staged.path(), b"zip").unwrap();
+
+        let result = client(&server)
+            .upload_artifacts(
+                7,
+                "t",
+                ArtifactUpload {
+                    path: staged.path().to_path_buf(),
+                    len: 3,
+                    file_name: "a.zip".to_string(),
+                    format: "zip".to_string(),
+                    artifact_type: "archive".to_string(),
+                    expire_in: None,
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn download_artifacts_follows_redirect_to_object_storage() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1232,12 +1303,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let data = client(&server)
-            .download_artifacts(9, "dep-token")
+        let dest = tempfile::NamedTempFile::new().unwrap();
+        let size = client(&server)
+            .download_artifacts_to(9, "dep-token", dest.path())
             .await
             .unwrap();
 
-        assert_eq!(data, b"zip-data");
+        assert_eq!(size, 8);
+        assert_eq!(std::fs::read(dest.path()).unwrap(), b"zip-data");
     }
 
     #[tokio::test]
