@@ -44,6 +44,11 @@ turboci runner-stats -c /etc/turboci-runner.toml
 sudo rm -rf /var/lib/turboci/cache/*
 ```
 
+With `cache_s3` the next job downloads the deleted archives again from S3:
+also delete the objects under `<prefix>/project-<id>/` in the bucket, or use
+*Clear runner caches* on the project's **Build → Pipelines** page, which
+gives the jobs new cache keys.
+
 ## Runner token rotation
 
 When the GitLab instance gives runner tokens an expiry (*Admin → Settings →

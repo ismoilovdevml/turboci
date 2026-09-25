@@ -89,7 +89,8 @@ With `proxy` set:
   aliases below.
 - `NO_PROXY` also lists `localhost`, `127.0.0.1`, `::1` and the job's service
   aliases, so `tcp://docker:2375` and `postgres:5432` never go to the proxy.
-- A password in the proxy URL is masked in job logs.
+- A password in the proxy URL is masked in job logs. Jobs still read the full
+  URL, password included, from their proxy variables.
 
 Image pulls are done by dockerd, which has its own proxy setting. At start the
 runner logs a warning with the drop-in to add when dockerd has no proxy:
@@ -132,8 +133,14 @@ secret_key = "..."
 | Key | Default | Description |
 |---|---|---|
 | `url` | – | `https://host[:port]/bucket[/prefix]` (path-style); `http://` for storage without TLS |
-| `access_key`, `secret_key` | – | Credentials. Jobs never see them: the runner transfers the archives |
+| `access_key`, `secret_key` | – | Credentials. The runner transfers the archives, so docker jobs never see them; shell jobs run as the service user and can read the config file, as they can the runner token |
 | `region` | from `s3.<region>.amazonaws.com`, else `us-east-1` | Signing region (`auto` for R2) |
+
+The credentials need `s3:GetObject` and `s3:PutObject` on the archives, and
+`s3:ListBucket` on the bucket (it may be limited to the prefix). Without
+`s3:ListBucket` AWS answers 403 instead of 404 for an archive that does not
+exist yet, so every cache miss logs a warning, and the start-up check reports
+access denied.
 
 `cache_dir` stays the first layer. To restore, the runner asks S3 whether the
 archive changed (`If-None-Match`): an unchanged one is taken from the local
@@ -149,7 +156,8 @@ Uploaded cache main to S3 (45.2 MB)
 When S3 cannot be reached the job uses the local copy and the log shows a
 warning; a cache never fails a job. The runner then stops calling S3 for 60
 seconds, so the jobs in that time go straight to the local copy instead of
-each waiting through the same timeouts. `proxy`, `no_proxy` and `tls_ca_file`
+each waiting through the same timeouts; after that one call tries S3 again
+while the others keep skipping it. `proxy`, `no_proxy` and `tls_ca_file`
 apply to S3 too. At start the runner checks the bucket in the background,
 without delaying jobs, and logs what is wrong (not found, access denied,
 unreachable).
@@ -157,7 +165,8 @@ unreachable).
 The runner never deletes objects. Expire old archives with a bucket lifecycle
 rule, e.g. `mc ilm rule add --expire-days 14 minio/turboci-cache` or an S3
 lifecycle rule with `Expiration: {Days: 14}`. Archives are stored as
-`<prefix>/project-<id>/<key>.zip`; every runner with the credentials can
+`<prefix>/project-<id>/<encoded-key>.zip`, the cache key percent-encoded
+(`feature/x` is `feature%2Fx.zip`); every runner with the credentials can
 write every project's cache, so use one bucket or prefix per group of
 runners that trust each other. Archives above 5 GiB are kept only locally.
 
