@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
             };
 
             let executor = executor.with_ca_pem(network.ca_pem.clone());
-            let cache_s3 = runner_config.cache_s3.clone();
+            let cache_s3 = runner_config.s3_cache().cloned();
             let mut daemon = RunnerDaemon::new(runner_config, gitlab, executor);
             if let Some(s3) = &cache_s3 {
                 let bucket = runner_daemon::s3::Bucket::new(s3, network.client_builder()?)?;

@@ -476,6 +476,17 @@ impl RunnerConfig {
         }
     }
 
+    /// `cache_s3` to use: S3 is the job cache's second layer, so it is
+    /// ignored (with a warning) while the cache is off
+    pub fn s3_cache(&self) -> Option<&S3CacheConfig> {
+        let s3 = self.cache_s3.as_ref()?;
+        if !self.cache_enabled {
+            tracing::warn!("cache_s3 is ignored because cache_enabled = false");
+            return None;
+        }
+        Some(s3)
+    }
+
     /// Proxy and CA settings for the runner's HTTP clients
     pub fn network(&self) -> Result<crate::net::Network> {
         let ca_pem = match &self.tls_ca_file {
@@ -809,6 +820,26 @@ mod tests {
             RunnerConfig::parse("runner_token = \"t\"\n[cache_s3]\nurl = \"http://m/ci\"").is_err(),
             "keys are required"
         );
+    }
+
+    #[test]
+    fn s3_cache_is_ignored_when_the_cache_is_off() {
+        let s3 = S3CacheConfig {
+            url: "http://minio:9000/ci".to_string(),
+            access_key: "AK".to_string(),
+            secret_key: "SK".to_string(),
+            region: None,
+        };
+        let enabled = RunnerConfig {
+            cache_s3: Some(s3),
+            ..RunnerConfig::default()
+        };
+        assert!(enabled.s3_cache().is_some());
+        let disabled = RunnerConfig {
+            cache_enabled: false,
+            ..enabled
+        };
+        assert!(disabled.s3_cache().is_none());
     }
 
     #[test]
