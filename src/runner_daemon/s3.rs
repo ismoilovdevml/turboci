@@ -7,8 +7,11 @@
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::Instant;
 
 use super::config::S3CacheConfig;
 
@@ -167,6 +170,55 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// When an upload body last handed a chunk to the connection. Without a
+/// body it stays at the start of the request.
+#[derive(Clone)]
+struct Progress(Arc<Mutex<Instant>>);
+
+impl Progress {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn bump(&self) {
+        if let Ok(mut last) = self.0.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    fn idle(&self) -> Duration {
+        self.0.lock().map(|last| last.elapsed()).unwrap_or_default()
+    }
+}
+
+fn stalled(limit: Duration) -> anyhow::Error {
+    anyhow::anyhow!("S3 stalled: no data for {:?}", limit)
+}
+
+/// Run `fut` until it finishes, or fail once `progress` has not moved for
+/// `limit`. There is no total timeout: a large upload may take as long as it
+/// keeps moving.
+async fn until_stalled<F: Future>(
+    fut: F,
+    progress: &Progress,
+    limit: Duration,
+) -> Result<F::Output> {
+    let mut check =
+        tokio::time::interval((limit / 4).clamp(Duration::from_millis(1), Duration::from_secs(1)));
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut fut => return Ok(output),
+            _ = check.tick() => {
+                if progress.idle() > limit {
+                    return Err(stalled(limit));
+                }
+            }
+        }
+    }
+}
+
 /// Result of a conditional download
 #[derive(Debug)]
 pub enum Download {
@@ -191,6 +243,8 @@ pub struct Bucket {
     access_key: String,
     secret_key: String,
     retry_delay: Duration,
+    /// A transfer fails after this long without data moving
+    stall_timeout: Duration,
 }
 
 impl std::fmt::Debug for Bucket {
@@ -203,12 +257,12 @@ impl std::fmt::Debug for Bucket {
 }
 
 impl Bucket {
-    /// `http` carries the runner's proxy and CA; timeouts are added here
+    /// `http` carries the runner's proxy and CA; a connect timeout is added
+    /// here. Transfers have no total timeout, only a stall timeout.
     pub fn new(config: &S3CacheConfig, http: reqwest::ClientBuilder) -> Result<Self> {
         let location = S3Location::parse(&config.url, config.region.as_deref())?;
         let client = http
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(60))
             .build()
             .context("Failed to build the S3 HTTP client")?;
         Ok(Self {
@@ -217,12 +271,19 @@ impl Bucket {
             access_key: config.access_key.clone(),
             secret_key: config.secret_key.clone(),
             retry_delay: Duration::from_secs(1),
+            stall_timeout: Duration::from_secs(60),
         })
     }
 
     /// Shorter waits between attempts (tests)
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
+        self
+    }
+
+    /// Shorter stall timeout (tests)
+    pub fn with_stall_timeout(mut self, limit: Duration) -> Self {
+        self.stall_timeout = limit;
         self
     }
 
@@ -302,6 +363,7 @@ impl Bucket {
             for (name, value) in extra {
                 request = request.header(*name, value);
             }
+            let progress = Progress::new();
             if let Some(file) = body {
                 let opened = tokio::fs::File::open(file)
                     .await
@@ -309,28 +371,37 @@ impl Bucket {
                 let len = opened.metadata().await?.len();
                 // Streamed in 64 KiB pieces; S3 needs the length up front
                 // (it rejects chunked uploads)
-                let stream = futures_util::stream::unfold(opened, |mut file| async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; 64 * 1024];
-                    match file.read(&mut buf).await {
-                        Ok(0) => None,
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Some((Ok::<Vec<u8>, std::io::Error>(buf), file))
+                let stream = futures_util::stream::unfold(
+                    (opened, progress.clone()),
+                    |(mut file, progress)| async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = vec![0u8; 64 * 1024];
+                        match file.read(&mut buf).await {
+                            Ok(0) => None,
+                            Ok(n) => {
+                                buf.truncate(n);
+                                progress.bump();
+                                Some((Ok::<Vec<u8>, std::io::Error>(buf), (file, progress)))
+                            }
+                            Err(e) => Some((Err(e), (file, progress))),
                         }
-                        Err(e) => Some((Err(e), file)),
-                    }
-                });
+                    },
+                );
                 request = request
                     .header("content-length", len)
                     .body(reqwest::Body::wrap_stream(stream));
             }
-            match request.send().await {
+            // The reply must start within the stall timeout of the last
+            // chunk sent (or of the request, without a body)
+            let sent = until_stalled(request.send(), &progress, self.stall_timeout)
+                .await
+                .and_then(|sent| sent.context("cannot reach S3"));
+            match sent {
                 Ok(response) if response.status().is_server_error() => {
                     last_error = Some(anyhow::anyhow!("S3 answered {}", response.status()));
                 }
                 Ok(response) => return Ok(response),
-                Err(e) => last_error = Some(anyhow::Error::new(e).context("cannot reach S3")),
+                Err(e) => last_error = Some(e),
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("S3 request failed")))
@@ -360,7 +431,11 @@ impl Bucket {
         let mut out = tokio::fs::File::from_std(file.reopen()?);
         let mut bytes = 0u64;
         use tokio::io::AsyncWriteExt;
-        while let Some(chunk) = response.chunk().await.context("S3 download interrupted")? {
+        while let Some(chunk) = tokio::time::timeout(self.stall_timeout, response.chunk())
+            .await
+            .map_err(|_| stalled(self.stall_timeout))?
+            .context("S3 download interrupted")?
+        {
             out.write_all(&chunk).await?;
             bytes += chunk.len() as u64;
         }
@@ -685,5 +760,68 @@ mod tests {
             .await
             .unwrap_err()
             .contains("cannot reach"));
+    }
+
+    #[tokio::test]
+    async fn watchdog_fails_only_without_progress() {
+        let limit = Duration::from_millis(300);
+        let progress = Progress::new();
+        let working = async {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                progress.bump();
+            }
+        };
+        assert!(until_stalled(working, &progress, limit).await.is_ok());
+
+        let started = std::time::Instant::now();
+        let silent = tokio::time::sleep(Duration::from_secs(1));
+        let error = until_stalled(silent, &Progress::new(), limit)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stalled"), "{}", error);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn stalled_replies_fail_and_slow_ones_do_not() {
+        let server = MockServer::start().await;
+        for (name, delay) in [("slow.zip", 50), ("stuck.zip", 1000)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/ci-cache/project-1/{}", name)))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(b"zip".to_vec())
+                        .set_delay(Duration::from_millis(delay)),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("PUT"))
+            .and(path("/ci-cache/project-1/stuck.zip"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let b = bucket(&server, "").with_stall_timeout(Duration::from_millis(300));
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            b.get_to_file(&b.object_key(1, "slow.zip"), None, dir.path())
+                .await
+                .unwrap(),
+            Download::Downloaded { bytes: 3, .. }
+        ));
+        let stuck = b
+            .get_to_file(&b.object_key(1, "stuck.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(stuck.to_string().contains("stalled"), "{:#}", stuck);
+        let file = dir.path().join("stuck.zip");
+        std::fs::write(&file, b"zip").unwrap();
+        let upload = b
+            .put_file(&b.object_key(1, "stuck.zip"), &file)
+            .await
+            .unwrap_err();
+        assert!(upload.to_string().contains("stalled"), "{:#}", upload);
     }
 }

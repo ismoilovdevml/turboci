@@ -56,8 +56,9 @@ pub struct RunnerConfig {
     pub executor: ExecutorConfig,
 }
 
-/// `[cache_s3]`: S3-compatible storage shared by runners, the cache's second layer
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `[cache_s3]`: S3-compatible storage shared by runners, the cache's second layer.
+/// `Debug` is written by hand so the secret key is never printed.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3CacheConfig {
     /// `https://host[:port]/bucket[/prefix]`; `http://` for storage without TLS
     pub url: String,
@@ -66,6 +67,17 @@ pub struct S3CacheConfig {
     /// Signing region; default from *.amazonaws.com hosts, else us-east-1
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+}
+
+impl std::fmt::Debug for S3CacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3CacheConfig")
+            .field("url", &self.url)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -797,5 +809,19 @@ mod tests {
             RunnerConfig::parse("runner_token = \"t\"\n[cache_s3]\nurl = \"http://m/ci\"").is_err(),
             "keys are required"
         );
+    }
+
+    #[test]
+    fn debug_output_hides_the_s3_secret_key() {
+        let config = RunnerConfig {
+            cache_s3: Some(S3CacheConfig {
+                url: "http://minio:9000/ci".to_string(),
+                access_key: "AK".to_string(),
+                secret_key: "s3-secret-value".to_string(),
+                region: None,
+            }),
+            ..RunnerConfig::default()
+        };
+        assert!(!format!("{:?}", config).contains("s3-secret-value"));
     }
 }
