@@ -828,7 +828,7 @@ mod tests {
             second
         );
 
-        // S3 gone: after the retries the restore falls back to the local copy
+        // S3 gone: the restore falls back to the local copy
         docker(&["stop", name]);
         let offline = cache_b
             .restore(9, &[key.to_string()], consumer.path().to_str().unwrap())

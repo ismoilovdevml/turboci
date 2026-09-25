@@ -157,10 +157,12 @@ When S3 cannot be reached the job uses the local copy and the log shows a
 warning; a cache never fails a job. The runner then stops calling S3 for 60
 seconds, so the jobs in that time go straight to the local copy instead of
 each waiting through the same timeouts; after that one call tries S3 again
-while the others keep skipping it. `proxy`, `no_proxy` and `tls_ca_file`
-apply to S3 too. At start the runner checks the bucket in the background,
-without delaying jobs, and logs what is wrong (not found, access denied,
-unreachable).
+while the others keep skipping it. The pause starts on the first attempt
+that cannot connect or stalls (no data for 60 seconds); 5xx answers and
+dropped connections are tried three times first. `proxy`, `no_proxy` and
+`tls_ca_file` apply to S3 too. At start the runner checks the bucket in
+the background, without delaying jobs, and logs what is wrong (not found,
+access denied, unreachable).
 
 The runner never deletes objects. Expire old archives with a bucket lifecycle
 rule, e.g. `mc ilm rule add --expire-days 14 minio/turboci-cache` or an S3

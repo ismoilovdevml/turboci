@@ -453,24 +453,30 @@ impl Bucket {
             // chunk sent (or of the request, without a body). The URL is
             // dropped from errors: it names a project and its cache key,
             // and the breaker repeats the error to every job.
-            let sent = until_stalled(request.send(), &progress, self.stall_timeout)
-                .await
-                .and_then(|sent| {
-                    sent.map_err(reqwest::Error::without_url)
-                        .context("cannot reach S3")
-                });
+            let sent = until_stalled(request.send(), &progress, self.stall_timeout).await;
             match sent {
-                Ok(response) if response.status().is_server_error() => {
+                Ok(Ok(response)) if response.status().is_server_error() => {
                     last_error = Some(anyhow::anyhow!("S3 answered {}", response.status()));
                 }
-                Ok(response) => {
+                Ok(Ok(response)) => {
                     // S3 answered: it is reachable again (4xx included)
                     if let Ok(mut breaker) = self.breaker.lock() {
                         *breaker = None;
                     }
                     return Ok(response);
                 }
-                Err(e) => last_error = Some(e),
+                Ok(Err(e)) => {
+                    // No connection (refused, timed out, no route): a retry
+                    // would wait the same way, so the breaker opens at once
+                    let unreachable = e.is_connect();
+                    let error = anyhow::Error::new(e.without_url()).context("cannot reach S3");
+                    if unreachable {
+                        return Err(self.trip(error));
+                    }
+                    last_error = Some(error);
+                }
+                // A stalled attempt has already cost a whole stall timeout
+                Err(stalled) => return Err(self.trip(stalled)),
             }
             // A trial gets one attempt: its failure opens the breaker again
             if trial {
@@ -733,6 +739,35 @@ mod tests {
             tokio::time::sleep(hold).await;
         });
         (address, server)
+    }
+
+    /// A server that accepts every connection and never answers, or with
+    /// `hang_up` reads the request and closes the connection; counts the
+    /// connections
+    async fn mute_server(
+        hang_up: bool,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if hang_up {
+                    let _ = socket.read(&mut [0u8; 4096]).await;
+                } else {
+                    open.push(socket);
+                }
+            }
+        });
+        (address, accepted, server)
     }
 
     async fn requests_to(server: &MockServer, name: &str) -> usize {
@@ -1103,6 +1138,82 @@ mod tests {
             .await
             .unwrap_err();
         assert!(skipped.to_string().contains("S3 skipped"), "{:#}", skipped);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_attempt_opens_the_breaker_without_retrying() {
+        let (address, connections, server) = mute_server(false).await;
+        let limit = Duration::from_millis(200);
+        let b = bucket_at(format!("http://{}/ci-cache", address)).with_stall_timeout(limit);
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+
+        let stalled = b
+            .get_to_file(&b.object_key(1, "k.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(stalled.to_string().contains("S3 stalled"), "{:#}", stalled);
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // About one stall limit; three attempts take more than three
+        assert!(started.elapsed() < limit * 3, "{:?}", started.elapsed());
+        let skipped = b
+            .get_to_file(&b.object_key(1, "next.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(skipped.to_string().contains("S3 skipped"), "{:#}", skipped);
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_opens_the_breaker_without_retrying() {
+        // Retries would wait 1 s and 2 s first
+        let b = bucket_at("http://127.0.0.1:9/ci-cache".to_string())
+            .with_retry_delay(Duration::from_secs(1));
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+
+        let refused = b
+            .get_to_file(&b.object_key(1, "k.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{:#}", refused).contains("cannot reach S3"),
+            "{:#}",
+            refused
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let skipped = b
+            .get_to_file(&b.object_key(1, "next.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(skipped.to_string().contains("S3 skipped"), "{:#}", skipped);
+    }
+
+    #[tokio::test]
+    async fn a_connection_closed_without_an_answer_is_retried() {
+        let (address, connections, server) = mute_server(true).await;
+        let b = bucket_at(format!("http://{}/ci-cache", address));
+        let dir = tempfile::tempdir().unwrap();
+
+        let closed = b
+            .get_to_file(&b.object_key(1, "k.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{:#}", closed).contains("cannot reach S3"),
+            "{:#}",
+            closed
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 3);
         server.abort();
     }
 
