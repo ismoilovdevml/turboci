@@ -186,7 +186,20 @@ async fn main() -> Result<()> {
             };
 
             let executor = executor.with_ca_pem(network.ca_pem.clone());
-            let daemon = RunnerDaemon::new(runner_config, gitlab, executor);
+            let cache_s3 = runner_config.cache_s3.clone();
+            let mut daemon = RunnerDaemon::new(runner_config, gitlab, executor);
+            if let Some(s3) = &cache_s3 {
+                let bucket = runner_daemon::s3::Bucket::new(s3, network.client_builder()?)?;
+                match bucket.probe().await {
+                    Ok(()) => info!("   S3 cache: {}", s3.url),
+                    Err(message) => tracing::warn!(
+                        "S3 cache {}: {} (jobs keep using the local cache)",
+                        s3.url,
+                        message
+                    ),
+                }
+                daemon = daemon.with_s3_cache(bucket);
+            }
             spawn_signal_handler(daemon.shutdown_handle())?;
             daemon.start().await?;
         }

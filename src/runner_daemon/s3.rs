@@ -1,9 +1,6 @@
 //! S3-compatible object storage for the job cache: path-style URLs, SigV4
 //! header signing and the three calls the cache needs.
 
-// Only tests use the client until the job cache wires it in
-#![allow(dead_code)]
-
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -276,12 +273,14 @@ impl Bucket {
     }
 
     /// Shorter waits between attempts (tests)
+    #[cfg(test)]
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
         self
     }
 
     /// Shorter stall timeout (tests)
+    #[cfg(test)]
     pub fn with_stall_timeout(mut self, limit: Duration) -> Self {
         self.stall_timeout = limit;
         self

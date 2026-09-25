@@ -337,6 +337,12 @@ impl RunnerDaemon {
         }
     }
 
+    /// Share the job cache with other runners through S3
+    pub fn with_s3_cache(mut self, bucket: s3::Bucket) -> Self {
+        self.cache = self.cache.with_remote(bucket);
+        self
+    }
+
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         ShutdownHandle(self.shutdown.clone())
     }
@@ -732,12 +738,23 @@ impl RunnerDaemon {
                     restored = self.cache.restore(project_id(job), &keys, &workspace).await;
                 }
                 match restored {
-                    Ok(Some(key)) => {
-                        trace
-                            .write(&format!("Successfully restored cache {}\n", key))
-                            .await
+                    Ok(restored) => {
+                        for warning in &restored.warnings {
+                            warn!("{}", warning);
+                            trace.write(&format!("WARNING: {}\n", warning)).await;
+                        }
+                        match restored.hit {
+                            Some((key, source)) => {
+                                trace
+                                    .write(&format!(
+                                        "Successfully restored cache {} ({})\n",
+                                        key, source
+                                    ))
+                                    .await
+                            }
+                            None => trace.write("No cache found\n").await,
+                        }
                     }
-                    Ok(None) => trace.write("No cache found\n").await,
                     Err(e) => {
                         warn!("Failed to restore cache {}: {}", keys[0], e);
                         trace
@@ -1001,10 +1018,31 @@ impl RunnerDaemon {
                 .save(project_id(job), &key, &workspace.to_string_lossy(), &paths)
                 .await
             {
-                Ok(Some(size)) => {
+                Ok(Some(saved)) => {
                     trace
-                        .write(&format!("Created cache {} ({} bytes)\n", key, size))
-                        .await
+                        .write(&format!("Created cache {} ({} bytes)\n", key, saved.size))
+                        .await;
+                    match saved.upload {
+                        Some(Ok(())) => {
+                            trace
+                                .write(&format!(
+                                    "Uploaded cache {} to S3 ({:.1} MB)\n",
+                                    key,
+                                    saved.size as f64 / 1_048_576.0
+                                ))
+                                .await
+                        }
+                        Some(Err(e)) => {
+                            warn!("Cache {} not uploaded to S3: {}", key, e);
+                            trace
+                                .write(&format!(
+                                    "WARNING: cache {} saved locally, not uploaded to S3: {}\n",
+                                    key, e
+                                ))
+                                .await
+                        }
+                        None => {}
+                    }
                 }
                 Ok(None) => {
                     trace
@@ -1727,6 +1765,68 @@ mod tests {
             trace
         );
         assert!(trace.contains("cached-dep"), "{}", trace);
+    }
+
+    #[tokio::test]
+    async fn s3_errors_are_job_log_warnings_and_the_local_cache_is_used() {
+        let server = MockServer::start().await;
+        let s3 = MockServer::start().await;
+        Mock::given(wiremock::matchers::path("/ci/project-5/deps.zip"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("<Error><Code>AccessDenied</Code></Error>"),
+            )
+            .mount(&s3)
+            .await;
+        let bucket = s3::Bucket::new(
+            &config::S3CacheConfig {
+                url: format!("{}/ci", s3.uri()),
+                access_key: "AK".to_string(),
+                secret_key: "SK".to_string(),
+                region: None,
+            },
+            reqwest::Client::builder(),
+        )
+        .unwrap()
+        .with_retry_delay(Duration::from_millis(10));
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await.with_s3_cache(bucket);
+
+        daemon
+            .execute_job(lifecycle_job(
+                33,
+                &["mkdir -p vendor", "echo cached-dep > vendor/lib.txt"],
+                "on_success",
+            ))
+            .await
+            .unwrap();
+        daemon
+            .execute_job(lifecycle_job(34, &["cat vendor/lib.txt"], "on_success"))
+            .await
+            .unwrap();
+
+        assert_eq!(final_update(&server, 33).await["state"], "success");
+        let saving = trace_of(&server, 33).await;
+        assert!(
+            saving.contains("WARNING: cache deps saved locally, not uploaded to S3: S3 answered 403 Forbidden (AccessDenied)"),
+            "{}",
+            saving
+        );
+        assert_eq!(final_update(&server, 34).await["state"], "success");
+        let restoring = trace_of(&server, 34).await;
+        assert!(
+            restoring.contains(
+                "WARNING: S3 unavailable for cache deps: S3 answered 403 Forbidden (AccessDenied)"
+            ),
+            "{}",
+            restoring
+        );
+        assert!(
+            restoring.contains("Successfully restored cache deps (local copy)"),
+            "{}",
+            restoring
+        );
+        assert!(restoring.contains("cached-dep"), "{}", restoring);
     }
 
     #[tokio::test]
