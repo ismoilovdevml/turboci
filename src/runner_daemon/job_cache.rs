@@ -259,17 +259,24 @@ impl LocalCache {
             .file
             .persist(&path)
             .with_context(|| format!("Failed to save {}", path.display()))?;
-        // The local archive changed: its old ETag no longer describes it
-        let _ = tokio::fs::remove_file(sidecar(&path)).await;
         let upload = match &self.remote {
-            None => None,
+            None => {
+                // Without S3 the old ETag describes nothing any more
+                let _ = tokio::fs::remove_file(sidecar(&path)).await;
+                None
+            }
             Some(remote) => {
+                // Until the upload succeeds the sidecar keeps the ETag of the
+                // object this archive replaced: while S3 still holds that
+                // object, a restore gets 304 and keeps this newer archive.
+                // A failed or interrupted upload leaves it that way.
                 let object = remote.object_key(project_id, &format!("{}.zip", encode_key(key)));
                 Some(match remote.put_file(&object, &path).await {
                     Ok(etag) => {
-                        if let Some(etag) = etag {
-                            let _ = tokio::fs::write(sidecar(&path), etag).await;
-                        }
+                        let _ = match etag {
+                            Some(etag) => tokio::fs::write(sidecar(&path), etag).await,
+                            None => tokio::fs::remove_file(sidecar(&path)).await,
+                        };
                         Ok(())
                     }
                     Err(e) => Err(format!("{:#}", e)),
@@ -473,6 +480,102 @@ mod tests {
             "{:?}",
             restored.warnings
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_keeps_the_previous_etag() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("<Error><Code>AccessDenied</Code></Error>"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // S3 still holds "v1", the archive the local one replaced
+        let old = workspace("old");
+        let root = tempdir().unwrap();
+        LocalCache::new(root.path())
+            .save(
+                5,
+                "main",
+                old.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        let archive = LocalCache::new(root.path()).archive_path(5, "main");
+        std::fs::write(sidecar(&archive), "\"v1\"").unwrap();
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(std::fs::read(&archive).unwrap()),
+            )
+            .mount(&server)
+            .await;
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+        let newer = workspace("new");
+
+        let saved = cache
+            .save(
+                5,
+                "main",
+                newer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            matches!(&saved.upload, Some(Err(e)) if e.contains("AccessDenied")),
+            "{:?}",
+            saved.upload
+        );
+        assert_eq!(
+            std::fs::read_to_string(sidecar(&archive)).unwrap(),
+            "\"v1\""
+        );
+        let consumer = tempdir().unwrap();
+        let restored = cache
+            .restore(5, &["main".to_string()], consumer.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(restored.hit, Some((_, Source::S3NotModified))),
+            "{:?}",
+            restored
+        );
+        assert_eq!(
+            std::fs::read_to_string(consumer.path().join("vendor/lib.txt")).unwrap(),
+            "new"
+        );
+
+        // An upload S3 takes without an ETag leaves no sidecar
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let saved = cache
+            .save(
+                5,
+                "main",
+                newer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.upload, Some(Ok(())));
+        assert!(!sidecar(&archive).exists());
     }
 
     #[tokio::test]
