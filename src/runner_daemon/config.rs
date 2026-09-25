@@ -48,8 +48,24 @@ pub struct RunnerConfig {
     pub pre_build_script: Option<String>,
     pub post_build_script: Option<String>,
 
+    /// S3-compatible storage shared by runners, used next to `cache_dir`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_s3: Option<S3CacheConfig>,
+
     /// Executor configuration
     pub executor: ExecutorConfig,
+}
+
+/// `[cache_s3]`: S3-compatible storage shared by runners, the cache's second layer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3CacheConfig {
+    /// `https://host[:port]/bucket[/prefix]`; `http://` for storage without TLS
+    pub url: String,
+    pub access_key: String,
+    pub secret_key: String,
+    /// Signing region; default from *.amazonaws.com hosts, else us-east-1
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +345,7 @@ impl Default for RunnerConfig {
             post_get_sources_script: None,
             pre_build_script: None,
             post_build_script: None,
+            cache_s3: None,
             executor: ExecutorConfig::default(),
         }
     }
@@ -431,6 +448,12 @@ impl RunnerConfig {
                 "environment entries must look like KEY=value, got {:?}",
                 bad
             );
+        }
+        if let Some(s3) = &self.cache_s3 {
+            super::s3::S3Location::parse(&s3.url, s3.region.as_deref())?;
+            if s3.access_key.trim().is_empty() || s3.secret_key.trim().is_empty() {
+                anyhow::bail!("cache_s3 needs access_key and secret_key");
+            }
         }
         match self.executor.executor_type.as_str() {
             "docker" | "shell" => Ok(()),
@@ -752,5 +775,27 @@ mod tests {
             ..RunnerConfig::default()
         };
         assert!(missing.network().is_err());
+    }
+
+    #[test]
+    fn s3_cache_settings_are_validated() {
+        let ok = RunnerConfig::parse(
+            "runner_token = \"t\"\n[cache_s3]\nurl = \"http://minio:9000/ci\"\naccess_key = \"a\"\nsecret_key = \"s\"",
+        )
+        .unwrap();
+        ok.validate().unwrap();
+        assert!(unknown_keys("runner_token = \"t\"\n[cache_s3]\nurl = \"http://minio:9000/ci\"\naccess_key = \"a\"\nsecret_key = \"s\"", &ok).is_empty());
+
+        for bad in [
+            "[cache_s3]\nurl = \"http://minio:9000\"\naccess_key = \"a\"\nsecret_key = \"s\"",
+            "[cache_s3]\nurl = \"http://minio:9000/ci\"\naccess_key = \"\"\nsecret_key = \"s\"",
+        ] {
+            let config = RunnerConfig::parse(&format!("runner_token = \"t\"\n{}", bad)).unwrap();
+            assert!(config.validate().is_err(), "accepted {}", bad);
+        }
+        assert!(
+            RunnerConfig::parse("runner_token = \"t\"\n[cache_s3]\nurl = \"http://m/ci\"").is_err(),
+            "keys are required"
+        );
     }
 }

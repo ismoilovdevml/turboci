@@ -18,6 +18,7 @@ pub mod executor;
 pub mod git;
 pub mod image;
 pub mod job_cache;
+pub mod s3;
 pub mod script;
 pub mod system_id;
 pub mod token;
