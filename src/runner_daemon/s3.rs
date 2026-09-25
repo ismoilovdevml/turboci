@@ -242,6 +242,11 @@ pub struct Bucket {
     retry_delay: Duration,
     /// A transfer fails after this long without data moving
     stall_timeout: Duration,
+    /// How long calls are skipped after S3 was unreachable
+    cooldown: Duration,
+    /// Until when calls are skipped, and why; shared by clones, so one job's
+    /// failure spares the others the same timeouts
+    breaker: Arc<Mutex<Option<(Instant, String)>>>,
 }
 
 impl std::fmt::Debug for Bucket {
@@ -269,6 +274,8 @@ impl Bucket {
             secret_key: config.secret_key.clone(),
             retry_delay: Duration::from_secs(1),
             stall_timeout: Duration::from_secs(60),
+            cooldown: Duration::from_secs(60),
+            breaker: Arc::default(),
         })
     }
 
@@ -284,6 +291,40 @@ impl Bucket {
     pub fn with_stall_timeout(mut self, limit: Duration) -> Self {
         self.stall_timeout = limit;
         self
+    }
+
+    /// Shorter pause after an outage (tests)
+    #[cfg(test)]
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = cooldown;
+        self
+    }
+
+    /// Fail at once while S3 is known to be down, instead of waiting through
+    /// the same timeouts and retries on every call
+    fn check_breaker(&self) -> Result<()> {
+        let Ok(breaker) = self.breaker.lock() else {
+            return Ok(());
+        };
+        match &*breaker {
+            Some((until, error)) if *until > Instant::now() => {
+                let left = until.saturating_duration_since(Instant::now());
+                anyhow::bail!(
+                    "S3 skipped for the next {}s after: {}",
+                    left.as_secs_f64().ceil() as u64,
+                    error
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Skip calls for the cooldown after a network-level failure
+    fn trip(&self, error: anyhow::Error) -> anyhow::Error {
+        if let Ok(mut breaker) = self.breaker.lock() {
+            *breaker = Some((Instant::now() + self.cooldown, format!("{:#}", error)));
+        }
+        error
     }
 
     /// `<prefix>/project-<id>/<file_name>`
@@ -330,6 +371,7 @@ impl Bucket {
             self.location.endpoint.as_str().trim_end_matches('/'),
             path
         );
+        self.check_breaker()?;
         let mut last_error = None;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
@@ -399,11 +441,17 @@ impl Bucket {
                 Ok(response) if response.status().is_server_error() => {
                     last_error = Some(anyhow::anyhow!("S3 answered {}", response.status()));
                 }
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    // S3 answered: it is reachable again (4xx included)
+                    if let Ok(mut breaker) = self.breaker.lock() {
+                        *breaker = None;
+                    }
+                    return Ok(response);
+                }
                 Err(e) => last_error = Some(e),
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("S3 request failed")))
+        Err(self.trip(last_error.unwrap_or_else(|| anyhow::anyhow!("S3 request failed"))))
     }
 
     /// Download `key` into a temporary file in `dir`, unless `etag` is current
@@ -432,8 +480,9 @@ impl Bucket {
         use tokio::io::AsyncWriteExt;
         while let Some(chunk) = tokio::time::timeout(self.stall_timeout, response.chunk())
             .await
-            .map_err(|_| stalled(self.stall_timeout))?
-            .context("S3 download interrupted")?
+            .map_err(|_| stalled(self.stall_timeout))
+            .and_then(|chunk| chunk.context("S3 download interrupted"))
+            .map_err(|e| self.trip(e))?
         {
             out.write_all(&chunk).await?;
             bytes += chunk.len() as u64;
@@ -444,6 +493,8 @@ impl Bucket {
 
     /// Upload the file at `path` as `key`; returns the new object's ETag
     pub async fn put_file(&self, key: &str, path: &Path) -> Result<Option<String>> {
+        // Before hashing: a large archive takes a while
+        self.check_breaker()?;
         let len = tokio::fs::metadata(path).await?.len();
         if len > MAX_SINGLE_PUT {
             anyhow::bail!(
@@ -817,10 +868,162 @@ mod tests {
         assert!(stuck.to_string().contains("stalled"), "{:#}", stuck);
         let file = dir.path().join("stuck.zip");
         std::fs::write(&file, b"zip").unwrap();
+        // A new bucket: the stalled GET opened this one's breaker
+        let b = bucket(&server, "").with_stall_timeout(Duration::from_millis(300));
         let upload = b
             .put_file(&b.object_key(1, "stuck.zip"), &file)
             .await
             .unwrap_err();
-        assert!(upload.to_string().contains("stalled"), "{:#}", upload);
+        assert!(upload.to_string().contains("S3 stalled"), "{:#}", upload);
+    }
+
+    #[tokio::test]
+    async fn an_outage_stops_further_calls_until_the_cooldown_ends() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/down.zip"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let b = bucket(&server, "");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k.zip");
+        std::fs::write(&file, b"zip").unwrap();
+
+        let outage = b
+            .get_to_file(&b.object_key(1, "down.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(outage.to_string().contains("503"), "{:#}", outage);
+
+        // Clones share the breaker: nothing reaches S3 during the cooldown
+        let other = b.clone();
+        let skipped = other
+            .get_to_file(&other.object_key(1, "other.zip"), None, dir.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            skipped.starts_with("S3 skipped for the next") && skipped.contains("503"),
+            "{}",
+            skipped
+        );
+        let upload = other
+            .put_file(&other.object_key(1, "k.zip"), &file)
+            .await
+            .unwrap_err();
+        assert!(upload.to_string().contains("S3 skipped"), "{:#}", upload);
+        let probe = other.probe().await.unwrap_err();
+        assert!(probe.contains("S3 skipped"), "{}", probe);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn calls_reach_s3_again_after_the_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/down.zip"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/back.zip"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let b = bucket(&server, "").with_cooldown(Duration::from_millis(50));
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(b
+            .get_to_file(&b.object_key(1, "down.zip"), None, dir.path())
+            .await
+            .is_err());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(matches!(
+            b.get_to_file(&b.object_key(1, "back.zip"), None, dir.path())
+                .await
+                .unwrap(),
+            Download::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_errors_do_not_open_the_breaker() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/denied.zip"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("<Error><Code>AccessDenied</Code></Error>"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/gone.zip"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let b = bucket(&server, "");
+        let dir = tempfile::tempdir().unwrap();
+
+        let denied = b
+            .get_to_file(&b.object_key(1, "denied.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("AccessDenied"), "{:#}", denied);
+
+        assert!(matches!(
+            b.get_to_file(&b.object_key(1, "gone.zip"), None, dir.path())
+                .await
+                .unwrap(),
+            Download::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_download_that_stalls_midway_opens_the_breaker() {
+        use tokio::io::AsyncWriteExt;
+        // Sends the headers and part of the body, then goes silent
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let b = Bucket::new(
+            &crate::runner_daemon::config::S3CacheConfig {
+                url: format!("http://{}/ci-cache", address),
+                access_key: "AK".to_string(),
+                secret_key: "SK".to_string(),
+                region: None,
+            },
+            reqwest::Client::builder(),
+        )
+        .unwrap()
+        .with_stall_timeout(Duration::from_millis(200));
+        let dir = tempfile::tempdir().unwrap();
+
+        let stalled = b
+            .get_to_file(&b.object_key(1, "big.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(stalled.to_string().contains("S3 stalled"), "{:#}", stalled);
+
+        let skipped = b
+            .get_to_file(&b.object_key(1, "next.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(skipped.to_string().contains("S3 skipped"), "{:#}", skipped);
+        server.abort();
     }
 }

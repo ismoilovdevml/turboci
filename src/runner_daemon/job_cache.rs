@@ -228,6 +228,8 @@ impl LocalCache {
                         let _ = tokio::fs::remove_file(sidecar(path)).await;
                     }
                 }
+                // Hosts that only pull must keep the local layer bounded too
+                self.evict(dir);
                 Ok(Some(Source::S3Downloaded(bytes)))
             }
         }
@@ -520,6 +522,54 @@ mod tests {
             !root.path().join("project-5/main.zip.etag").exists(),
             "no ETag header, no sidecar"
         );
+    }
+
+    #[tokio::test]
+    async fn downloads_evict_old_archives_without_a_save() {
+        let server = MockServer::start().await;
+        let root = tempdir().unwrap();
+        let producer = workspace("dep");
+        let local = LocalCache::new(root.path()).with_max_age_days(1);
+        local
+            .save(
+                5,
+                "a",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        let old = local.archive_path(5, "a");
+        let archive = std::fs::read(&old).unwrap();
+        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        std::fs::File::options()
+            .append(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/b.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+            .mount(&server)
+            .await;
+        let cache = LocalCache::new(root.path())
+            .with_max_age_days(1)
+            .with_remote(remote(&server));
+        let consumer = tempdir().unwrap();
+
+        let restored = cache
+            .restore(5, &["b".to_string()], consumer.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(restored.hit, Some((_, Source::S3Downloaded(_)))),
+            "{:?}",
+            restored
+        );
+        assert!(!old.exists(), "archive unused for 2 days kept");
+        assert!(cache.archive_path(5, "b").exists());
     }
 
     #[tokio::test]

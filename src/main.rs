@@ -190,14 +190,18 @@ async fn main() -> Result<()> {
             let mut daemon = RunnerDaemon::new(runner_config, gitlab, executor);
             if let Some(s3) = &cache_s3 {
                 let bucket = runner_daemon::s3::Bucket::new(s3, network.client_builder()?)?;
-                match bucket.probe().await {
-                    Ok(()) => info!("   S3 cache: {}", s3.url),
-                    Err(message) => tracing::warn!(
-                        "S3 cache {}: {} (jobs keep using the local cache)",
-                        s3.url,
-                        message
-                    ),
-                }
+                // In the background: a slow S3 must not delay taking jobs
+                let (probe, url) = (bucket.clone(), s3.url.clone());
+                tokio::spawn(async move {
+                    match probe.probe().await {
+                        Ok(()) => info!("   S3 cache: {}", url),
+                        Err(message) => tracing::warn!(
+                            "S3 cache {}: {} (jobs keep using the local cache)",
+                            url,
+                            message
+                        ),
+                    }
+                });
                 daemon = daemon.with_s3_cache(bucket);
             }
             spawn_signal_handler(daemon.shutdown_handle())?;
