@@ -27,6 +27,8 @@ CONCURRENT="${TURBOCI_CONCURRENT:-4}"
 VERSION="${TURBOCI_VERSION:-}"
 LOCAL_BINARY=""
 TLS_CA_FILE="${TURBOCI_TLS_CA_FILE:-}"
+PROXY="${TURBOCI_PROXY:-}"
+NO_PROXY_LIST="${TURBOCI_NO_PROXY:-}"
 START_SERVICE=1
 
 usage() {
@@ -42,6 +44,9 @@ Usage: install.sh [options]
   --binary PATH      Install this binary instead of downloading a release
   --tls-ca-file PATH CA certificate (PEM) of a GitLab with a self-signed or
                      internal certificate
+  --proxy URL        HTTP(S) proxy for the runner, its jobs and services
+                     (http://[user:pass@]host:port)
+  --no-proxy LIST    Hosts, domains (.corp.local) and CIDRs reached directly
   --no-start         Configure but do not start the service
   --name NAME        Install a second runner under this name (service NAME,
                      config /etc/NAME-runner.toml, state /var/lib/NAME);
@@ -52,7 +57,7 @@ Usage: install.sh [options]
   -h, --help         Show this help
 
 Environment: TURBOCI_URL, TURBOCI_TOKEN, TURBOCI_EXECUTOR, TURBOCI_CONCURRENT,
-TURBOCI_VERSION, TURBOCI_NAME, TURBOCI_USER.
+TURBOCI_VERSION, TURBOCI_NAME, TURBOCI_USER, TURBOCI_PROXY, TURBOCI_NO_PROXY.
 USAGE
 }
 
@@ -65,6 +70,8 @@ while [ $# -gt 0 ]; do
         --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
         --binary) LOCAL_BINARY="${2:?--binary needs a value}"; shift 2 ;;
         --tls-ca-file) TLS_CA_FILE="${2:?--tls-ca-file needs a value}"; shift 2 ;;
+        --proxy) PROXY="${2:?--proxy needs a value}"; shift 2 ;;
+        --no-proxy) NO_PROXY_LIST="${2:?--no-proxy needs a value}"; shift 2 ;;
         --no-start) START_SERVICE=0; shift ;;
         --name) INSTANCE="${2:?--name needs a value}"; shift 2 ;;
         --user) SERVICE_USER="${2:?--user needs a value}"; shift 2 ;;
@@ -75,6 +82,21 @@ done
 
 if ! [[ "$INSTANCE" =~ ^[a-z][a-z0-9-]{0,30}$ ]]; then
     echo "--name must be lowercase letters, digits and dashes" >&2
+    exit 1
+fi
+# Values go into a TOML string: no whitespace, quotes or backslashes
+PROXY_RE='^https?://[^[:space:]"\\]+$'
+UNSAFE_RE='[[:space:]"\\]'
+if [ -n "$PROXY" ] && ! [[ "$PROXY" =~ $PROXY_RE ]]; then
+    echo "--proxy must be an http:// or https:// URL" >&2
+    exit 1
+fi
+if [ -n "$NO_PROXY_LIST" ] && [ -z "$PROXY" ]; then
+    echo "--no-proxy needs --proxy" >&2
+    exit 1
+fi
+if [[ "$NO_PROXY_LIST" =~ $UNSAFE_RE ]]; then
+    echo "--no-proxy must be a comma-separated list without spaces or quotes" >&2
     exit 1
 fi
 SERVICE_NAME="$INSTANCE"
@@ -418,6 +440,16 @@ create_config() {
         echo -e "${GREEN}✓${NC} CA certificate: ${BLUE}/etc/turboci-ca.pem${NC}"
     fi
 
+    PROXY_LINES=""
+    if [ -n "$PROXY" ]; then
+        PROXY_LINES="proxy = \"$PROXY\""
+        if [ -n "$NO_PROXY_LIST" ]; then
+            PROXY_LINES="$PROXY_LINES
+no_proxy = \"$NO_PROXY_LIST\""
+        fi
+        echo -e "${GREEN}✓${NC} Proxy configured"
+    fi
+
     cat > "$CONFIG_FILE" << EOF
 # TurboCI Runner Configuration
 concurrent = $CONCURRENT
@@ -425,6 +457,7 @@ check_interval = 3
 runner_token = "$RUNNER_TOKEN"
 gitlab_url = "$GITLAB_URL"
 $TLS_CA_LINE
+$PROXY_LINES
 cache_enabled = true
 cache_dir = "$STATE_DIR/cache"
 state_dir = "$STATE_DIR"

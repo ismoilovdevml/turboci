@@ -17,6 +17,11 @@ gitlab_url = "https://gitlab.com"
 # the runner, and given to jobs as CI_SERVER_TLS_CA_FILE / GIT_SSL_CAINFO
 # tls_ca_file = "/etc/turboci-ca.pem"
 
+# HTTP(S) proxy for the runner, its jobs and services; NO_PROXY for jobs also
+# gets localhost and the job's service aliases
+# proxy = "http://proxy.corp:3128"
+# no_proxy = "localhost,.corp.local,10.0.0.0/8"
+
 # Directory the runner writes its state to. When GitLab gives the runner token
 # an expiry, the runner resets it after 3/4 of its lifetime and keeps the new
 # token here (runner_token.json); a different runner_token above replaces it.

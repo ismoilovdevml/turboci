@@ -490,6 +490,10 @@ mod tests {
             .replace("$RUNNER_TOKEN", "")
             .replace("$GITLAB_URL", "https://gitlab.com")
             .replace("$TLS_CA_LINE", "tls_ca_file = \"/etc/turboci-ca.pem\"")
+            .replace(
+                "$PROXY_LINES",
+                "proxy = \"http://proxy.corp:3128\"\nno_proxy = \"localhost,.corp.local\"",
+            )
             .replace("$EXECUTOR", "docker")
             .replace("$STATE_DIR", "/var/lib/turboci")
             .replace("$SERVICE_USER", "turboci");

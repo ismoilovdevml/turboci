@@ -745,6 +745,31 @@ fn workspace_owner(dir: &Path) -> Option<String> {
     }
 }
 
+/// Settings of the host dockerd that the runner's config needs but that only
+/// dockerd's own configuration can provide; each entry says how to fix it
+pub fn daemon_warnings(
+    info: &bollard::models::SystemInfo,
+    config: &DockerConfig,
+    proxy: bool,
+    certs_dir: &Path,
+) -> Vec<String> {
+    let _ = (config, certs_dir);
+    let mut warnings = Vec::new();
+    let dockerd_proxy = [&info.http_proxy, &info.https_proxy]
+        .iter()
+        .any(|value| value.as_deref().is_some_and(|v| !v.is_empty()));
+    if proxy && !dockerd_proxy {
+        warnings.push(
+            "proxy is set but dockerd has none, so image pulls bypass it. Add \
+             /etc/systemd/system/docker.service.d/proxy.conf with [Service] \
+             Environment=\"HTTP_PROXY=...\" \"HTTPS_PROXY=...\" \"NO_PROXY=...\", then \
+             systemctl daemon-reload && systemctl restart docker"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
 /// Containers and network created for one job, removed when it ends
 #[derive(Default)]
 struct JobContainers {
@@ -817,6 +842,16 @@ impl DockerExecutor {
                     info!("🧹 Removed leftover network {}", name);
                 }
             }
+        }
+    }
+
+    /// `daemon_warnings` for the Docker daemon this runner uses
+    pub async fn daemon_warnings(&self, proxy: bool) -> Vec<String> {
+        match self.docker.info().await {
+            Ok(info) => {
+                daemon_warnings(&info, &self.config, proxy, Path::new("/etc/docker/certs.d"))
+            }
+            Err(e) => vec![format!("Cannot read the Docker daemon's settings: {}", e)],
         }
     }
 
@@ -2772,6 +2807,23 @@ mod tests {
             vec![8080]
         );
         assert!(service_ports(None).is_empty());
+    }
+
+    #[test]
+    fn warns_when_dockerd_has_no_proxy() {
+        let config = DockerConfig::default();
+        let certs = std::path::Path::new("/nonexistent");
+        let bare = bollard::models::SystemInfo::default();
+        let with_proxy = bollard::models::SystemInfo {
+            https_proxy: Some("http://proxy.corp:3128".to_string()),
+            ..Default::default()
+        };
+
+        let warnings = daemon_warnings(&bare, &config, true, certs);
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(warnings[0].contains("docker.service.d"), "{}", warnings[0]);
+        assert!(daemon_warnings(&with_proxy, &config, true, certs).is_empty());
+        assert!(daemon_warnings(&bare, &config, false, certs).is_empty());
     }
 
     #[test]

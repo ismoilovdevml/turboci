@@ -170,10 +170,12 @@ async fn main() -> Result<()> {
                 }
                 "docker" => {
                     info!("🐳 Using Docker executor (isolated containers)");
-                    ExecutorType::Docker(
-                        DockerExecutor::new(runner_config.executor.docker.clone())?
-                            .with_owner(&system_id),
-                    )
+                    let docker = DockerExecutor::new(runner_config.executor.docker.clone())?
+                        .with_owner(&system_id);
+                    for warning in docker.daemon_warnings(runner_config.proxy.is_some()).await {
+                        tracing::warn!("{}", warning);
+                    }
+                    ExecutorType::Docker(docker)
                 }
                 _ => {
                     return Err(anyhow::anyhow!(

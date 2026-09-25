@@ -63,6 +63,46 @@ environment = ["ANDROID_HOME=/home/ci/Android/Sdk", "GIT_STRATEGY=clone"]
 pre_get_sources_script = "export PATH=$PATH:/opt/flutter/bin"
 ```
 
+## Proxy
+
+```toml
+proxy = "http://proxy.corp:3128"
+no_proxy = "localhost,.corp.local,10.0.0.0/8"
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `proxy` | – | Proxy for HTTP and HTTPS (`http://` or `https://`, may hold `user:pass@`) |
+| `no_proxy` | – | Comma-separated hosts, domains (`.corp.local`), IPs and CIDRs reached directly. Needs `proxy` |
+
+With `proxy` set:
+
+- The runner's own requests (GitLab API, job logs, artifacts, the S3 cache)
+  go through it. Without it the runner reads `HTTP_PROXY`, `HTTPS_PROXY` and
+  `NO_PROXY` from its environment.
+- Jobs, the source checkout and services get `HTTP_PROXY`, `HTTPS_PROXY`,
+  `NO_PROXY` and their lowercase forms. A job that sets one of them itself
+  keeps its own value; the runner's `environment` overrides both. Each of the
+  six is overridden on its own: a job that sets only `HTTP_PROXY` still gets
+  the runner's `http_proxy`, which curl and git read first, and a job-level
+  `NO_PROXY` replaces the runner's list, including the loopback and service
+  aliases below.
+- `NO_PROXY` also lists `localhost`, `127.0.0.1`, `::1` and the job's service
+  aliases, so `tcp://docker:2375` and `postgres:5432` never go to the proxy.
+- A password in the proxy URL is masked in job logs.
+
+Image pulls are done by dockerd, which has its own proxy setting. At start the
+runner logs a warning with the drop-in to add when dockerd has no proxy:
+
+```ini
+# /etc/systemd/system/docker.service.d/proxy.conf
+[Service]
+Environment="HTTP_PROXY=http://proxy.corp:3128" "HTTPS_PROXY=http://proxy.corp:3128" "NO_PROXY=localhost,.corp.local"
+```
+
+Then `systemctl daemon-reload && systemctl restart docker`. The installer
+writes the runner's side with `--proxy URL --no-proxy LIST`.
+
 ## Cache
 
 | Key | Default | Description |
