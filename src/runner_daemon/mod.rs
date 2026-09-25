@@ -36,8 +36,45 @@ fn attempts(job: &Job, key: &str) -> u32 {
         .clamp(1, 10)
 }
 
-/// Add the runner config's `environment` and hook scripts to a job
+/// Add the runner config's proxy, `environment` and hook scripts to a job
 fn apply_runner_config(job: &mut Job, config: &config::RunnerConfig) {
+    if let Some(proxy) = &config.proxy {
+        // Service aliases only exist on the job's network, never behind the proxy
+        let values = job_variables(job);
+        let aliases: Vec<String> = config
+            .executor
+            .docker
+            .services
+            .iter()
+            .map(|s| (s.name.clone(), s.alias.clone()))
+            .chain(
+                job.services
+                    .iter()
+                    .map(|s| (s.name.clone(), s.alias.clone())),
+            )
+            .flat_map(|(name, alias)| {
+                image::service_aliases(&script::expand(&name, &values), alias.as_deref())
+            })
+            .collect();
+        let no_proxy = crate::net::effective_no_proxy(config.no_proxy.as_deref(), &aliases);
+        // Inserted first, so the job's own variables and `environment` win
+        for (key, value) in [
+            ("HTTP_PROXY", proxy.as_str()),
+            ("HTTPS_PROXY", proxy.as_str()),
+            ("http_proxy", proxy.as_str()),
+            ("https_proxy", proxy.as_str()),
+            ("NO_PROXY", no_proxy.as_str()),
+            ("no_proxy", no_proxy.as_str()),
+        ] {
+            job.variables.insert(
+                0,
+                serde_json::from_value(serde_json::json!({
+                    "key": key, "value": value, "public": true, "internal": true, "raw": true
+                }))
+                .expect("valid variable"),
+            );
+        }
+    }
     for entry in &config.environment {
         if let Some((key, value)) = entry.split_once('=') {
             job.variables.push(
@@ -276,6 +313,10 @@ impl RunnerDaemon {
         // Add GitLab URL as potential secret location
         if config.gitlab_url.contains('@') {
             scrubber.add_secret(config.gitlab_url.clone());
+        }
+        // A proxy URL with a password must not show up in job logs
+        if let Some(proxy) = config.proxy.as_ref().filter(|p| p.contains('@')) {
+            scrubber.add_secret(proxy.clone());
         }
 
         Self {
@@ -1461,6 +1502,77 @@ mod tests {
         })
         .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{}", trace);
+    }
+
+    #[tokio::test]
+    async fn proxy_reaches_jobs_and_yields_to_job_variables() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = daemon(&server, dir.path()).await;
+        let mut config = (*runner.config).clone();
+        config.proxy = Some("http://proxy.corp:3128".into());
+        config.no_proxy = Some(".corp.local".into());
+        runner.config = Arc::new(config);
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 132, "token": "t",
+            "variables": [{"key": "https_proxy", "value": "http://job-proxy:8080"}],
+            "services": [{"name": "docker:27-dind", "alias": "docker"}],
+            "steps": [{"name": "script", "when": "on_success", "script": [
+                "echo \"http=$HTTP_PROXY lower=$http_proxy\"",
+                "echo \"https=$HTTPS_PROXY job=$https_proxy\"",
+                "echo \"no=$NO_PROXY\""
+            ]}]
+        }))
+        .unwrap();
+
+        runner.execute_job(job).await.unwrap();
+
+        let trace = trace_of(&server, 132).await;
+        assert!(
+            trace.contains("http=http://proxy.corp:3128 lower=http://proxy.corp:3128"),
+            "{}",
+            trace
+        );
+        assert!(
+            trace.contains("https=http://proxy.corp:3128 job=http://job-proxy:8080"),
+            "{}",
+            trace
+        );
+        // docker:27-dind with alias "docker" is reachable only as "docker"
+        assert!(
+            trace.contains("no=.corp.local,localhost,127.0.0.1,::1,docker\n"),
+            "{}",
+            trace
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_with_credentials_is_masked_in_job_logs() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Mounts the GitLab mocks; the runner under test is built below because
+        // the scrubber is filled in RunnerDaemon::new
+        let base = daemon(&server, dir.path()).await;
+        let mut config = (*base.config).clone();
+        config.proxy = Some("http://user:s3cr3t-pass@proxy.corp:3128".into());
+        let runner = RunnerDaemon::new(
+            config,
+            GitLabClient::new(server.uri(), "glrt-test".to_string()),
+            executor::ExecutorType::Shell(executor::ShellExecutor::new(Some(
+                dir.path().join("builds").to_string_lossy().into_owned(),
+            ))),
+        );
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 133, "token": "t",
+            "steps": [{"name": "script", "when": "on_success", "script": ["echo \"p=$HTTP_PROXY\""]}]
+        }))
+        .unwrap();
+
+        runner.execute_job(job).await.unwrap();
+
+        let trace = trace_of(&server, 133).await;
+        assert!(!trace.contains("s3cr3t-pass"), "{}", trace);
+        assert!(trace.contains("p=[MASKED]"), "{}", trace);
     }
 
     #[test]

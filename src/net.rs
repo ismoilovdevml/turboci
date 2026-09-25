@@ -97,6 +97,25 @@ impl Network {
     }
 }
 
+/// NO_PROXY for jobs: the configured entries, loopback, and `extra` (the job's
+/// service aliases, which only exist on the job's network), without repeats
+// Only the runner (feature `runner`) passes it to jobs
+#[cfg_attr(not(feature = "runner"), allow(dead_code))]
+pub fn effective_no_proxy(configured: Option<&str>, extra: &[String]) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    let given = configured.unwrap_or("").split(',').map(str::trim);
+    let loopback = ["localhost", "127.0.0.1", "::1"].into_iter();
+    for entry in given
+        .chain(loopback)
+        .chain(extra.iter().map(String::as_str))
+    {
+        if !entry.is_empty() && !entries.iter().any(|e| e == entry) {
+            entries.push(entry.to_string());
+        }
+    }
+    entries.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +232,22 @@ mod tests {
         );
         assert!(!request_line.is_finished(), "the proxy must not be used");
         request_line.abort();
+    }
+
+    #[test]
+    fn effective_no_proxy_adds_loopback_and_services_once() {
+        assert_eq!(
+            effective_no_proxy(
+                Some(" .corp.local, localhost ,10.0.0.0/8"),
+                &[
+                    "docker".to_string(),
+                    "postgres".to_string(),
+                    "docker".to_string()
+                ]
+            ),
+            ".corp.local,localhost,10.0.0.0/8,127.0.0.1,::1,docker,postgres"
+        );
+        assert_eq!(effective_no_proxy(None, &[]), "localhost,127.0.0.1,::1");
     }
 
     #[test]
