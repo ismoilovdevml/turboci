@@ -44,7 +44,7 @@ The runner then shows as **online** in GitLab.
 | `--version vX.Y.Z` | latest | Release to install |
 | `--binary PATH` | – | Install a local binary instead of downloading one |
 | `--tls-ca-file PATH` | – | CA (PEM) of a GitLab with a self-signed or internal certificate |
-| `--proxy URL` | – | HTTP(S) proxy for the runner, its jobs and services (`http://[user:pass@]host:port`) |
+| `--proxy URL` | – | HTTP(S) proxy for the runner, its jobs and services, and the installer's own downloads (`http://[user:pass@]host:port`) |
 | `--no-proxy LIST` | – | Hosts, domains (`.corp.local`) and CIDRs reached directly. Needs `--proxy` |
 | `--insecure-registry HOST` | – | Registry reached over HTTP or without certificate checks, for docker:dind services (repeatable). dockerd needs it in `/etc/docker/daemon.json` too |
 | `--registry-ca HOST=FILE` | – | CA (PEM) of a registry, installed for dockerd in `/etc/docker/certs.d/HOST/ca.crt` and for docker:dind services (repeatable) |

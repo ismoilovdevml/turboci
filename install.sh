@@ -46,8 +46,8 @@ Usage: install.sh [options]
   --binary PATH      Install this binary instead of downloading a release
   --tls-ca-file PATH CA certificate (PEM) of a GitLab with a self-signed or
                      internal certificate
-  --proxy URL        HTTP(S) proxy for the runner, its jobs and services
-                     (http://[user:pass@]host:port)
+  --proxy URL        HTTP(S) proxy for the runner, its jobs and services, and
+                     this installer's downloads (http://[user:pass@]host:port)
   --no-proxy LIST    Hosts, domains (.corp.local) and CIDRs reached directly
   --insecure-registry HOST  Registry reached over HTTP or without certificate
                      checks, for docker:dind services (repeatable). dockerd
@@ -115,6 +115,7 @@ for host in "${INSECURE_REGISTRIES[@]}"; do
         exit 1
     fi
 done
+REGISTRY_CA_HOSTS=" "
 for entry in "${REGISTRY_CAS[@]}"; do
     host="${entry%%=*}"
     file="${entry#*=}"
@@ -122,7 +123,20 @@ for entry in "${REGISTRY_CAS[@]}"; do
         echo "--registry-ca must be HOST=FILE with an existing file, got $entry" >&2
         exit 1
     fi
+    # A repeated host would be a duplicate TOML key: the runner would not start
+    case "$REGISTRY_CA_HOSTS" in
+        *" $host "*) echo "--registry-ca: $host is given more than once" >&2; exit 1 ;;
+    esac
+    REGISTRY_CA_HOSTS="$REGISTRY_CA_HOSTS$host "
 done
+# The installer's own downloads (release, get.docker.com and the packages it
+# installs) use the proxy too: sudo drops the caller's proxy variables
+if [ -n "$PROXY" ]; then
+    export http_proxy="$PROXY" https_proxy="$PROXY" HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY"
+    if [ -n "$NO_PROXY_LIST" ]; then
+        export no_proxy="$NO_PROXY_LIST" NO_PROXY="$NO_PROXY_LIST"
+    fi
+fi
 SERVICE_NAME="$INSTANCE"
 STATE_DIR="/var/lib/$INSTANCE"
 CONFIG_FILE="$CONFIG_DIR/$INSTANCE-runner.toml"
