@@ -239,6 +239,14 @@ impl DockerConfig {
             );
         }
         for (registry, file) in &self.registry_ca {
+            // dockerd mounts it into dind services and rejects relative sources
+            if !Path::new(file).is_absolute() {
+                anyhow::bail!(
+                    "executor.docker.registry_ca: {} for {} must be an absolute path",
+                    file,
+                    registry
+                );
+            }
             let pem = fs::read(file).with_context(|| {
                 format!(
                     "executor.docker.registry_ca: cannot read {} for {}",
@@ -693,6 +701,16 @@ mod tests {
         ));
         ok.validate().unwrap();
         assert_eq!(ok.executor.docker.registry_ca.len(), 1);
+        // The same certificate as a path relative to the working directory:
+        // readable here, but dockerd rejects relative bind-mount sources
+        let relative = std::env::current_dir()
+            .unwrap()
+            .components()
+            .skip(1)
+            .map(|_| "..")
+            .collect::<std::path::PathBuf>()
+            .join(cert.strip_prefix("/").unwrap());
+        assert!(std::fs::metadata(&relative).is_ok(), "{:?}", relative);
 
         for bad in [
             "insecure_registries = [\"\"]".to_string(),
@@ -706,6 +724,10 @@ mod tests {
             format!(
                 "[executor.docker.registry_ca]\n\"https://harbor.corp\" = {:?}",
                 cert.to_str().unwrap()
+            ),
+            format!(
+                "[executor.docker.registry_ca]\n\"harbor.corp\" = {:?}",
+                relative.to_str().unwrap()
             ),
         ] {
             assert!(config(&bad).validate().is_err(), "accepted {}", bad);
