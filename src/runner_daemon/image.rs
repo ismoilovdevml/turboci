@@ -78,6 +78,43 @@ pub fn dind_command(command: Option<&[String]>, insecure: &[String]) -> Option<V
     Some(args)
 }
 
+/// Whether `ip` is inside `cidr` ("10.0.0.0/8", "::1/128"); false when unparsable
+pub fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
+    use std::net::IpAddr;
+    let Some((network, bits)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(network), Ok(bits)) = (network.parse::<IpAddr>(), bits.parse::<u32>()) else {
+        return false;
+    };
+    match (ip, network) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) if bits <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            u32::from(ip) & mask == u32::from(net) & mask
+        }
+        (IpAddr::V6(ip), IpAddr::V6(net)) if bits <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+            u128::from(ip) & mask == u128::from(net) & mask
+        }
+        _ => false,
+    }
+}
+
+/// A line for the job log when an image pull failed because of the
+/// registry's certificate or because it only speaks HTTP
+pub fn registry_pull_hint(error: &str, registry: &str) -> Option<String> {
+    let tls = error.contains("x509:") || error.contains("certificate");
+    let http = error.contains("server gave HTTP response to HTTPS client");
+    (tls || http).then(|| {
+        format!(
+            "Hint: dockerd cannot verify {registry}. Put its CA in \
+             /etc/docker/certs.d/{registry}/ca.crt (and executor.docker.registry_ca \
+             for docker:dind), or list it in dockerd's insecure-registries (and \
+             executor.docker.insecure_registries)"
+        )
+    })
+}
+
 fn host_of(url: &str) -> &str {
     let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     without_scheme.split('/').next().unwrap_or(without_scheme)
@@ -273,6 +310,35 @@ mod tests {
         );
         assert_eq!(dind_command(None, &[]), None, "the image's CMD is kept");
         assert_eq!(dind_command(Some(&given), &[]), Some(given.clone()));
+    }
+
+    #[test]
+    fn matches_ips_against_cidrs() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(ip_in_cidr(ip("10.0.0.5"), "10.0.0.0/8"));
+        assert!(ip_in_cidr(ip("127.0.0.1"), "127.0.0.0/8"));
+        assert!(!ip_in_cidr(ip("192.168.1.5"), "10.0.0.0/8"));
+        assert!(ip_in_cidr(ip("::1"), "::1/128"));
+        assert!(!ip_in_cidr(ip("10.0.0.5"), "::1/128"));
+        assert!(!ip_in_cidr(ip("10.0.0.5"), "garbage"));
+    }
+
+    #[test]
+    fn explains_tls_pull_errors() {
+        let hint = registry_pull_hint(
+            "Get \"https://harbor.corp/v2/\": x509: certificate signed by unknown authority",
+            "harbor.corp",
+        )
+        .unwrap();
+        assert!(
+            hint.contains("registry_ca") && hint.contains("harbor.corp"),
+            "{}",
+            hint
+        );
+        assert!(
+            registry_pull_hint("http: server gave HTTP response to HTTPS client", "h").is_some()
+        );
+        assert!(registry_pull_hint("manifest unknown", "h").is_none());
     }
 
     #[test]

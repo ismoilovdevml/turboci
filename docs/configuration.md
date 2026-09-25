@@ -142,6 +142,8 @@ aliases.
 | `shm_size` | – | Size of `/dev/shm`, e.g. `"1g"`. Docker's 64 MB is too small for browsers and some test runners |
 | `oom_score_adjust` | – | OOM killer preference of containers (-1000 to 1000) |
 | `auth_config_file` | `~/.docker/config.json` of the service user | Docker client config whose `auths` are used to pull private images |
+| `insecure_registries` | `[]` | Registries (`host[:port]`) reached over HTTP or without certificate checks; docker:dind services get `--insecure-registry` for each |
+| `registry_ca` | `{}` | Registry → PEM CA file; mounted into docker:dind services as `/etc/docker/certs.d/<registry>/ca.crt` |
 | `services` | `[]` | Services started for every job (see below) |
 
 `volumes` takes `host:container[:mode]` binds and bare container paths. A
@@ -179,6 +181,43 @@ An image is pulled with the first login found, in gitlab-runner's order:
 
 Only `auths` entries are read; credential helpers (`credsStore`,
 `credHelpers`) are not run.
+
+A registry with an internal CA or without TLS:
+
+```toml
+[executor.docker]
+insecure_registries = ["harbor.old.local"]
+
+[executor.docker.registry_ca]
+"harbor.corp.local" = "/etc/turboci-registry-ca/harbor.corp.local.pem"
+```
+
+Quote the registry names in `registry_ca`: an unquoted
+`harbor.corp.local = ...` is a nested TOML table, not a registry.
+
+Use `registry_ca` when the registry's certificate is signed by an internal
+CA: certificates stay verified. Use `insecure_registries` for a registry
+without TLS or without a CA file.
+
+Both apply to docker:dind services (any service image with `dind` in its
+name), so `docker build` and `docker push` in jobs work without changing the
+service's `command`. Arguments are appended after the service's own
+`command`, so that command must be dockerd flags (the usual case).
+`registry_ca` works for rootful docker:dind, which reads
+`/etc/docker/certs.d`. A rootless image (`docker:dind-rootless`) reads its
+CAs from `~/.config/docker/certs.d`, so use `insecure_registries` for it.
+
+Job images are pulled by the host dockerd, which reads its own settings. At
+start the runner checks them and logs the exact fix:
+
+- `insecure_registries`: the registry must be in `insecure-registries` of
+  `/etc/docker/daemon.json` (dockerd restart needed).
+- `registry_ca`: the CA must be in `/etc/docker/certs.d/<registry>/ca.crt`
+  (read on every connection, no restart).
+
+The installer does the second for you: `--registry-ca HOST=FILE` installs the
+CA for dockerd and writes `registry_ca`. `--insecure-registry HOST` writes
+`insecure_registries`; `daemon.json` is left to you.
 
 Workspaces live under `/tmp/turboci-builds/job-<id>` on the host and are
 removed when the job ends.

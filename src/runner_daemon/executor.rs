@@ -753,7 +753,6 @@ pub fn daemon_warnings(
     proxy: bool,
     certs_dir: &Path,
 ) -> Vec<String> {
-    let _ = (config, certs_dir);
     let mut warnings = Vec::new();
     let dockerd_proxy = [&info.http_proxy, &info.https_proxy]
         .iter()
@@ -766,6 +765,35 @@ pub fn daemon_warnings(
              systemctl daemon-reload && systemctl restart docker"
                 .to_string(),
         );
+    }
+    let registry_config = info.registry_config.clone().unwrap_or_default();
+    let indexes = registry_config.index_configs.unwrap_or_default();
+    let cidrs = registry_config.insecure_registry_cidrs.unwrap_or_default();
+    for registry in &config.insecure_registries {
+        let listed = indexes
+            .get(registry)
+            .is_some_and(|index| index.secure == Some(false));
+        let host = registry
+            .rsplit_once(':')
+            .map_or(registry.as_str(), |(h, _)| h);
+        let in_cidr = host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| cidrs.iter().any(|cidr| image::ip_in_cidr(ip, cidr)));
+        if !(listed || in_cidr) {
+            warnings.push(format!(
+                "dockerd does not treat {registry} as insecure, so pulls from it fail. Add it \
+                 to \"insecure-registries\" in /etc/docker/daemon.json and restart dockerd"
+            ));
+        }
+    }
+    for (registry, file) in &config.registry_ca {
+        if !certs_dir.join(registry).join("ca.crt").exists() {
+            warnings.push(format!(
+                "dockerd has no CA for {registry}, so pulls from it fail. Run: install -D -m 0644 \
+                 {file} {}/{registry}/ca.crt (no dockerd restart needed)",
+                certs_dir.display()
+            ));
+        }
     }
     warnings
 }
@@ -1248,9 +1276,13 @@ impl DockerExecutor {
             };
             let Some(progress) = progress else { break };
             if let Err(e) = progress {
+                let error = e.to_string();
+                let hint = image::registry_pull_hint(&error, image::registry(image))
+                    .map(|hint| format!("\n{}", hint))
+                    .unwrap_or_default();
                 return Err(pull_failure(format!(
-                    "failed to pull image {}: {}",
-                    image, e
+                    "failed to pull image {}: {}{}",
+                    image, error, hint
                 )));
             }
         }
@@ -2755,6 +2787,137 @@ mod tests {
         executor.cleanup(job_id).await;
     }
 
+    /// A job that builds an image in docker:dind and pushes it to the
+    /// `registry` service
+    fn dind_push_job(job_id: u64, registry: &str, registry_service: serde_json::Value) -> Job {
+        job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "docker:27-cli"},
+            "services": [
+                registry_service,
+                // Without an empty DOCKER_TLS_CERTDIR the entrypoint adds --tlsverify
+                {"name": "docker:27-dind", "alias": "docker",
+                 "command": ["--host=tcp://0.0.0.0:2375", "--tls=false"],
+                 "variables": [{"key": "DOCKER_TLS_CERTDIR", "value": ""}]}
+            ],
+            "variables": [{"key": "DOCKER_HOST", "value": "tcp://docker:2375"}],
+            "steps": steps(
+                &[
+                    "for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done",
+                    "printf 'FROM alpine:3.20\\n' | docker build -t turboci-push-test -",
+                    &format!("docker tag turboci-push-test {}/turboci/push-test:1", registry),
+                    &format!("docker push {}/turboci/push-test:1 && echo pushed-ok", registry),
+                ],
+                &[]
+            )
+        }))
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_dind_pushes_to_an_insecure_registry() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                privileged: true,
+                insecure_registries: vec!["registry:5000".to_string()],
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 990_000_000 + u64::from(std::process::id());
+        let j = dind_push_job(
+            job_id,
+            "registry:5000",
+            serde_json::json!({"name": "registry:2", "alias": "registry"}),
+        );
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("pushed-ok"), "{}", log);
+        executor.cleanup(job_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_dind_trusts_a_registry_ca() {
+        // A certificate for host "registry", which is also its own CA
+        let certs = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=registry",
+                "-addext",
+                "subjectAltName=DNS:registry",
+            ])
+            .arg("-keyout")
+            .arg(certs.path().join("key.pem"))
+            .arg("-out")
+            .arg(certs.path().join("cert.pem"))
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+        // Readable by the registry container's user
+        for file in ["key.pem", "cert.pem"] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                certs.path().join(file),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        let dir = certs.path().to_str().unwrap().to_string();
+        // With the port: a bare "registry/..." would be a Docker Hub repository
+        let registry = "registry:443";
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                privileged: true,
+                volumes: vec![format!("{}:/registry-certs:ro", dir)],
+                registry_ca: std::collections::BTreeMap::from([(
+                    registry.to_string(),
+                    format!("{}/cert.pem", dir),
+                )]),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 991_000_000 + u64::from(std::process::id());
+        let j = dind_push_job(
+            job_id,
+            registry,
+            serde_json::json!({"name": "registry:2", "alias": "registry", "variables": [
+                {"key": "REGISTRY_HTTP_ADDR", "value": "0.0.0.0:443"},
+                {"key": "REGISTRY_HTTP_TLS_CERTIFICATE", "value": "/registry-certs/cert.pem"},
+                {"key": "REGISTRY_HTTP_TLS_KEY", "value": "/registry-certs/key.pem"},
+                {"key": "HEALTHCHECK_TCP_PORT", "value": "443"}
+            ]}),
+        );
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("pushed-ok"), "{}", log);
+        executor.cleanup(job_id).await;
+    }
+
     #[tokio::test]
     #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
     async fn docker_lists_untracked_files_with_the_helper() {
@@ -2851,6 +3014,48 @@ mod tests {
         assert!(warnings[0].contains("docker.service.d"), "{}", warnings[0]);
         assert!(daemon_warnings(&with_proxy, &config, true, certs).is_empty());
         assert!(daemon_warnings(&bare, &config, false, certs).is_empty());
+    }
+
+    #[test]
+    fn warns_about_registries_dockerd_does_not_trust() {
+        use bollard::models::{IndexInfo, RegistryServiceConfig, SystemInfo};
+
+        let certs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(certs.path().join("harbor.ok")).unwrap();
+        std::fs::write(certs.path().join("harbor.ok/ca.crt"), "pem").unwrap();
+        let config = DockerConfig {
+            insecure_registries: vec![
+                "insecure.ok".to_string(),
+                "10.0.0.5:5000".to_string(),
+                "missing.insecure".to_string(),
+            ],
+            registry_ca: std::collections::BTreeMap::from([
+                ("harbor.ok".to_string(), "/x.pem".to_string()),
+                ("harbor.missing".to_string(), "/y.pem".to_string()),
+            ]),
+            ..DockerConfig::default()
+        };
+        let info = SystemInfo {
+            registry_config: Some(RegistryServiceConfig {
+                insecure_registry_cidrs: Some(vec!["10.0.0.0/8".to_string()]),
+                index_configs: Some(std::collections::HashMap::from([(
+                    "insecure.ok".to_string(),
+                    IndexInfo {
+                        name: Some("insecure.ok".to_string()),
+                        secure: Some(false),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let warnings = daemon_warnings(&info, &config, false, certs.path());
+
+        assert_eq!(warnings.len(), 2, "{:?}", warnings);
+        assert!(warnings[0].contains("missing.insecure") && warnings[0].contains("daemon.json"));
+        assert!(warnings[1].contains("harbor.missing") && warnings[1].contains("install -D"));
     }
 
     #[test]

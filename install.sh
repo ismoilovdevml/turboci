@@ -29,6 +29,8 @@ LOCAL_BINARY=""
 TLS_CA_FILE="${TURBOCI_TLS_CA_FILE:-}"
 PROXY="${TURBOCI_PROXY:-}"
 NO_PROXY_LIST="${TURBOCI_NO_PROXY:-}"
+INSECURE_REGISTRIES=()
+REGISTRY_CAS=()
 START_SERVICE=1
 
 usage() {
@@ -47,6 +49,12 @@ Usage: install.sh [options]
   --proxy URL        HTTP(S) proxy for the runner, its jobs and services
                      (http://[user:pass@]host:port)
   --no-proxy LIST    Hosts, domains (.corp.local) and CIDRs reached directly
+  --insecure-registry HOST  Registry reached over HTTP or without certificate
+                     checks, for docker:dind services (repeatable). dockerd
+                     needs it in /etc/docker/daemon.json too
+  --registry-ca HOST=FILE   CA (PEM) of a registry: installed for dockerd in
+                     /etc/docker/certs.d/HOST/ca.crt and for docker:dind
+                     services (repeatable)
   --no-start         Configure but do not start the service
   --name NAME        Install a second runner under this name (service NAME,
                      config /etc/NAME-runner.toml, state /var/lib/NAME);
@@ -72,6 +80,8 @@ while [ $# -gt 0 ]; do
         --tls-ca-file) TLS_CA_FILE="${2:?--tls-ca-file needs a value}"; shift 2 ;;
         --proxy) PROXY="${2:?--proxy needs a value}"; shift 2 ;;
         --no-proxy) NO_PROXY_LIST="${2:?--no-proxy needs a value}"; shift 2 ;;
+        --insecure-registry) INSECURE_REGISTRIES+=("${2:?--insecure-registry needs a value}"); shift 2 ;;
+        --registry-ca) REGISTRY_CAS+=("${2:?--registry-ca needs HOST=FILE}"); shift 2 ;;
         --no-start) START_SERVICE=0; shift ;;
         --name) INSTANCE="${2:?--name needs a value}"; shift 2 ;;
         --user) SERVICE_USER="${2:?--user needs a value}"; shift 2 ;;
@@ -99,6 +109,20 @@ if [[ "$NO_PROXY_LIST" =~ $UNSAFE_RE ]]; then
     echo "--no-proxy must be a comma-separated list without spaces or quotes" >&2
     exit 1
 fi
+for host in "${INSECURE_REGISTRIES[@]}"; do
+    if ! [[ "$host" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+        echo "--insecure-registry must be host or host:port, got $host" >&2
+        exit 1
+    fi
+done
+for entry in "${REGISTRY_CAS[@]}"; do
+    host="${entry%%=*}"
+    file="${entry#*=}"
+    if ! [[ "$host" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || [ "$host" = "$entry" ] || [ ! -f "$file" ]; then
+        echo "--registry-ca must be HOST=FILE with an existing file, got $entry" >&2
+        exit 1
+    fi
+done
 SERVICE_NAME="$INSTANCE"
 STATE_DIR="/var/lib/$INSTANCE"
 CONFIG_FILE="$CONFIG_DIR/$INSTANCE-runner.toml"
@@ -207,6 +231,12 @@ validate_options() {
         echo -e "${RED}❌ --tls-ca-file: $TLS_CA_FILE is not a PEM certificate${NC}"
         exit 1
     fi
+    for entry in "${REGISTRY_CAS[@]}"; do
+        if ! grep -q "BEGIN CERTIFICATE" "${entry#*=}" 2>/dev/null; then
+            echo -e "${RED}❌ --registry-ca: ${entry#*=} is not a PEM certificate${NC}"
+            exit 1
+        fi
+    done
     if [ "$CREATE_USER" -eq 0 ] && ! id -u "$SERVICE_USER" > /dev/null 2>&1; then
         echo -e "${RED}❌ --user: user $SERVICE_USER does not exist${NC}"
         exit 1
@@ -450,6 +480,25 @@ no_proxy = \"$NO_PROXY_LIST\""
         echo -e "${GREEN}✓${NC} Proxy configured"
     fi
 
+    INSECURE_LINE=""
+    if [ ${#INSECURE_REGISTRIES[@]} -gt 0 ]; then
+        INSECURE_LINE="insecure_registries = [$(printf '"%s", ' "${INSECURE_REGISTRIES[@]}" | sed 's/, $//')]"
+        echo -e "${YELLOW}⚠️  Also add ${INSECURE_REGISTRIES[*]} to insecure-registries in /etc/docker/daemon.json (dockerd restart needed)${NC}"
+    fi
+    REGISTRY_CA_BLOCK=""
+    if [ ${#REGISTRY_CAS[@]} -gt 0 ]; then
+        REGISTRY_CA_BLOCK="[executor.docker.registry_ca]"
+        for entry in "${REGISTRY_CAS[@]}"; do
+            host="${entry%%=*}"
+            file="${entry#*=}"
+            install -D -m 0644 -o root -g root "$file" "/etc/turboci-registry-ca/$host.pem"
+            install -D -m 0644 -o root -g root "$file" "/etc/docker/certs.d/$host/ca.crt"
+            REGISTRY_CA_BLOCK="$REGISTRY_CA_BLOCK
+\"$host\" = \"/etc/turboci-registry-ca/$host.pem\""
+            echo -e "${GREEN}✓${NC} Registry CA for $host: ${BLUE}/etc/docker/certs.d/$host/ca.crt${NC}"
+        done
+    fi
+
     cat > "$CONFIG_FILE" << EOF
 # TurboCI Runner Configuration
 concurrent = $CONCURRENT
@@ -475,6 +524,8 @@ default_image = "alpine:latest"
 privileged = false
 volumes = []
 network_mode = "bridge"
+$INSECURE_LINE
+$REGISTRY_CA_BLOCK
 EOF
 
     secure_config

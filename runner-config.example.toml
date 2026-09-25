@@ -91,9 +91,18 @@ helper_image = "alpine/git:latest"
 # (default: ~/.docker/config.json of the service user)
 # auth_config_file = "/var/lib/turboci/.docker/config.json"
 
+# Registries reached over HTTP or without certificate checks: docker:dind
+# services get --insecure-registry for each (dockerd needs them in daemon.json)
+# insecure_registries = ["harbor.old.local"]
+
 # Services started for every job, e.g. a Docker daemon for image builds
 # (needs privileged = true)
 # [[executor.docker.services]]
 # name = "docker:27-dind"
 # alias = "docker"
 # command = ["--host=tcp://0.0.0.0:2375", "--tls=false"]
+
+# Registry CAs (PEM) for docker:dind services, mounted as
+# /etc/docker/certs.d/<registry>/ca.crt
+# [executor.docker.registry_ca]
+# "harbor.corp.local" = "/etc/turboci-registry-ca/harbor.corp.local.pem"

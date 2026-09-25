@@ -542,7 +542,18 @@ mod tests {
             )
             .replace("$EXECUTOR", "docker")
             .replace("$STATE_DIR", "/var/lib/turboci")
-            .replace("$SERVICE_USER", "turboci");
+            .replace("$SERVICE_USER", "turboci")
+            .replace(
+                "$INSECURE_LINE",
+                "insecure_registries = [\"harbor.old.local\"]",
+            )
+            .replace("$REGISTRY_CA_BLOCK", "");
+        // The registry CA table must parse where the template puts it
+        let with_ca = rendered.clone()
+            + "[executor.docker.registry_ca]\n\"harbor.corp\" = \"/etc/turboci-registry-ca/harbor.corp.pem\"\n";
+        let parsed = RunnerConfig::parse(&with_ca).unwrap();
+        assert!(unknown_keys(&with_ca, &parsed).is_empty());
+        assert_eq!(parsed.executor.docker.registry_ca.len(), 1);
         let config = RunnerConfig::parse(&rendered).unwrap();
         assert!(unknown_keys(&rendered, &config).is_empty());
         assert!(
