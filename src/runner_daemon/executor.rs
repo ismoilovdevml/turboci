@@ -770,6 +770,23 @@ pub fn daemon_warnings(
     warnings
 }
 
+/// Read-only mounts of registry CAs where dockerd looks for them. Mounts, not
+/// binds: a registry port (`host:8443`) would break the `src:dst` bind syntax.
+pub fn dind_ca_mounts(
+    registry_ca: &std::collections::BTreeMap<String, String>,
+) -> Vec<bollard::models::Mount> {
+    registry_ca
+        .iter()
+        .map(|(registry, file)| bollard::models::Mount {
+            target: Some(format!("/etc/docker/certs.d/{}/ca.crt", registry)),
+            source: Some(file.clone()),
+            typ: Some(bollard::models::MountTypeEnum::BIND),
+            read_only: Some(true),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Containers and network created for one job, removed when it ends
 #[derive(Default)]
 struct JobContainers {
@@ -965,15 +982,25 @@ impl DockerExecutor {
                 .await;
             self.ensure_image(&service_image, Some(&service.pull_policy), job, trace)
                 .await?;
+            let mut host_config = self.host_config(volumes.clone(), containers.network.as_deref());
+            let mut service = service.clone();
+            if image::is_dind(&service_image) {
+                service.command = image::dind_command(
+                    service.command.as_deref(),
+                    &self.config.insecure_registries,
+                );
+                let mounts = dind_ca_mounts(&self.config.registry_ca);
+                host_config.mounts = (!mounts.is_empty()).then_some(mounts);
+            }
             let id = self
                 .create_service(
                     job,
                     &format!("turboci-job-{}-svc-{}", job.id, index),
                     &service_image,
-                    service,
+                    &service,
                     &values,
                     // Configured volumes too, e.g. /certs/client for docker:dind with TLS
-                    self.host_config(volumes.clone(), containers.network.as_deref()),
+                    host_config,
                 )
                 .await
                 .map_err(|e| JobFailure::system(format!("service {}: {:#}", service.name, e)))?;
@@ -2824,6 +2851,28 @@ mod tests {
         assert!(warnings[0].contains("docker.service.d"), "{}", warnings[0]);
         assert!(daemon_warnings(&with_proxy, &config, true, certs).is_empty());
         assert!(daemon_warnings(&bare, &config, false, certs).is_empty());
+    }
+
+    #[test]
+    fn dind_ca_mounts_keep_ports_in_the_target() {
+        let registry_ca = std::collections::BTreeMap::from([(
+            "harbor.corp:8443".to_string(),
+            "/etc/turboci-registry-ca/harbor.corp:8443.pem".to_string(),
+        )]);
+
+        let mounts = dind_ca_mounts(&registry_ca);
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].target.as_deref(),
+            Some("/etc/docker/certs.d/harbor.corp:8443/ca.crt")
+        );
+        assert_eq!(
+            mounts[0].source.as_deref(),
+            Some("/etc/turboci-registry-ca/harbor.corp:8443.pem")
+        );
+        assert_eq!(mounts[0].read_only, Some(true));
+        assert_eq!(mounts[0].typ, Some(bollard::models::MountTypeEnum::BIND));
     }
 
     #[test]

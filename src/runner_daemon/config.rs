@@ -96,6 +96,12 @@ pub struct DockerConfig {
     /// like ~/.docker/config.json. Default: the service user's
     /// ~/.docker/config.json when it exists
     pub auth_config_file: Option<String>,
+    /// Registries reached over HTTP or without verifying their certificate:
+    /// docker:dind services get `--insecure-registry` for each
+    pub insecure_registries: Vec<String>,
+    /// Registry (`host[:port]`) → PEM CA file, mounted into docker:dind
+    /// services as /etc/docker/certs.d/<registry>/ca.crt
+    pub registry_ca: std::collections::BTreeMap<String, String>,
 }
 
 /// A service in `[[executor.docker.services]]`
@@ -218,6 +224,36 @@ impl DockerConfig {
                 bad
             );
         }
+        let valid_registry = |host: &str| {
+            !host.is_empty() && !host.contains('/') && !host.chars().any(char::is_whitespace)
+        };
+        if let Some(bad) = self
+            .insecure_registries
+            .iter()
+            .chain(self.registry_ca.keys())
+            .find(|host| !valid_registry(host))
+        {
+            anyhow::bail!(
+                "executor.docker: registry {:?} must be host or host:port, without a scheme or path",
+                bad
+            );
+        }
+        for (registry, file) in &self.registry_ca {
+            let pem = fs::read(file).with_context(|| {
+                format!(
+                    "executor.docker.registry_ca: cannot read {} for {}",
+                    file, registry
+                )
+            })?;
+            let certificates = reqwest::Certificate::from_pem_bundle(&pem).unwrap_or_default();
+            if certificates.is_empty() {
+                anyhow::bail!(
+                    "executor.docker.registry_ca: {} for {} holds no PEM certificate",
+                    file,
+                    registry
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -320,6 +356,8 @@ impl Default for DockerConfig {
             oom_score_adjust: None,
             services: Vec::new(),
             auth_config_file: None,
+            insecure_registries: Vec::new(),
+            registry_ca: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -606,6 +644,71 @@ mod tests {
         ] {
             let config = RunnerConfig::parse(&format!("runner_token = \"t\"\n{}", bad)).unwrap();
             assert!(config.validate().is_err(), "accepted {}", bad);
+        }
+    }
+
+    /// A self-signed certificate made with openssl, as PEM
+    fn test_certificate(dir: &std::path::Path) -> std::path::PathBuf {
+        let cert = dir.join("ca.pem");
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=registry.test",
+            ])
+            .arg("-keyout")
+            .arg(dir.join("key.pem"))
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+        cert
+    }
+
+    #[test]
+    fn registry_settings_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = test_certificate(dir.path());
+        let not_pem = dir.path().join("not.pem");
+        std::fs::write(&not_pem, "hello").unwrap();
+        let config = |body: &str| {
+            RunnerConfig::parse(&format!(
+                "runner_token = \"t\"\n[executor.docker]\n{}",
+                body
+            ))
+            .unwrap()
+        };
+
+        let ok = config(&format!(
+            "insecure_registries = [\"harbor.old.local\", \"10.0.0.5:5000\"]\n[executor.docker.registry_ca]\n\"harbor.corp:8443\" = {:?}",
+            cert.to_str().unwrap()
+        ));
+        ok.validate().unwrap();
+        assert_eq!(ok.executor.docker.registry_ca.len(), 1);
+
+        for bad in [
+            "insecure_registries = [\"\"]".to_string(),
+            "insecure_registries = [\"https://harbor.corp\"]".to_string(),
+            "insecure_registries = [\"harbor.corp/library\"]".to_string(),
+            "[executor.docker.registry_ca]\n\"harbor.corp\" = \"/nonexistent.pem\"".to_string(),
+            format!(
+                "[executor.docker.registry_ca]\n\"harbor.corp\" = {:?}",
+                not_pem.to_str().unwrap()
+            ),
+            format!(
+                "[executor.docker.registry_ca]\n\"https://harbor.corp\" = {:?}",
+                cert.to_str().unwrap()
+            ),
+        ] {
+            assert!(config(&bad).validate().is_err(), "accepted {}", bad);
         }
     }
 

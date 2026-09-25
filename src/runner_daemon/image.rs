@@ -55,6 +55,29 @@ pub fn service_aliases(image: &str, alias: Option<&str>) -> Vec<String> {
     aliases
 }
 
+/// A Docker-in-Docker image (docker:dind, docker:27-dind, a mirror of them)
+pub fn is_dind(image: &str) -> bool {
+    image.to_ascii_lowercase().contains("dind")
+}
+
+/// Command of a dind service with `--insecure-registry` for each of
+/// `insecure` it does not have yet. The dind entrypoint puts arguments that
+/// start with `-` after dockerd's defaults, so flags alone are a full command.
+/// `None` keeps the image's CMD.
+pub fn dind_command(command: Option<&[String]>, insecure: &[String]) -> Option<Vec<String>> {
+    if insecure.is_empty() {
+        return command.map(<[String]>::to_vec);
+    }
+    let mut args = command.map(<[String]>::to_vec).unwrap_or_default();
+    for host in insecure {
+        let flag = format!("--insecure-registry={}", host);
+        if !args.contains(&flag) {
+            args.push(flag);
+        }
+    }
+    Some(args)
+}
+
 fn host_of(url: &str) -> &str {
     let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     without_scheme.split('/').next().unwrap_or(without_scheme)
@@ -212,6 +235,44 @@ mod tests {
                 "redis"
             ]
         );
+    }
+
+    #[test]
+    fn recognises_dind_images() {
+        for image in [
+            "docker:dind",
+            "docker:27-dind",
+            "harbor.corp:5000/library/docker:dind-rootless",
+        ] {
+            assert!(is_dind(image), "{}", image);
+        }
+        for image in ["docker:27-cli", "postgres:16", "alpine"] {
+            assert!(!is_dind(image), "{}", image);
+        }
+    }
+
+    #[test]
+    fn dind_command_appends_insecure_registries_once() {
+        let insecure = vec!["harbor.corp".to_string(), "10.0.0.5:5000".to_string()];
+        let given = vec![
+            "--tls=false".to_string(),
+            "--insecure-registry=harbor.corp".to_string(),
+        ];
+
+        assert_eq!(
+            dind_command(Some(&given), &insecure),
+            Some(vec![
+                "--tls=false".to_string(),
+                "--insecure-registry=harbor.corp".to_string(),
+                "--insecure-registry=10.0.0.5:5000".to_string(),
+            ])
+        );
+        assert_eq!(
+            dind_command(None, &insecure[..1]),
+            Some(vec!["--insecure-registry=harbor.corp".to_string()])
+        );
+        assert_eq!(dind_command(None, &[]), None, "the image's CMD is kept");
+        assert_eq!(dind_command(Some(&given), &[]), Some(given.clone()));
     }
 
     #[test]
