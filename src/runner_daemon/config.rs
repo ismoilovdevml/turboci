@@ -23,6 +23,11 @@ pub struct RunnerConfig {
     /// PEM file with the CA that signed the GitLab server's certificate
     /// (self-signed or internal CA); trusted by the runner and given to jobs
     pub tls_ca_file: Option<String>,
+    /// Proxy (http:// or https://) for the runner's requests and its jobs
+    pub proxy: Option<String>,
+    /// Comma-separated hosts, domains (.corp.local), IPs and CIDRs reached
+    /// without the proxy
+    pub no_proxy: Option<String>,
 
     /// Cache configuration
     pub cache_enabled: bool,
@@ -269,6 +274,8 @@ impl Default for RunnerConfig {
             runner_token: String::new(),
             gitlab_url: "https://gitlab.com".to_string(),
             tls_ca_file: None,
+            proxy: None,
+            no_proxy: None,
             cache_enabled: true,
             cache_dir: default_cache_dir(),
             cache_max_age_days: 14,
@@ -355,6 +362,19 @@ impl RunnerConfig {
         if self.check_interval == 0 {
             anyhow::bail!("check_interval must be at least 1 second");
         }
+        match &self.proxy {
+            Some(proxy) => {
+                let valid = reqwest::Url::parse(proxy).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                });
+                if !valid {
+                    // The value is not shown: it may hold a password
+                    anyhow::bail!("proxy must be an http:// or https:// URL with a host");
+                }
+            }
+            None if self.no_proxy.is_some() => anyhow::bail!("no_proxy needs proxy to be set"),
+            None => {}
+        }
         self.executor.docker.validate()?;
         if let Some(bad) = self.environment.iter().find(|entry| {
             entry
@@ -373,6 +393,22 @@ impl RunnerConfig {
                 other
             ),
         }
+    }
+
+    /// Proxy and CA settings for the runner's HTTP clients
+    pub fn network(&self) -> Result<crate::net::Network> {
+        let ca_pem = match &self.tls_ca_file {
+            Some(path) => Some(
+                fs::read_to_string(path)
+                    .with_context(|| format!("Cannot read tls_ca_file {}", path))?,
+            ),
+            None => None,
+        };
+        Ok(crate::net::Network {
+            proxy: self.proxy.clone(),
+            no_proxy: self.no_proxy.clone(),
+            ca_pem,
+        })
     }
 
     /// Save configuration to TOML file
@@ -539,5 +575,42 @@ mod tests {
     fn test_default_executor_is_docker() {
         assert_eq!(RunnerConfig::default().executor.executor_type, "docker");
         assert_eq!(ExecutorConfig::default().executor_type, "docker");
+    }
+
+    #[test]
+    fn proxy_settings_are_validated() {
+        let ok = RunnerConfig::parse(
+            "runner_token = \"t\"\nproxy = \"http://user:secret@proxy.corp:3128\"\nno_proxy = \"localhost,.corp.local,10.0.0.0/8\"",
+        )
+        .unwrap();
+        ok.validate().unwrap();
+        let network = ok.network().unwrap();
+        assert_eq!(
+            network.proxy.as_deref(),
+            Some("http://user:secret@proxy.corp:3128")
+        );
+        assert_eq!(
+            network.no_proxy.as_deref(),
+            Some("localhost,.corp.local,10.0.0.0/8")
+        );
+
+        for bad in [
+            "proxy = \"proxy.corp:3128\"",
+            "proxy = \"socks5://proxy.corp:1080\"",
+            "proxy = \"http://\"",
+            "no_proxy = \"localhost\"",
+        ] {
+            let config = RunnerConfig::parse(&format!("runner_token = \"t\"\n{}", bad)).unwrap();
+            assert!(config.validate().is_err(), "accepted {}", bad);
+        }
+    }
+
+    #[test]
+    fn network_reads_the_ca_file() {
+        let missing = RunnerConfig {
+            tls_ca_file: Some("/nonexistent/ca.pem".to_string()),
+            ..RunnerConfig::default()
+        };
+        assert!(missing.network().is_err());
     }
 }

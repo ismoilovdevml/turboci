@@ -100,18 +100,13 @@ impl GitLabClient {
         self
     }
 
-    /// Also trust `pem` (the CA of a GitLab server with a private certificate)
-    pub fn with_root_certificate(mut self, pem: &[u8]) -> Result<Self> {
-        let certificates =
-            reqwest::Certificate::from_pem_bundle(pem).context("Invalid CA certificate (PEM)")?;
-        if certificates.is_empty() {
-            anyhow::bail!("The CA file contains no PEM certificate");
-        }
-        let builder = certificates.into_iter().fold(
-            crate::net::client_builder().timeout(std::time::Duration::from_secs(30)),
-            |builder, certificate| builder.add_root_certificate(certificate),
-        );
-        self.client = builder.build().context("Failed to build HTTP client")?;
+    /// Send every request through the proxy of `network`, trusting its CA
+    pub fn with_network(mut self, network: &crate::net::Network) -> Result<Self> {
+        self.client = network
+            .client_builder()?
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("Failed to build HTTP client")?;
         Ok(self)
     }
 
@@ -1302,16 +1297,24 @@ mod tests {
             .status;
         assert!(status.success());
 
-        let pem = std::fs::read(&cert).unwrap();
+        let pem = std::fs::read_to_string(&cert).unwrap();
+        let network = crate::net::Network {
+            ca_pem: Some(pem),
+            ..Default::default()
+        };
         assert!(GitLabClient::new("https://x".to_string(), "t".to_string())
-            .with_root_certificate(&pem)
+            .with_network(&network)
             .is_ok());
     }
 
     #[test]
     fn invalid_ca_certificate_is_rejected() {
-        let result = GitLabClient::new("https://x".to_string(), "t".to_string())
-            .with_root_certificate(b"not a certificate");
+        let network = crate::net::Network {
+            ca_pem: Some("not a certificate".to_string()),
+            ..Default::default()
+        };
+        let result =
+            GitLabClient::new("https://x".to_string(), "t".to_string()).with_network(&network);
         assert!(result.is_err());
     }
 
