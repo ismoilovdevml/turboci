@@ -105,14 +105,27 @@ pub fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
 pub fn registry_pull_hint(error: &str, registry: &str) -> Option<String> {
     let tls = error.contains("x509:") || error.contains("certificate");
     let http = error.contains("server gave HTTP response to HTTPS client");
-    (tls || http).then(|| {
-        format!(
-            "Hint: dockerd cannot verify {registry}. Put its CA in \
-             /etc/docker/certs.d/{registry}/ca.crt (and executor.docker.registry_ca \
-             for docker:dind), or list it in dockerd's insecure-registries (and \
-             executor.docker.insecure_registries)"
-        )
-    })
+    if !(tls || http) {
+        return None;
+    }
+    // dockerd verifies Docker Hub with the system roots only, and never treats
+    // it as insecure
+    if is_docker_hub(registry) {
+        return Some(
+            "Hint: dockerd cannot verify Docker Hub, usually because a proxy intercepts \
+             TLS. Add the proxy's CA to the host's system trust store \
+             (/usr/local/share/ca-certificates + update-ca-certificates, or \
+             /etc/pki/ca-trust/source/anchors + update-ca-trust) and restart dockerd; \
+             the runner's registry options do not apply to Docker Hub"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "Hint: dockerd cannot verify {registry}. Put its CA in \
+         /etc/docker/certs.d/{registry}/ca.crt (and executor.docker.registry_ca \
+         for docker:dind), or list it in dockerd's insecure-registries (and \
+         executor.docker.insecure_registries)"
+    ))
 }
 
 fn host_of(url: &str) -> &str {
@@ -339,6 +352,17 @@ mod tests {
             registry_pull_hint("http: server gave HTTP response to HTTPS client", "h").is_some()
         );
         assert!(registry_pull_hint("manifest unknown", "h").is_none());
+        // dockerd trusts only the system roots for Docker Hub
+        let hub = registry_pull_hint(
+            "Get \"https://registry-1.docker.io/v2/\": x509: certificate signed by unknown authority",
+            "docker.io",
+        )
+        .unwrap();
+        assert!(
+            hub.contains("trust store") && !hub.contains("registry_ca"),
+            "{}",
+            hub
+        );
     }
 
     #[test]
