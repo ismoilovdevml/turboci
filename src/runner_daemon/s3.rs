@@ -1317,14 +1317,17 @@ mod tests {
             .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(100)))
             .mount(&server)
             .await;
-        let b = bucket(&server, "").with_cooldown(Duration::from_millis(50));
+        let b = bucket(&server, "").with_cooldown(Duration::from_millis(300));
         let dir = tempfile::tempdir().unwrap();
         assert!(b
             .get_to_file(&b.object_key(1, "down.zip"), None, dir.path())
             .await
             .is_err());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
 
+        // The trial extends the pause by 300 ms and gets its answer after
+        // 100 ms: the last call below reaches S3 only if that answer closed
+        // the breaker
         let key = b.object_key(1, "back.zip");
         let calls =
             futures_util::future::join_all((0..3).map(|_| b.get_to_file(&key, None, dir.path())))
