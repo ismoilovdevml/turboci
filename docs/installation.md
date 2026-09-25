@@ -44,14 +44,19 @@ The runner then shows as **online** in GitLab.
 | `--version vX.Y.Z` | latest | Release to install |
 | `--binary PATH` | – | Install a local binary instead of downloading one |
 | `--tls-ca-file PATH` | – | CA (PEM) of a GitLab with a self-signed or internal certificate |
+| `--proxy URL` | – | HTTP(S) proxy for the runner, its jobs and services (`http://[user:pass@]host:port`) |
+| `--no-proxy LIST` | – | Hosts, domains (`.corp.local`) and CIDRs reached directly. Needs `--proxy` |
+| `--insecure-registry HOST` | – | Registry reached over HTTP or without certificate checks, for docker:dind services (repeatable). dockerd needs it in `/etc/docker/daemon.json` too |
+| `--registry-ca HOST=FILE` | – | CA (PEM) of a registry, installed for dockerd in `/etc/docker/certs.d/HOST/ca.crt` and for docker:dind services (repeatable) |
 | `--no-start` | – | Configure but do not start the service |
 | `--name NAME` | `turboci` | Install another runner next to the default one: service `NAME`, config `/etc/NAME-runner.toml`, state `/var/lib/NAME` |
 | `--user USER` | a new system user | Run the service as this existing user (it is not modified; not `root`) |
 
 Most options can also be set as environment variables: `TURBOCI_URL`,
 `TURBOCI_TOKEN`, `TURBOCI_EXECUTOR`, `TURBOCI_CONCURRENT`, `TURBOCI_VERSION`,
-`TURBOCI_TLS_CA_FILE`, `TURBOCI_NAME` and `TURBOCI_USER`. Passing the token through the
-environment keeps it out of the process list and shell history:
+`TURBOCI_TLS_CA_FILE`, `TURBOCI_PROXY`, `TURBOCI_NO_PROXY`, `TURBOCI_NAME` and
+`TURBOCI_USER`. Passing the token through the environment keeps it out of the
+process list and shell history:
 
 ```bash
 read -rs TURBOCI_TOKEN && export TURBOCI_TOKEN

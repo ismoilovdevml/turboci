@@ -711,6 +711,137 @@ mod tests {
         assert!(cache.archive_path(1, "fresh").exists());
     }
 
+    /// Runs `docker` with `args`, returning stdout
+    fn docker(args: &[&str]) -> String {
+        let output = std::process::Command::new("docker")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "docker {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Removes the container when the test ends, even after a failed assertion
+    struct Container(String);
+
+    impl Drop for Container {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn minio_shares_the_cache_between_hosts() {
+        // minio/minio is no longer published; pgsty/minio is a maintained fork
+        let container = Container(format!("turboci-minio-test-{}", std::process::id()));
+        let name = container.0.as_str();
+        docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            name,
+            "-p",
+            "127.0.0.1::9000",
+            "-e",
+            "MINIO_ROOT_USER=turboci",
+            "-e",
+            "MINIO_ROOT_PASSWORD=turboci-secret",
+            "pgsty/minio:latest",
+            "server",
+            "/data",
+        ]);
+        let port = docker(&["port", name, "9000/tcp"]);
+        let endpoint = format!("http://{}", port.lines().next().unwrap());
+        let bucket = || {
+            crate::runner_daemon::s3::Bucket::new(
+                &crate::runner_daemon::config::S3CacheConfig {
+                    url: format!("{}/turboci-cache/team a", endpoint),
+                    access_key: "turboci".to_string(),
+                    secret_key: "turboci-secret".to_string(),
+                    region: None,
+                },
+                reqwest::Client::builder(),
+            )
+            .unwrap()
+            .with_retry_delay(std::time::Duration::from_millis(200))
+        };
+        let mut ready = false;
+        for _ in 0..50 {
+            if bucket().create_bucket().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(ready, "MinIO did not start");
+        assert_eq!(bucket().probe().await, Ok(()));
+
+        let key = "feature/x y%";
+        let host_a = tempdir().unwrap();
+        let host_b = tempdir().unwrap();
+        let cache_a = LocalCache::new(host_a.path()).with_remote(bucket());
+        let cache_b = LocalCache::new(host_b.path()).with_remote(bucket());
+        let producer = workspace("shared");
+        let saved = cache_a
+            .save(
+                9,
+                key,
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.upload, Some(Ok(())));
+
+        let consumer = tempdir().unwrap();
+        let first = cache_b
+            .restore(9, &[key.to_string()], consumer.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(first.hit, Some((_, Source::S3Downloaded(_)))),
+            "{:?}",
+            first
+        );
+        assert_eq!(
+            std::fs::read_to_string(consumer.path().join("vendor/lib.txt")).unwrap(),
+            "shared"
+        );
+
+        let second = cache_b
+            .restore(9, &[key.to_string()], consumer.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(second.hit, Some((_, Source::S3NotModified))),
+            "{:?}",
+            second
+        );
+
+        // S3 gone: after the retries the restore falls back to the local copy
+        docker(&["stop", name]);
+        let offline = cache_b
+            .restore(9, &[key.to_string()], consumer.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(offline.hit, Some((_, Source::Local))),
+            "{:?}",
+            offline
+        );
+        assert_eq!(offline.warnings.len(), 1, "{:?}", offline.warnings);
+    }
+
     #[test]
     fn keys_are_expanded_and_default_when_empty() {
         let vars = HashMap::from([("CI_COMMIT_REF_SLUG".to_string(), "main".to_string())]);

@@ -111,9 +111,55 @@ writes the runner's side with `--proxy URL --no-proxy LIST`.
 | `cache_dir` | `/var/lib/turboci/cache` | Local cache, one directory per project |
 | `cache_max_age_days` | `14` | Archives not used for this many days are deleted (`0` keeps them forever) |
 
-The cache is local to the runner host, like gitlab-runner without a
-distributed cache. Archives are written to a temporary file and renamed into
-place, so concurrent jobs never read a partial archive.
+Without `cache_s3` the cache is local to the runner host, like gitlab-runner
+without a distributed cache. Archives are written to a temporary file and
+renamed into place, so concurrent jobs never read a partial archive.
+
+### Shared cache in S3
+
+Runners on several hosts share one cache through S3-compatible storage (AWS
+S3, MinIO, Ceph RGW, SeaweedFS, Cloudflare R2, Google Cloud Storage with HMAC
+keys):
+
+```toml
+[cache_s3]
+url = "https://minio.corp:9000/turboci-cache"
+access_key = "..."
+secret_key = "..."
+# region = "eu-central-1"
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `url` | – | `https://host[:port]/bucket[/prefix]` (path-style); `http://` for storage without TLS |
+| `access_key`, `secret_key` | – | Credentials. Jobs never see them: the runner transfers the archives |
+| `region` | from `s3.<region>.amazonaws.com`, else `us-east-1` | Signing region (`auto` for R2) |
+
+`cache_dir` stays the first layer. To restore, the runner asks S3 whether the
+archive changed (`If-None-Match`): an unchanged one is taken from the local
+disk, a changed one is downloaded. Saved archives are written locally and
+uploaded. The job log shows which happened:
+
+```
+Successfully restored cache main (S3: not modified, local copy)
+Successfully restored cache main (downloaded 120.0 MB from S3)
+Uploaded cache main to S3 (45.2 MB)
+```
+
+When S3 cannot be reached the job uses the local copy and the log shows a
+warning; a cache never fails a job. The runner then stops calling S3 for 60
+seconds, so the jobs in that time go straight to the local copy instead of
+each waiting through the same timeouts. `proxy`, `no_proxy` and `tls_ca_file`
+apply to S3 too. At start the runner checks the bucket in the background,
+without delaying jobs, and logs what is wrong (not found, access denied,
+unreachable).
+
+The runner never deletes objects. Expire old archives with a bucket lifecycle
+rule, e.g. `mc ilm rule add --expire-days 14 minio/turboci-cache` or an S3
+lifecycle rule with `Expiration: {Days: 14}`. Archives are stored as
+`<prefix>/project-<id>/<key>.zip`; every runner with the credentials can
+write every project's cache, so use one bucket or prefix per group of
+runners that trust each other. Archives above 5 GiB are kept only locally.
 
 ## Executor
 
@@ -167,7 +213,16 @@ alias = "docker"
 command = ["--host=tcp://0.0.0.0:2375", "--tls=false"]
 ```
 
-Jobs then reach it as `tcp://docker:2375` (`DOCKER_HOST`).
+Jobs then reach it as `tcp://docker:2375`. They must also set
+`DOCKER_TLS_CERTDIR` to empty, or the docker:dind image turns on TLS, on port
+2375 too. Variables from `.gitlab-ci.yml` reach the services listed here as
+well:
+
+```yaml
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+```
 
 ### Private registries
 

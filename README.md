@@ -20,8 +20,9 @@ single static binary with no external services: no Redis, no database.
   predefined runner variables; masked values and tokens are masked in the log
 - **Artifacts:** `paths`, `exclude`, `untracked`, `when`, `expire_in`, reports
   (`zip`, `gzip`, `raw`); dependency artifacts (`needs`/`dependencies`)
-- **Cache:** local cache on the runner host with `key`, `fallback_keys`,
-  `CACHE_FALLBACK_KEY`, `policy`, `when`, `untracked`
+- **Cache:** local cache on the runner host, optionally shared between hosts
+  through S3, with `key`, `fallback_keys`, `CACHE_FALLBACK_KEY`, `policy`,
+  `when`, `untracked`
 - **Docker:** `services` with aliases on a per-job network, `pull_policy`,
   GitLab registry credentials, `privileged`, `volumes`, memory/CPU limits
 - **Operations:** cancellation from the UI, SIGQUIT/SIGTERM shutdown,
@@ -30,8 +31,8 @@ single static binary with no external services: no Redis, no database.
 
 ## ⛔ Not supported (yet)
 
-Kubernetes and other executors, a distributed (S3) cache, interactive web
-terminals, external secrets (Vault), `DOCKER_AUTH_CONFIG`. See
+Kubernetes and other executors, interactive web terminals, external secrets
+(Vault), Docker credential helpers. See
 [pipeline support](https://ismoilovdevml.github.io/turboci/pipelines/) for the
 full list.
 
@@ -62,11 +63,15 @@ until the runner has reached GitLab.
 | `--version vX.Y.Z` | latest | release to install |
 | `--binary PATH` | – | install a local binary instead of downloading one |
 | `--tls-ca-file PATH` | – | CA (PEM) of a GitLab with a self-signed or internal certificate |
+| `--proxy URL` | – | HTTP(S) proxy for the runner, its jobs and services (`http://[user:pass@]host:port`) |
+| `--no-proxy LIST` | – | hosts, domains (`.corp.local`) and CIDRs reached directly; needs `--proxy` |
+| `--insecure-registry HOST` | – | registry reached over HTTP or without certificate checks, for docker:dind services (repeatable); dockerd needs it in `/etc/docker/daemon.json` too |
+| `--registry-ca HOST=FILE` | – | CA (PEM) of a registry, installed for dockerd in `/etc/docker/certs.d/HOST/ca.crt` and for docker:dind services (repeatable) |
 | `--no-start` | – | configure but do not start |
 
-Each option can also be given as an environment variable (`TURBOCI_URL`,
-`TURBOCI_TOKEN`, ...). Running the command again upgrades the runner and
-replaces the config, keeping a backup.
+Most options can also be given as environment variables (`TURBOCI_URL`,
+`TURBOCI_TOKEN`, `TURBOCI_PROXY`, ...). Running the command again upgrades
+the runner and replaces the config, keeping a backup.
 
 ### Manual Installation
 

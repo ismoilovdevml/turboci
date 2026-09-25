@@ -547,6 +547,18 @@ impl Bucket {
             Err(e) => Err(format!("cannot reach {}: {:#}", endpoint, e)),
         }
     }
+
+    /// Create the bucket (tests against a real server)
+    #[cfg(test)]
+    pub async fn create_bucket(&self) -> Result<()> {
+        let response = self
+            .send(reqwest::Method::PUT, "", EMPTY_SHA256, &[], None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(status_error(response).await);
+        }
+        Ok(())
+    }
 }
 
 /// An error naming the status and S3's error code (`<Code>...</Code>`)

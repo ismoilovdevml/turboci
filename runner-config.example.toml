@@ -41,6 +41,12 @@ cache_enabled = true
 cache_dir = "/var/lib/turboci/cache"
 # Cache archives not used for this many days are deleted (0 = keep forever)
 cache_max_age_days = 14
+# Share the cache between runner hosts through S3-compatible storage
+# (MinIO, AWS S3, Ceph, R2, ...); cache_dir stays the local first layer
+# [cache_s3]
+# url = "https://minio.corp:9000/turboci-cache"
+# access_key = "..."
+# secret_key = "..."
 
 # ===== EXECUTOR CONFIGURATION =====
 [executor]
@@ -96,7 +102,8 @@ helper_image = "alpine/git:latest"
 # insecure_registries = ["harbor.old.local"]
 
 # Services started for every job, e.g. a Docker daemon for image builds
-# (needs privileged = true)
+# (needs privileged = true). Jobs must set DOCKER_TLS_CERTDIR: "" as well:
+# docker:dind otherwise turns on TLS, on port 2375 too
 # [[executor.docker.services]]
 # name = "docker:27-dind"
 # alias = "docker"
