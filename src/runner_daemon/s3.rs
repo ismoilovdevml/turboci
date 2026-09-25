@@ -111,6 +111,11 @@ impl S3Location {
     pub fn parse(url: &str, region: Option<&str>) -> Result<Self> {
         let form = "cache_s3.url must look like https://host[:port]/bucket[/prefix] (path-style)";
         let parsed = reqwest::Url::parse(url).with_context(|| form.to_string())?;
+        // Without echoing the URL: the runner logs it, and reqwest would send
+        // the pair as a Basic Authorization header next to the signature
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("cache_s3.url must not hold credentials: set access_key and secret_key");
+        }
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             anyhow::bail!("{}, got {:?}", form, url);
         }
@@ -120,16 +125,19 @@ impl S3Location {
             anyhow::bail!("{}: the bucket is missing, got {:?}", form, url);
         }
         let host = parsed.host_str().unwrap_or_default().to_string();
-        let region = region.map(str::to_string).unwrap_or_else(|| {
-            host.strip_suffix(".amazonaws.com")
+        let region = match region.map(str::trim) {
+            Some("") => anyhow::bail!("cache_s3.region must not be empty"),
+            Some(region) => region.to_string(),
+            None => host
+                .strip_suffix(".amazonaws.com")
                 .and_then(|rest| {
                     rest.strip_prefix("s3.")
                         .or_else(|| rest.strip_prefix("s3-"))
                 })
                 .filter(|region| !region.is_empty() && !region.contains('.'))
                 .unwrap_or("us-east-1")
-                .to_string()
-        });
+                .to_string(),
+        };
         let mut endpoint = parsed.clone();
         endpoint.set_path("/");
         endpoint.set_query(None);
@@ -301,22 +309,29 @@ impl Bucket {
     }
 
     /// Fail at once while S3 is known to be down, instead of waiting through
-    /// the same timeouts and retries on every call
-    fn check_breaker(&self) -> Result<()> {
-        let Ok(breaker) = self.breaker.lock() else {
-            return Ok(());
+    /// the same timeouts and retries on every call. Once the cooldown is
+    /// over, the first call with `claim` is a trial (`true`): it keeps the
+    /// breaker open for another cooldown, so concurrent calls keep skipping
+    /// until the trial closes it or trips it again.
+    fn check_breaker(&self, claim: bool) -> Result<bool> {
+        let Ok(mut breaker) = self.breaker.lock() else {
+            return Ok(false);
         };
-        match &*breaker {
-            Some((until, error)) if *until > Instant::now() => {
-                let left = until.saturating_duration_since(Instant::now());
-                anyhow::bail!(
-                    "S3 skipped for the next {}s after: {}",
-                    left.as_secs_f64().ceil() as u64,
-                    error
-                )
-            }
-            _ => Ok(()),
+        let Some((until, error)) = breaker.as_mut() else {
+            return Ok(false);
+        };
+        let now = Instant::now();
+        if *until > now {
+            anyhow::bail!(
+                "S3 skipped for the next {}s after: {}",
+                until.saturating_duration_since(now).as_secs_f64().ceil() as u64,
+                error
+            );
         }
+        if claim {
+            *until = now + self.cooldown;
+        }
+        Ok(claim)
     }
 
     /// Skip calls for the cooldown after a network-level failure
@@ -371,12 +386,14 @@ impl Bucket {
             self.location.endpoint.as_str().trim_end_matches('/'),
             path
         );
-        self.check_breaker()?;
         let mut last_error = None;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(self.retry_delay * attempt).await;
             }
+            // Before every attempt: another call may have tripped the
+            // breaker while this one was retrying
+            let trial = self.check_breaker(true)?;
             let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
             let host = self.host_header();
             let authorization = Signer {
@@ -433,10 +450,15 @@ impl Bucket {
                     .body(reqwest::Body::wrap_stream(stream));
             }
             // The reply must start within the stall timeout of the last
-            // chunk sent (or of the request, without a body)
+            // chunk sent (or of the request, without a body). The URL is
+            // dropped from errors: it names a project and its cache key,
+            // and the breaker repeats the error to every job.
             let sent = until_stalled(request.send(), &progress, self.stall_timeout)
                 .await
-                .and_then(|sent| sent.context("cannot reach S3"));
+                .and_then(|sent| {
+                    sent.map_err(reqwest::Error::without_url)
+                        .context("cannot reach S3")
+                });
             match sent {
                 Ok(response) if response.status().is_server_error() => {
                     last_error = Some(anyhow::anyhow!("S3 answered {}", response.status()));
@@ -449,6 +471,10 @@ impl Bucket {
                     return Ok(response);
                 }
                 Err(e) => last_error = Some(e),
+            }
+            // A trial gets one attempt: its failure opens the breaker again
+            if trial {
+                break;
             }
         }
         Err(self.trip(last_error.unwrap_or_else(|| anyhow::anyhow!("S3 request failed"))))
@@ -466,7 +492,7 @@ impl Bucket {
             304 => return Ok(Download::NotModified),
             404 => return Ok(Download::NotFound),
             200 => {}
-            _ => return Err(status_error(response).await),
+            _ => return Err(status_error(response, self.stall_timeout).await),
         }
         let etag = response
             .headers()
@@ -481,7 +507,11 @@ impl Bucket {
         while let Some(chunk) = tokio::time::timeout(self.stall_timeout, response.chunk())
             .await
             .map_err(|_| stalled(self.stall_timeout))
-            .and_then(|chunk| chunk.context("S3 download interrupted"))
+            .and_then(|chunk| {
+                chunk
+                    .map_err(reqwest::Error::without_url)
+                    .context("S3 download interrupted")
+            })
             .map_err(|e| self.trip(e))?
         {
             out.write_all(&chunk).await?;
@@ -494,7 +524,7 @@ impl Bucket {
     /// Upload the file at `path` as `key`; returns the new object's ETag
     pub async fn put_file(&self, key: &str, path: &Path) -> Result<Option<String>> {
         // Before hashing: a large archive takes a while
-        self.check_breaker()?;
+        self.check_breaker(false)?;
         let len = tokio::fs::metadata(path).await?.len();
         if len > MAX_SINGLE_PUT {
             anyhow::bail!(
@@ -514,7 +544,7 @@ impl Bucket {
             .send(reqwest::Method::PUT, key, &hash, &[], Some(path))
             .await?;
         if !response.status().is_success() {
-            return Err(status_error(response).await);
+            return Err(status_error(response, self.stall_timeout).await);
         }
         Ok(response
             .headers()
@@ -555,16 +585,22 @@ impl Bucket {
             .send(reqwest::Method::PUT, "", EMPTY_SHA256, &[], None)
             .await?;
         if !response.status().is_success() {
-            return Err(status_error(response).await);
+            return Err(status_error(response, self.stall_timeout).await);
         }
         Ok(())
     }
 }
 
-/// An error naming the status and S3's error code (`<Code>...</Code>`)
-async fn status_error(response: reqwest::Response) -> anyhow::Error {
+/// An error naming the status and S3's error code (`<Code>...</Code>`). The
+/// body is read for at most `limit`: a server that goes silent must not
+/// hold the job.
+async fn status_error(response: reqwest::Response, limit: Duration) -> anyhow::Error {
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = tokio::time::timeout(limit, response.text())
+        .await
+        .ok()
+        .and_then(|body| body.ok())
+        .unwrap_or_default();
     let code = body
         .split_once("<Code>")
         .and_then(|(_, rest)| rest.split_once("</Code>"))
@@ -647,10 +683,25 @@ mod tests {
         }
     }
 
-    fn bucket(server: &MockServer, prefix: &str) -> Bucket {
+    #[test]
+    fn rejects_credentials_in_the_url_and_an_empty_region() {
+        for url in ["https://ak:hunter2@minio.corp/b", "https://ak@minio.corp/b"] {
+            let error = S3Location::parse(url, None).unwrap_err().to_string();
+            assert!(error.contains("access_key"), "{}", error);
+            assert!(!error.contains("hunter2"), "{}", error);
+        }
+        for region in ["", "  "] {
+            let error = S3Location::parse("https://minio.corp/b", Some(region))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "cache_s3.region must not be empty");
+        }
+    }
+
+    fn bucket_at(url: String) -> Bucket {
         Bucket::new(
             &crate::runner_daemon::config::S3CacheConfig {
-                url: format!("{}/ci-cache{}", server.uri(), prefix),
+                url,
                 access_key: "AK".to_string(),
                 secret_key: "SK".to_string(),
                 region: None,
@@ -659,6 +710,39 @@ mod tests {
         )
         .unwrap()
         .with_retry_delay(std::time::Duration::from_millis(10))
+    }
+
+    fn bucket(server: &MockServer, prefix: &str) -> Bucket {
+        bucket_at(format!("{}/ci-cache{}", server.uri(), prefix))
+    }
+
+    /// A server that answers one request with `reply` and then goes silent
+    /// for `hold` (closing the connection right away for zero)
+    async fn raw_server(
+        reply: &'static [u8],
+        hold: Duration,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket.write_all(reply).await.unwrap();
+            tokio::time::sleep(hold).await;
+        });
+        (address, server)
+    }
+
+    async fn requests_to(server: &MockServer, name: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with(name))
+            .count()
     }
 
     #[test]
@@ -998,31 +1082,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_download_that_stalls_midway_opens_the_breaker() {
-        use tokio::io::AsyncWriteExt;
         // Sends the headers and part of the body, then goes silent
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 4096];
-            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart")
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        });
-        let b = Bucket::new(
-            &crate::runner_daemon::config::S3CacheConfig {
-                url: format!("http://{}/ci-cache", address),
-                access_key: "AK".to_string(),
-                secret_key: "SK".to_string(),
-                region: None,
-            },
-            reqwest::Client::builder(),
+        let (address, server) = raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart",
+            Duration::from_secs(2),
         )
-        .unwrap()
-        .with_stall_timeout(Duration::from_millis(200));
+        .await;
+        let b = bucket_at(format!("http://{}/ci-cache", address))
+            .with_stall_timeout(Duration::from_millis(200));
         let dir = tempfile::tempdir().unwrap();
 
         let stalled = b
@@ -1037,5 +1104,131 @@ mod tests {
             .unwrap_err();
         assert!(skipped.to_string().contains("S3 skipped"), "{:#}", skipped);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn errors_do_not_name_the_object() {
+        // The breaker repeats an error to every job: project 7 must not see
+        // project 42's id or cache key
+        let b = bucket_at("http://127.0.0.1:9/ci-cache".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let unreachable = b
+            .get_to_file(&b.object_key(42, "feature%2Fx.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        let skipped = b
+            .get_to_file(&b.object_key(7, "main.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(skipped.to_string().contains("S3 skipped"), "{:#}", skipped);
+
+        // Closes the connection in the middle of the body
+        let (address, server) = raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart",
+            Duration::ZERO,
+        )
+        .await;
+        let b = bucket_at(format!("http://{}/ci-cache", address));
+        let interrupted = b
+            .get_to_file(&b.object_key(42, "feature%2Fx.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+        server.abort();
+
+        for error in [unreachable, skipped, interrupted] {
+            let text = format!("{:#}", error);
+            assert!(!text.contains("project-"), "{}", text);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_body_that_never_comes_does_not_hold_the_call() {
+        let (address, server) = raw_server(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 100\r\n\r\n",
+            Duration::from_secs(5),
+        )
+        .await;
+        let b = bucket_at(format!("http://{}/ci-cache", address))
+            .with_stall_timeout(Duration::from_millis(200));
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+
+        let error = b
+            .get_to_file(&b.object_key(1, "k.zip"), None, dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("403"), "{:#}", error);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn calls_in_flight_stop_retrying_once_the_breaker_opens() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/down.zip"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/slow.zip"))
+            .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(300)))
+            .mount(&server)
+            .await;
+        let b = bucket(&server, "");
+        let dir = tempfile::tempdir().unwrap();
+
+        // down.zip trips the breaker while slow.zip waits for its first reply
+        let (slow_key, down_key) = (b.object_key(1, "slow.zip"), b.object_key(1, "down.zip"));
+        let (slow, down) = tokio::join!(
+            b.get_to_file(&slow_key, None, dir.path()),
+            b.get_to_file(&down_key, None, dir.path()),
+        );
+
+        let down = down.unwrap_err();
+        assert!(down.to_string().contains("503"), "{:#}", down);
+        let slow = slow.unwrap_err().to_string();
+        assert!(slow.starts_with("S3 skipped"), "{}", slow);
+        assert_eq!(requests_to(&server, "slow.zip").await, 1);
+    }
+
+    #[tokio::test]
+    async fn after_the_cooldown_one_call_tries_s3_and_its_success_closes_the_breaker() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/down.zip"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ci-cache/project-1/back.zip"))
+            .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(100)))
+            .mount(&server)
+            .await;
+        let b = bucket(&server, "").with_cooldown(Duration::from_millis(50));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(b
+            .get_to_file(&b.object_key(1, "down.zip"), None, dir.path())
+            .await
+            .is_err());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let key = b.object_key(1, "back.zip");
+        let calls =
+            futures_util::future::join_all((0..3).map(|_| b.get_to_file(&key, None, dir.path())))
+                .await;
+
+        assert_eq!(requests_to(&server, "back.zip").await, 1);
+        let found = calls
+            .iter()
+            .filter(|call| matches!(call, Ok(Download::NotFound)))
+            .count();
+        assert_eq!(found, 1, "{:?}", calls);
+        assert!(matches!(
+            b.get_to_file(&key, None, dir.path()).await.unwrap(),
+            Download::NotFound
+        ));
+        assert_eq!(requests_to(&server, "back.zip").await, 2);
     }
 }
