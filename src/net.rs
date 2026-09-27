@@ -153,8 +153,11 @@ mod tests {
         assert_eq!(status, 200);
     }
 
-    /// A proxy that answers one request with 200 and returns its request line
-    async fn one_shot_proxy() -> (String, tokio::task::JoinHandle<String>) {
+    const PROXY_OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    /// A proxy that answers one request with `response`, closes the connection
+    /// and returns the request's head (request line and headers)
+    async fn one_shot_proxy(response: &'static [u8]) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -169,22 +172,15 @@ mod tests {
                 }
                 head.extend_from_slice(&buf[..n]);
             }
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                .await
-                .unwrap();
-            String::from_utf8_lossy(&head)
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .to_string()
+            socket.write_all(response).await.unwrap();
+            String::from_utf8_lossy(&head).to_string()
         });
         (url, handle)
     }
 
     #[tokio::test]
     async fn requests_go_through_the_configured_proxy() {
-        let (proxy, request_line) = one_shot_proxy().await;
+        let (proxy, head) = one_shot_proxy(PROXY_OK).await;
         let network = Network {
             proxy: Some(proxy),
             ..Network::default()
@@ -203,14 +199,49 @@ mod tests {
 
         assert_eq!(status, 200);
         assert_eq!(
-            request_line.await.unwrap(),
-            "GET http://turboci-proxy-test.invalid/ping HTTP/1.1"
+            head.await.unwrap().lines().next(),
+            Some("GET http://turboci-proxy-test.invalid/ping HTTP/1.1")
         );
     }
 
     #[tokio::test]
+    async fn https_is_tunneled_with_the_proxy_credentials() {
+        // The proxy then closes the tunnel, so the TLS handshake fails; only
+        // what the proxy received matters
+        let (proxy, head) = one_shot_proxy(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+        let network = Network {
+            proxy: Some(proxy.replace("http://", "http://user:secret@")),
+            ..Network::default()
+        };
+
+        let result = network
+            .client_builder()
+            .unwrap()
+            .build()
+            .unwrap()
+            .get("https://turboci-proxy-test.invalid/ping")
+            .send()
+            .await;
+
+        assert!(result.is_err(), "the tunnel was closed before TLS");
+        let head = head.await.unwrap();
+        let mut lines = head.lines();
+        assert_eq!(
+            lines.next(),
+            Some("CONNECT turboci-proxy-test.invalid:443 HTTP/1.1")
+        );
+        let auth = lines.find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("proxy-authorization")
+                .then(|| value.trim())
+        });
+        // base64("user:secret")
+        assert_eq!(auth, Some("Basic dXNlcjpzZWNyZXQ="), "{}", head);
+    }
+
+    #[tokio::test]
     async fn no_proxy_hosts_are_reached_directly() {
-        let (proxy, request_line) = one_shot_proxy().await;
+        let (proxy, request_line) = one_shot_proxy(PROXY_OK).await;
         let network = Network {
             proxy: Some(proxy),
             no_proxy: Some("localhost,.invalid".to_string()),
