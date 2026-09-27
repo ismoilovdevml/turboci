@@ -901,7 +901,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
     async fn minio_shares_the_cache_between_hosts() {
-        // minio/minio is no longer published; pgsty/minio is a maintained fork
+        // minio/minio is no longer published; pgsty/minio is a maintained
+        // community fork, pinned to a release and its multi-arch index digest
+        // so the test runs the same server every time
         let container = Container(format!("turboci-minio-test-{}", std::process::id()));
         let name = container.0.as_str();
         docker(&[
@@ -916,7 +918,8 @@ mod tests {
             "MINIO_ROOT_USER=turboci",
             "-e",
             "MINIO_ROOT_PASSWORD=turboci-secret",
-            "pgsty/minio:latest",
+            "pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:\
+             b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372",
             "server",
             "/data",
         ]);
