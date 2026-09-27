@@ -140,7 +140,9 @@ The credentials need `s3:GetObject` and `s3:PutObject` on the archives, and
 `s3:ListBucket` on the bucket (it may be limited to the prefix). Without
 `s3:ListBucket` AWS answers 403 instead of 404 for an archive that does not
 exist yet, so every cache miss logs a warning, and the start-up check reports
-access denied.
+access denied. A grant limited with an `s3:prefix` condition may not allow
+that check (HEAD on the bucket), which then logs access denied although the
+archives work.
 
 `cache_dir` stays the first layer. To restore, the runner asks S3 whether the
 archive changed (`If-None-Match`): an unchanged one is taken from the local
@@ -168,9 +170,11 @@ The runner never deletes objects. Expire old archives with a bucket lifecycle
 rule, e.g. `mc ilm rule add --expire-days 14 minio/turboci-cache` or an S3
 lifecycle rule with `Expiration: {Days: 14}`. Archives are stored as
 `<prefix>/project-<id>/<encoded-key>.zip`, the cache key percent-encoded
-(`feature/x` is `feature%2Fx.zip`); every runner with the credentials can
-write every project's cache, so use one bucket or prefix per group of
-runners that trust each other. Archives above 5 GiB are kept only locally.
+(`feature/x` is `feature%2Fx.zip`), and a key whose encoded name is longer
+than 200 characters as `h-<blake3 hash>.zip`; every runner with the
+credentials can write every project's cache, so use one bucket or prefix per
+group of runners that trust each other. Archives above 5 GiB are kept only
+locally.
 
 ## Executor
 

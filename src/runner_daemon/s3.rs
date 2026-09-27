@@ -571,7 +571,8 @@ impl Bucket {
                 200..=299 => Ok(()),
                 404 => Err(format!("bucket {} not found at {}", bucket, endpoint)),
                 403 => Err(format!(
-                    "access to bucket {} denied (check access_key and secret_key)",
+                    "access to bucket {} denied (check access_key and secret_key, \
+                     and that they allow s3:ListBucket on the bucket)",
                     bucket
                 )),
                 301 => Err(format!(
@@ -921,10 +922,24 @@ mod tests {
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
+        Mock::given(method("HEAD"))
+            .and(path("/locked"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
 
         let message = bucket(&server, "").probe().await.unwrap_err();
 
         assert!(message.contains("not found"), "{}", message);
+        let denied = bucket_at(format!("{}/locked", server.uri()))
+            .probe()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied,
+            "access to bucket locked denied (check access_key and secret_key, \
+             and that they allow s3:ListBucket on the bucket)"
+        );
         let unreachable = Bucket::new(
             &crate::runner_daemon::config::S3CacheConfig {
                 url: "http://127.0.0.1:9/ci-cache".to_string(),
