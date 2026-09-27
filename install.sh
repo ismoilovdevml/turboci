@@ -32,6 +32,8 @@ NO_PROXY_LIST="${TURBOCI_NO_PROXY:-}"
 INSECURE_REGISTRIES=()
 REGISTRY_CAS=()
 START_SERVICE=1
+# Set when an upgrade drains the running service instead of starting it
+DRAINING=0
 
 usage() {
     cat << USAGE
@@ -633,6 +635,7 @@ enable_service() {
             # (no new ones are taken); systemd then starts the new binary
             # (Restart=always). A plain restart would fail running jobs.
             systemctl kill -s SIGQUIT $SERVICE_NAME
+            DRAINING=1
             echo -e "${GREEN}✓${NC} Service draining: running jobs finish, then it restarts with the new binary"
             echo -e "   Follow it with: ${BLUE}journalctl -u $SERVICE_NAME -f${NC}"
         else
@@ -678,6 +681,11 @@ print_next_steps() {
 
     if [ "$STARTED" -eq 1 ]; then
         echo -e "\n${GREEN}🚀 TurboCI is running.${NC} Jobs for this runner will start automatically."
+        echo -e "   Logs: ${BLUE}journalctl -u $SERVICE_NAME -f${NC}\n"
+        return
+    fi
+    if [ "$DRAINING" -eq 1 ]; then
+        echo -e "\n${GREEN}🔄 TurboCI upgraded.${NC} Running jobs finish, then the service restarts on the new binary with the kept config."
         echo -e "   Logs: ${BLUE}journalctl -u $SERVICE_NAME -f${NC}\n"
         return
     fi
