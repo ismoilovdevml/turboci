@@ -154,5 +154,7 @@ curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/uninstall
 It stops the service and removes the config (a `0600` backup is kept), the
 state directory, and the containers, networks and cache volumes the runner
 created. The service user is removed only if the installer created it. The
-binary and the shared workspace directory stay while other TurboCI runners
-are installed. Delete the runner in GitLab afterwards.
+binary, the shared workspace directory and `/etc/turboci-registry-ca` stay
+while other TurboCI runners are installed. Registry CAs installed for dockerd
+in `/etc/docker/certs.d` are never removed. Delete the runner in GitLab
+afterwards.

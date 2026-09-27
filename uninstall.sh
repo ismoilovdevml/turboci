@@ -3,8 +3,8 @@ set -e
 
 # TurboCI Uninstaller
 # Removes: service, binary, config (a root-only backup is kept), work and state
-# directories, the turboci user, and leftover job containers/networks.
-# Docker is left installed.
+# directories, TurboCI's copy of registry CAs, the turboci user, and leftover
+# job containers/networks. Docker and /etc/docker/certs.d are left alone.
 
 BIN_NAME="turboci"
 INSTALL_DIR="/usr/local/bin"
@@ -26,6 +26,8 @@ CONFIG_FILE="/etc/$INSTANCE-runner.toml"
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 TMPFILES_FILE="/etc/tmpfiles.d/$INSTANCE.conf"
 STATE_DIR="/var/lib/$INSTANCE"
+# install.sh --registry-ca copies; shared by every runner on the host
+REGISTRY_CA_DIR="/etc/turboci-registry-ca"
 # The user the service ran as; it is only removed if install.sh created it
 SERVICE_USER=$(sed -n 's/^User=//p' "$SERVICE_FILE" 2>/dev/null)
 SERVICE_USER="${SERVICE_USER:-$INSTANCE}"
@@ -171,6 +173,29 @@ remove_workdir() {
     fi
 }
 
+# Remove TurboCI's copy of registry CAs. The directory is shared by all
+# runners, so it goes with the last one. The copies in /etc/docker/certs.d
+# stay: dockerd (and other tools) read them and may still pull from the hosts.
+remove_registry_ca() {
+    [ -d "$REGISTRY_CA_DIR" ] || return 0
+    echo -e "\n${YELLOW}🔐 Removing registry CAs...${NC}"
+    if [ -n "$OTHER_RUNNERS" ]; then
+        echo -e "${BLUE}ℹ️  Kept: other TurboCI runners use $REGISTRY_CA_DIR${NC}"
+        return
+    fi
+
+    HOSTS=""
+    for pem in "$REGISTRY_CA_DIR"/*.pem; do
+        [ -e "$pem" ] || continue
+        HOSTS="$HOSTS $(basename "$pem" .pem)"
+    done
+    if [ -n "$HOSTS" ]; then
+        echo -e "${BLUE}ℹ️  Left for dockerd: the CAs of${HOSTS} in /etc/docker/certs.d/<host>/ca.crt${NC}"
+    fi
+    rm -rf "$REGISTRY_CA_DIR"
+    echo -e "${GREEN}✓${NC} Removed: $REGISTRY_CA_DIR"
+}
+
 # Remove the service user
 remove_user() {
     id -u "$SERVICE_USER" > /dev/null 2>&1 || return 0
@@ -196,6 +221,7 @@ print_summary() {
     echo -e "   ✓ TurboCI binary"
     echo -e "   ✓ Configuration (root-only backup kept)"
     echo -e "   ✓ Work directories, local cache and leftover job containers"
+    echo -e "   ✓ TurboCI's copy of registry CAs, if no other runner uses it"
     echo -e "   ✓ Service user, if the installer created it"
     echo -e "\n${BLUE}ℹ️  Docker was left installed.${NC}"
 
@@ -214,6 +240,7 @@ main() {
     remove_config
     remove_job_containers
     remove_workdir
+    remove_registry_ca
     remove_user
     print_summary
 }
