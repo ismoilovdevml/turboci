@@ -773,12 +773,14 @@ fn workspace_owner(dir: &Path) -> Option<String> {
 }
 
 /// Settings of the host dockerd that the runner's config needs but that only
-/// dockerd's own configuration can provide; each entry says how to fix it
+/// dockerd's own configuration can provide; each entry says how to fix it.
+/// `resolve` returns a host name's addresses, none when it does not resolve.
 pub fn daemon_warnings(
     info: &bollard::models::SystemInfo,
     config: &DockerConfig,
     proxy: bool,
     certs_dir: &Path,
+    resolve: &dyn Fn(&str) -> Vec<std::net::IpAddr>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     let dockerd_proxy = [&info.http_proxy, &info.https_proxy]
@@ -800,13 +802,19 @@ pub fn daemon_warnings(
         let listed = indexes
             .get(registry)
             .is_some_and(|index| index.secure == Some(false));
-        let host = registry
-            .rsplit_once(':')
-            .map_or(registry.as_str(), |(h, _)| h);
-        let in_cidr = host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| cidrs.iter().any(|cidr| image::ip_in_cidr(ip, cidr)));
-        if !(listed || in_cidr) {
+        // Like dockerd: insecure when one of the host's addresses is in a CIDR
+        // (127.0.0.0/8 is by default); a name that does not resolve is not
+        let in_cidr = || {
+            let host = registry_host(registry);
+            let addrs = match host.parse::<std::net::IpAddr>() {
+                Ok(ip) => vec![ip],
+                Err(_) => resolve(host),
+            };
+            addrs
+                .into_iter()
+                .any(|ip| cidrs.iter().any(|cidr| image::ip_in_cidr(ip, cidr)))
+        };
+        if !(listed || in_cidr()) {
             warnings.push(format!(
                 "dockerd does not treat {registry} as insecure, so pulls from it fail. Add it \
                  to \"insecure-registries\" in /etc/docker/daemon.json and restart dockerd"
@@ -823,6 +831,21 @@ pub fn daemon_warnings(
         }
     }
     warnings
+}
+
+/// Host of a registry given as `host`, `host:port` or `[v6]:port`, split like
+/// dockerd's net.SplitHostPort; anything else (`::1`, `[::1]`) is kept whole
+fn registry_host(registry: &str) -> &str {
+    if let Some((host, _)) = registry
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("]:"))
+    {
+        return host;
+    }
+    match registry.split_once(':') {
+        Some((host, port)) if !port.contains(':') => host,
+        _ => registry,
+    }
 }
 
 /// Read-only mounts of registry CAs where dockerd looks for them. Mounts, not
@@ -919,12 +942,23 @@ impl DockerExecutor {
 
     /// `daemon_warnings` for the Docker daemon this runner uses
     pub async fn daemon_warnings(&self, proxy: bool) -> Vec<String> {
-        match self.docker.info().await {
-            Ok(info) => {
-                daemon_warnings(&info, &self.config, proxy, Path::new("/etc/docker/certs.d"))
-            }
-            Err(e) => vec![format!("Cannot read the Docker daemon's settings: {}", e)],
-        }
+        let info = match self.docker.info().await {
+            Ok(info) => info,
+            Err(e) => return vec![format!("Cannot read the Docker daemon's settings: {}", e)],
+        };
+        let config = self.config.clone();
+        // Resolving insecure registry names blocks (getaddrinfo)
+        tokio::task::spawn_blocking(move || {
+            let resolve = |host: &str| -> Vec<std::net::IpAddr> {
+                crate::net::lookup(host)
+                    .map(|addrs| addrs.iter().map(|addr| addr.ip()).collect())
+                    .unwrap_or_default()
+            };
+            let certs_dir = Path::new("/etc/docker/certs.d");
+            daemon_warnings(&info, &config, proxy, certs_dir, &resolve)
+        })
+        .await
+        .unwrap_or_else(|e| vec![format!("Cannot check the Docker daemon's settings: {}", e)])
     }
 
     async fn execute(
@@ -3182,6 +3216,11 @@ mod tests {
         assert!(service_ports(None).is_empty());
     }
 
+    /// A resolver for which no host name resolves
+    fn no_dns(_: &str) -> Vec<std::net::IpAddr> {
+        Vec::new()
+    }
+
     #[test]
     fn warns_when_dockerd_has_no_proxy() {
         let config = DockerConfig::default();
@@ -3192,11 +3231,70 @@ mod tests {
             ..Default::default()
         };
 
-        let warnings = daemon_warnings(&bare, &config, true, certs);
+        let warnings = daemon_warnings(&bare, &config, true, certs, &no_dns);
         assert_eq!(warnings.len(), 1, "{:?}", warnings);
         assert!(warnings[0].contains("docker.service.d"), "{}", warnings[0]);
-        assert!(daemon_warnings(&with_proxy, &config, true, certs).is_empty());
-        assert!(daemon_warnings(&bare, &config, false, certs).is_empty());
+        assert!(daemon_warnings(&with_proxy, &config, true, certs, &no_dns).is_empty());
+        assert!(daemon_warnings(&bare, &config, false, certs, &no_dns).is_empty());
+    }
+
+    /// dockerd's registry settings with these insecure CIDRs and no index configs
+    fn with_insecure_cidrs(cidrs: &[&str]) -> bollard::models::SystemInfo {
+        bollard::models::SystemInfo {
+            registry_config: Some(bollard::models::RegistryServiceConfig {
+                insecure_registry_cidrs: Some(cidrs.iter().map(|c| c.to_string()).collect()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn registry_names_resolving_into_an_insecure_cidr_do_not_warn() {
+        let config = DockerConfig {
+            insecure_registries: vec![
+                "localhost:5000".to_string(),
+                "mirror.corp".to_string(),
+                "[fd00::5]:5000".to_string(),
+            ],
+            ..DockerConfig::default()
+        };
+        let info = with_insecure_cidrs(&["127.0.0.0/8", "10.0.0.0/8", "fd00::/8"]);
+        let resolve = |host: &str| -> Vec<std::net::IpAddr> {
+            match host {
+                "localhost" => vec!["127.0.0.1".parse().unwrap()],
+                "mirror.corp" => vec!["192.168.1.9".parse().unwrap(), "10.1.2.3".parse().unwrap()],
+                _ => Vec::new(),
+            }
+        };
+
+        let warnings = daemon_warnings(&info, &config, false, Path::new("/nonexistent"), &resolve);
+
+        assert!(warnings.is_empty(), "{:?}", warnings);
+    }
+
+    #[test]
+    fn registry_names_resolving_outside_the_insecure_cidrs_warn() {
+        let config = DockerConfig {
+            insecure_registries: vec!["registry.corp:5000".to_string()],
+            ..DockerConfig::default()
+        };
+        let info = with_insecure_cidrs(&["127.0.0.0/8", "10.0.0.0/8"]);
+        let resolve = |host: &str| -> Vec<std::net::IpAddr> {
+            match host {
+                "registry.corp" => vec!["192.168.1.10".parse().unwrap()],
+                _ => Vec::new(),
+            }
+        };
+
+        let warnings = daemon_warnings(&info, &config, false, Path::new("/nonexistent"), &resolve);
+
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(
+            warnings[0].contains("registry.corp:5000") && warnings[0].contains("daemon.json"),
+            "{}",
+            warnings[0]
+        );
     }
 
     #[test]
@@ -3234,7 +3332,7 @@ mod tests {
             ..Default::default()
         };
 
-        let warnings = daemon_warnings(&info, &config, false, certs.path());
+        let warnings = daemon_warnings(&info, &config, false, certs.path(), &no_dns);
 
         assert_eq!(warnings.len(), 2, "{:?}", warnings);
         assert!(warnings[0].contains("missing.insecure") && warnings[0].contains("daemon.json"));
