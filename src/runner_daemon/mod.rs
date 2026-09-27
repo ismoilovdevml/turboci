@@ -983,8 +983,9 @@ impl RunnerDaemon {
         if !self.config.cache_enabled {
             return;
         }
-        let workspace = self.project_dir(job);
+        let workspace = self.project_dir(job).to_string_lossy().into_owned();
         let variables = job_variables(job);
+        let cancel = trace.cancel();
         let wants_untracked = job
             .cache
             .iter()
@@ -1013,11 +1014,17 @@ impl RunnerDaemon {
             }
             let key = job_cache::resolve_key(&cache_entry.key, &variables);
             trace.write(&format!("Saving cache {}...\n", key)).await;
-            match self
-                .cache
-                .save(project_id(job), &key, &workspace.to_string_lossy(), &paths)
-                .await
-            {
+            // An aborted job saves nothing more (dropping the save removes
+            // its staging file); checked first, so no later entry starts
+            let saved = tokio::select! {
+                biased;
+                _ = cancel.reached(RemoteState::Aborted) => {
+                    trace.write("Cache not saved: job canceled\n").await;
+                    return;
+                }
+                saved = self.cache.save(project_id(job), &key, &workspace, &paths) => saved,
+            };
+            match saved {
                 Ok(Some(saved)) => {
                     trace
                         .write(&format!("Created cache {} ({} bytes)\n", key, saved.size))
@@ -1888,6 +1895,68 @@ mod tests {
             requests(&server, "POST", 51).await.is_empty(),
             "aborted jobs upload nothing, even artifacts with when: always"
         );
+    }
+
+    #[tokio::test]
+    async fn an_abort_stops_saving_the_cache() {
+        let server = MockServer::start().await;
+        let s3 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&s3)
+            .await;
+        // S3 takes the upload but answers only after 10 s
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .mount(&s3)
+            .await;
+        let bucket = s3::Bucket::new(
+            &config::S3CacheConfig {
+                url: format!("{}/ci", s3.uri()),
+                access_key: "AK".to_string(),
+                secret_key: "SK".to_string(),
+                region: None,
+            },
+            reqwest::Client::builder(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await.with_s3_cache(bucket);
+        let handle = daemon.shutdown_handle();
+        let job = lifecycle_job(
+            52,
+            &["mkdir -p vendor", "echo dep > vendor/lib.txt"],
+            "on_success",
+        );
+        // Abort once the upload has reached S3
+        let abort = async {
+            while !s3
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.method.as_str() == "PUT")
+            {
+                sleep(Duration::from_millis(20)).await;
+            }
+            handle.request(Shutdown::Abort);
+        };
+
+        let started = std::time::Instant::now();
+        let (executed, _) = tokio::join!(
+            daemon.execute_job(job),
+            tokio::time::timeout(Duration::from_secs(10), abort)
+        );
+        executed.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let trace = trace_of(&server, 52).await;
+        assert!(trace.contains("Cache not saved: job canceled"), "{}", trace);
+        assert!(!trace.contains("Uploaded cache"), "{}", trace);
     }
 
     #[tokio::test]

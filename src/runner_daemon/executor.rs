@@ -304,7 +304,13 @@ async fn run_job_steps(
         Err(RunError::Failed(f)) => Some(f),
     };
     if failure.is_none() {
-        failure = restore.restore(job, trace).await.err();
+        // Bound like the scripts: a slow S3 transfer must not outlive the
+        // job timeout or a cancel (dropping it removes its temporary files)
+        failure = tokio::select! {
+            restored = restore.restore(job, trace) => restored.err(),
+            _ = tokio::time::sleep_until(script_limits.deadline) => Some(timed_out()),
+            _ = script_limits.cancel.reached(script_limits.stop_at) => Some(canceled()),
+        };
     }
 
     // RUNNER_SCRIPT_TIMEOUT caps the script steps within the job timeout
@@ -2001,6 +2007,7 @@ mod tests {
         job: &Job,
         work_dir: &Path,
         state: RemoteState,
+        restore: &dyn Restore,
     ) -> (JobOutcome, String) {
         let executor = ShellExecutor::new(Some(work_dir.to_string_lossy().into_owned()));
         let scrubber = SecretScrubber::new(vec![]);
@@ -2011,7 +2018,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
             cancel.update(state);
         });
-        let outcome = executor.execute(job, &mut trace, &NoRestore).await;
+        let outcome = executor.execute(job, &mut trace, restore).await;
         trigger.await.unwrap();
         trace.finish().await;
         (outcome, trace.text())
@@ -2026,7 +2033,8 @@ mod tests {
         }));
 
         let started = std::time::Instant::now();
-        let (outcome, log) = run_shell_canceled(&j, dir.path(), RemoteState::Canceling).await;
+        let (outcome, log) =
+            run_shell_canceled(&j, dir.path(), RemoteState::Canceling, &NoRestore).await;
 
         assert_eq!(outcome.unwrap_err().reason, FailureReason::JobCanceled);
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -2043,10 +2051,71 @@ mod tests {
             "steps": steps(&["sleep 30"], &["echo cleanup-ran"])
         }));
 
-        let (outcome, log) = run_shell_canceled(&j, dir.path(), RemoteState::Aborted).await;
+        let (outcome, log) =
+            run_shell_canceled(&j, dir.path(), RemoteState::Aborted, &NoRestore).await;
 
         assert_eq!(outcome.unwrap_err().reason, FailureReason::JobCanceled);
         assert!(!log.contains("cleanup-ran"), "{}", log);
+    }
+
+    /// A restore that never finishes, like a stuck S3 transfer
+    struct EndlessRestore;
+
+    #[async_trait]
+    impl Restore for EndlessRestore {
+        async fn restore(&self, _job: &Job, _trace: &mut TraceWriter<'_>) -> JobOutcome {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_job_timeout_stops_a_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ShellExecutor::new(Some(dir.path().to_string_lossy().into_owned()));
+        let j = job(serde_json::json!({
+            "id": 9, "token": "t",
+            "runner_info": {"timeout": 1},
+            "steps": steps(&["echo script-ran"], &["echo after-ran"])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, j.id, &j.token, &scrubber);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            executor.execute(&j, &mut trace, &EndlessRestore),
+        )
+        .await
+        .expect("the restore outlived the 1 s job timeout");
+        trace.finish().await;
+        let log = trace.text();
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::JobExecutionTimeout
+        );
+        assert!(!log.contains("\nscript-ran"), "{}", log);
+        assert!(log.contains("after-ran"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn canceling_stops_a_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 10, "token": "t",
+            "steps": steps(&["echo script-ran"], &["echo cleanup-ran"])
+        }));
+
+        // Canceled after 500 ms
+        let (outcome, log) = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_shell_canceled(&j, dir.path(), RemoteState::Canceling, &EndlessRestore),
+        )
+        .await
+        .expect("the restore ignored the cancel");
+
+        assert_eq!(outcome.unwrap_err().reason, FailureReason::JobCanceled);
+        assert!(!log.contains("\nscript-ran"), "{}", log);
+        assert!(log.contains("cleanup-ran"), "{}", log);
     }
 
     #[tokio::test]
