@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 use zip::{ZipArchive, ZipWriter};
 
+use super::cancel::Stop;
 use crate::gitlab::GitLabClient;
 
 /// An archive staged in a temporary file (archives are never held in memory)
@@ -13,33 +14,51 @@ pub struct Archive {
 }
 
 /// Download a dependency's artifacts archive to a file in `staging_dir` and
-/// extract it into the workspace. Returns the archive size.
+/// extract it into the workspace, until `stop`. Returns the archive size.
 pub async fn download_and_extract_artifacts(
     gitlab: &GitLabClient,
     job_id: u64,
     token: &str,
     workspace_path: &str,
     staging_dir: &Path,
+    stop: &Stop,
 ) -> Result<u64> {
+    stop.check()?;
     let staged = tempfile::NamedTempFile::new_in(staging_dir)?;
     let size = gitlab
         .download_artifacts_to(job_id, token, staged.path())
         .await?;
-    extract_archive_file(staged.path(), workspace_path).await?;
+    extract_archive_file(staged.path(), workspace_path, stop).await?;
     Ok(size)
 }
 
-/// Extract an untrusted ZIP file into the workspace, off the async runtime
-pub async fn extract_archive_file(path: &Path, workspace_path: &str) -> Result<()> {
+/// Extract an untrusted ZIP file into the workspace, off the async runtime.
+/// Dropping the future does not end the extraction: `stop` does, between
+/// files and between the chunks of a file.
+pub async fn extract_archive_file(path: &Path, workspace_path: &str, stop: &Stop) -> Result<()> {
     let path = path.to_path_buf();
     let workspace = workspace_path.to_string();
+    let stop = stop.clone();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)
             .with_context(|| format!("Failed to open {}", path.display()))?;
-        extract_zip_reader(file, &workspace, ExtractLimits::default())
+        extract_zip_reader(file, &workspace, ExtractLimits::default(), &stop)
     })
     .await
     .context("Extraction task panicked")?
+}
+
+/// Reads from `inner` until `stop` is set
+struct StopReader<'a, R> {
+    inner: R,
+    stop: &'a Stop,
+}
+
+impl<R: std::io::Read> std::io::Read for StopReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stop.check().map_err(std::io::Error::other)?;
+        self.inner.read(buf)
+    }
 }
 
 /// Limits applied when extracting untrusted archives (zip bomb protection)
@@ -70,7 +89,12 @@ fn extract_zip_with_limits(
     workspace_path: &str,
     limits: ExtractLimits,
 ) -> Result<()> {
-    extract_zip_reader(std::io::Cursor::new(zip_data), workspace_path, limits)
+    extract_zip_reader(
+        std::io::Cursor::new(zip_data),
+        workspace_path,
+        limits,
+        &Stop::default(),
+    )
 }
 
 /// Extract an untrusted ZIP archive into `workspace_path`.
@@ -81,6 +105,7 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
     reader: R,
     workspace_path: &str,
     limits: ExtractLimits,
+    stop: &Stop,
 ) -> Result<()> {
     let mut archive = ZipArchive::new(reader).context("Failed to read ZIP archive")?;
 
@@ -102,6 +127,7 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
     let mut total_bytes: u64 = 0;
 
     for i in 0..archive.len() {
+        stop.check()?;
         let mut file = archive.by_index(i)?;
         let rel_path = file
             .enclosed_name()
@@ -133,7 +159,10 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
         let remaining = limits.max_total_bytes.saturating_sub(total_bytes);
         let mut out_file = safe_fs::create_file(&dir, name)?;
         let written = std::io::copy(
-            &mut std::io::Read::take(&mut file, remaining.saturating_add(1)),
+            &mut StopReader {
+                inner: std::io::Read::take(&mut file, remaining.saturating_add(1)),
+                stop,
+            },
             &mut out_file,
         )?;
         if written > remaining {
@@ -667,6 +696,64 @@ mod tests {
             max_total_bytes: u64::MAX,
         };
         assert!(extract_zip_with_limits(&data, ws_path, too_many).is_err());
+    }
+
+    /// Reads a ZIP and sets `stop` once more than `after` bytes were read
+    struct StopAfter {
+        inner: std::io::Cursor<Vec<u8>>,
+        read: u64,
+        after: u64,
+        stop: Stop,
+    }
+
+    impl Read for StopAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n as u64;
+            if self.read > self.after {
+                self.stop.stop();
+            }
+            Ok(n)
+        }
+    }
+
+    impl std::io::Seek for StopAfter {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn extraction_stops_within_a_file() {
+        let mut data = Vec::new();
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut data));
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("big.bin", stored).unwrap();
+        zip.write_all(&vec![7u8; 4 << 20]).unwrap();
+        zip.start_file("next.txt", stored).unwrap();
+        zip.finish().unwrap();
+        let ws = tempdir().unwrap();
+        let stop = Stop::default();
+        let reader = StopAfter {
+            inner: std::io::Cursor::new(data),
+            read: 0,
+            after: 1 << 20,
+            stop: stop.clone(),
+        };
+
+        let error = extract_zip_reader(
+            reader,
+            ws.path().to_str().unwrap(),
+            ExtractLimits::default(),
+            &stop,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().starts_with("stopped"), "{:#}", error);
+        let written = std::fs::metadata(ws.path().join("big.bin")).unwrap().len();
+        assert!(written < 4 << 20, "{}", written);
+        assert!(!ws.path().join("next.txt").exists());
     }
 
     // --- collection (#2) ---

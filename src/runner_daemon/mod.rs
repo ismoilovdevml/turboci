@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::gitlab::{ArtifactUpload, FailureReason, GitLabClient, Job, JobState, RemoteState};
 use crate::security::secret_scrubber::SecretScrubber;
-use cancel::CancelSignal;
+use cancel::{CancelSignal, Stop};
 use executor::{JobFailure, JobOutcome};
 use trace::TraceWriter;
 
@@ -184,8 +184,8 @@ struct WorkspaceRestore<'a>(&'a RunnerDaemon);
 
 #[async_trait::async_trait]
 impl executor::Restore for WorkspaceRestore<'_> {
-    async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
-        self.0.restore_workspace(job, trace).await
+    async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>, stop: &Stop) -> JobOutcome {
+        self.0.restore_workspace(job, trace, stop).await
     }
 }
 
@@ -691,8 +691,14 @@ impl RunnerDaemon {
         })
     }
 
-    /// Restore cache and dependency artifacts into the checked-out project
-    async fn restore_workspace(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome {
+    /// Restore cache and dependency artifacts into the checked-out project,
+    /// until `stop`
+    async fn restore_workspace(
+        &self,
+        job: &Job,
+        trace: &mut TraceWriter<'_>,
+        stop: &Stop,
+    ) -> JobOutcome {
         let project_dir = self.project_dir(job);
         let workspace = project_dir.to_string_lossy();
 
@@ -730,12 +736,18 @@ impl RunnerDaemon {
                     .write(&format!("Restoring cache {}...\n", keys[0]))
                     .await;
                 let tries = attempts(job, "RESTORE_CACHE_ATTEMPTS");
-                let mut restored = self.cache.restore(project_id(job), &keys, &workspace).await;
+                let mut restored = self
+                    .cache
+                    .restore(project_id(job), &keys, &workspace, stop)
+                    .await;
                 for _ in 1..tries {
                     if restored.is_ok() {
                         break;
                     }
-                    restored = self.cache.restore(project_id(job), &keys, &workspace).await;
+                    restored = self
+                        .cache
+                        .restore(project_id(job), &keys, &workspace, stop)
+                        .await;
                 }
                 match restored {
                     Ok(restored) => {
@@ -774,17 +786,21 @@ impl RunnerDaemon {
         trace
             .section_start("download_artifacts", "Downloading artifacts")
             .await;
-        let downloaded = self.download_dependencies(job, trace, &workspace).await;
+        let downloaded = self
+            .download_dependencies(job, trace, &workspace, stop)
+            .await;
         trace.section_end("download_artifacts").await;
         downloaded
     }
 
-    /// Download and extract the artifacts of the jobs this one depends on
+    /// Download and extract the artifacts of the jobs this one depends on,
+    /// until `stop` (the executor sets it on the job timeout or a cancel)
     async fn download_dependencies(
         &self,
         job: &Job,
         trace: &mut TraceWriter<'_>,
         workspace: &str,
+        stop: &Stop,
     ) -> JobOutcome {
         for dependency in job
             .dependencies
@@ -797,40 +813,27 @@ impl RunnerDaemon {
                     dependency.id, dependency.name
                 ))
                 .await;
-            let cancel = trace.cancel();
             let job_dir = self.executor.job_dir(job.id);
             let tries = attempts(job, "ARTIFACT_DOWNLOAD_ATTEMPTS");
-            let download = async {
-                let mut result = Err(anyhow::anyhow!("not attempted"));
-                for attempt in 1..=tries {
-                    result = artifacts::download_and_extract_artifacts(
-                        &self.gitlab,
-                        dependency.id,
-                        &dependency.token,
-                        workspace,
-                        &job_dir,
-                    )
-                    .await;
-                    if result.is_ok() || attempt == tries {
-                        break;
-                    }
-                    warn!(
-                        "Artifact download attempt {}/{} failed, retrying",
-                        attempt, tries
-                    );
+            let mut result = Err(anyhow::anyhow!("not attempted"));
+            for attempt in 1..=tries {
+                result = artifacts::download_and_extract_artifacts(
+                    &self.gitlab,
+                    dependency.id,
+                    &dependency.token,
+                    workspace,
+                    &job_dir,
+                    stop,
+                )
+                .await;
+                if result.is_ok() || attempt == tries {
+                    break;
                 }
-                result
-            };
-            let result = tokio::select! {
-                result = download => result,
-                _ = cancel.reached(RemoteState::Aborted) => {
-                    return Err(JobFailure {
-                        reason: FailureReason::JobCanceled,
-                        exit_code: None,
-                        message: "canceled".to_string(),
-                    });
-                }
-            };
+                warn!(
+                    "Artifact download attempt {}/{} failed, retrying",
+                    attempt, tries
+                );
+            }
             result.map_err(|e| JobFailure {
                 reason: FailureReason::ScriptFailure,
                 exit_code: None,
@@ -1014,8 +1017,10 @@ impl RunnerDaemon {
             }
             let key = job_cache::resolve_key(&cache_entry.key, &variables);
             trace.write(&format!("Saving cache {}...\n", key)).await;
-            // An aborted job saves nothing more (dropping the save removes
-            // its staging file); checked first, so no later entry starts
+            // An aborted job saves nothing more; checked first, so no later
+            // entry starts. A dropped save only reads the workspace: a zip
+            // still being written runs to its end in the background, into a
+            // staging file in the cache directory that is then removed.
             let saved = tokio::select! {
                 biased;
                 _ = cancel.reached(RemoteState::Aborted) => {

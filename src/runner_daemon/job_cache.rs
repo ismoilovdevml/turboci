@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::artifacts;
+use super::cancel::Stop;
 use super::script;
 
 #[derive(Debug, Clone)]
@@ -158,15 +159,17 @@ impl LocalCache {
             })
     }
 
-    /// Extract the first key that has an archive, in S3 or locally
+    /// Extract the first key that has an archive, in S3 or locally, until `stop`
     pub async fn restore(
         &self,
         project_id: u64,
         keys: &[String],
         workspace: &str,
+        stop: &Stop,
     ) -> Result<Restore> {
         let mut outcome = Restore::default();
         for key in keys {
+            stop.check()?;
             let path = self.archive_path(project_id, key);
             let mut source = Source::Local;
             if let Some(remote) = &self.remote {
@@ -184,7 +187,7 @@ impl LocalCache {
                     if let Ok(file) = std::fs::File::options().append(true).open(&path) {
                         let _ = file.set_modified(std::time::SystemTime::now());
                     }
-                    artifacts::extract_archive_file(&path, workspace).await?;
+                    artifacts::extract_archive_file(&path, workspace, stop).await?;
                     outcome.hit = Some((key.clone(), source));
                     return Ok(outcome);
                 }
@@ -362,7 +365,12 @@ mod tests {
         let consumer = tempdir().unwrap();
 
         let restored = cache_b
-            .restore(5, &["main".to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                5,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
 
@@ -409,7 +417,12 @@ mod tests {
 
         let consumer = tempdir().unwrap();
         let restored = cache
-            .restore(5, &["main".to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                5,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
 
@@ -465,7 +478,12 @@ mod tests {
 
         let consumer = tempdir().unwrap();
         let restored = cache
-            .restore(5, &["main".to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                5,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
 
@@ -546,7 +564,12 @@ mod tests {
         );
         let consumer = tempdir().unwrap();
         let restored = cache
-            .restore(5, &["main".to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                5,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
         assert!(
@@ -576,6 +599,29 @@ mod tests {
             .unwrap();
         assert_eq!(saved.upload, Some(Ok(())));
         assert!(!sidecar(&archive).exists());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_restore_does_not_call_s3() {
+        let server = MockServer::start().await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+        let consumer = tempdir().unwrap();
+        let stop = Stop::default();
+        stop.stop();
+
+        let stopped = cache
+            .restore(
+                5,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &stop,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(stopped.to_string().starts_with("stopped"), "{:#}", stopped);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -612,6 +658,7 @@ mod tests {
                 5,
                 &["feature".to_string(), "main".to_string()],
                 consumer.path().to_str().unwrap(),
+                &Stop::default(),
             )
             .await
             .unwrap();
@@ -662,7 +709,12 @@ mod tests {
         let consumer = tempdir().unwrap();
 
         let restored = cache
-            .restore(5, &["b".to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                5,
+                &["b".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
 
@@ -727,6 +779,7 @@ mod tests {
                 42,
                 &["feature-branch".to_string(), "main".to_string()],
                 consumer.path().to_str().unwrap(),
+                &Stop::default(),
             )
             .await
             .unwrap();
@@ -737,7 +790,12 @@ mod tests {
             b"dep"
         );
         let miss = cache
-            .restore(7, &["main".to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                7,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
         assert!(miss.hit.is_none(), "caches must not leak between projects");
@@ -908,7 +966,12 @@ mod tests {
 
         let consumer = tempdir().unwrap();
         let first = cache_b
-            .restore(9, &[key.to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                9,
+                &[key.to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
         assert!(
@@ -922,7 +985,12 @@ mod tests {
         );
 
         let second = cache_b
-            .restore(9, &[key.to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                9,
+                &[key.to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
         assert!(
@@ -934,7 +1002,12 @@ mod tests {
         // S3 gone: the restore falls back to the local copy
         docker(&["stop", name]);
         let offline = cache_b
-            .restore(9, &[key.to_string()], consumer.path().to_str().unwrap())
+            .restore(
+                9,
+                &[key.to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
             .await
             .unwrap();
         assert!(

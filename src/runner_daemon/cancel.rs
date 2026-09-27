@@ -43,6 +43,24 @@ impl CancelSignal {
     }
 }
 
+/// Tells blocking work (archive extraction) to stop; clones share the flag
+#[derive(Clone, Default)]
+pub struct Stop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Stop {
+    pub fn stop(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An error once stopped; checked between the steps of the work
+    pub fn check(&self) -> anyhow::Result<()> {
+        if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("stopped: the job timed out or was canceled");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

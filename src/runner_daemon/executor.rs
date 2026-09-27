@@ -21,7 +21,7 @@ use tokio::process::Command;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::cancel::CancelSignal;
+use super::cancel::{CancelSignal, Stop};
 use super::config::DockerConfig;
 use super::git::{self, GitStrategy};
 use super::image::{self, PullPolicy};
@@ -44,6 +44,13 @@ const TRACE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Upper bound for resetting workspace ownership after a job
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a restore stopped by the job timeout or a cancel may take to
+/// end; a download stuck in the network is dropped after it (shorter in tests)
+const RESTORE_STOP_GRACE: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
 /// Host directory holding Docker job workspaces (bind-mounted as /builds)
 const DOCKER_BUILDS_ROOT: &str = "/tmp/turboci-builds";
 
@@ -208,10 +215,11 @@ impl ExecutorType {
 
 /// Restores cache and dependency artifacts into the project, after sources are
 /// checked out and before the scripts run (gitlab-runner's order: otherwise
-/// `git checkout -f` would revert restored tracked files)
+/// `git checkout -f` would revert restored tracked files). Extractions end
+/// once `stop` is set.
 #[async_trait]
 pub trait Restore: Send + Sync {
-    async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>) -> JobOutcome;
+    async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>, stop: &Stop) -> JobOutcome;
 }
 
 /// Nothing to restore
@@ -221,7 +229,7 @@ pub struct NoRestore;
 #[cfg(test)]
 #[async_trait]
 impl Restore for NoRestore {
-    async fn restore(&self, _job: &Job, _trace: &mut TraceWriter<'_>) -> JobOutcome {
+    async fn restore(&self, _job: &Job, _trace: &mut TraceWriter<'_>, _stop: &Stop) -> JobOutcome {
         Ok(())
     }
 }
@@ -304,13 +312,26 @@ async fn run_job_steps(
         Err(RunError::Failed(f)) => Some(f),
     };
     if failure.is_none() {
-        // Bound like the scripts: a slow S3 transfer must not outlive the
-        // job timeout or a cancel (dropping it removes its temporary files)
-        failure = tokio::select! {
-            restored = restore.restore(job, trace) => restored.err(),
+        // Bound like the scripts: a slow S3 transfer must not outlive the job
+        // timeout or a cancel. The restore is then stopped and awaited, so no
+        // extraction still writes to the workspace while after_script, the
+        // saves and the cleanup run.
+        let stop = Stop::default();
+        let mut restoring = restore.restore(job, trace, &stop);
+        let interrupted = tokio::select! {
+            restored = &mut restoring => {
+                failure = restored.err();
+                None
+            }
             _ = tokio::time::sleep_until(script_limits.deadline) => Some(timed_out()),
             _ = script_limits.cancel.reached(script_limits.stop_at) => Some(canceled()),
         };
+        if interrupted.is_some() {
+            stop.stop();
+            // Dropping a download removes its temporary file
+            let _ = tokio::time::timeout(RESTORE_STOP_GRACE, restoring).await;
+            failure = interrupted;
+        }
     }
 
     // RUNNER_SCRIPT_TIMEOUT caps the script steps within the job timeout
@@ -2058,12 +2079,18 @@ mod tests {
         assert!(!log.contains("cleanup-ran"), "{}", log);
     }
 
-    /// A restore that never finishes, like a stuck S3 transfer
+    /// A restore that never finishes and ignores the stop, like a download
+    /// stuck in the network: only the grace period ends it
     struct EndlessRestore;
 
     #[async_trait]
     impl Restore for EndlessRestore {
-        async fn restore(&self, _job: &Job, _trace: &mut TraceWriter<'_>) -> JobOutcome {
+        async fn restore(
+            &self,
+            _job: &Job,
+            _trace: &mut TraceWriter<'_>,
+            _stop: &Stop,
+        ) -> JobOutcome {
             std::future::pending().await
         }
     }
@@ -2085,7 +2112,7 @@ mod tests {
             executor.execute(&j, &mut trace, &EndlessRestore),
         )
         .await
-        .expect("the restore outlived the 1 s job timeout");
+        .expect("the restore outlived the 1 s job timeout and the grace period");
         trace.finish().await;
         let log = trace.text();
 
@@ -2111,11 +2138,93 @@ mod tests {
             run_shell_canceled(&j, dir.path(), RemoteState::Canceling, &EndlessRestore),
         )
         .await
-        .expect("the restore ignored the cancel");
+        .expect("the restore outlived the cancel and the grace period");
 
         assert_eq!(outcome.unwrap_err().reason, FailureReason::JobCanceled);
         assert!(!log.contains("\nscript-ran"), "{}", log);
         assert!(log.contains("cleanup-ran"), "{}", log);
+    }
+
+    /// Extracts a cache archive, like the S3 cache restore
+    struct ExtractRestore {
+        archive: PathBuf,
+        into: PathBuf,
+    }
+
+    #[async_trait]
+    impl Restore for ExtractRestore {
+        async fn restore(
+            &self,
+            _job: &Job,
+            _trace: &mut TraceWriter<'_>,
+            stop: &Stop,
+        ) -> JobOutcome {
+            super::super::artifacts::extract_archive_file(
+                &self.archive,
+                &self.into.to_string_lossy(),
+                stop,
+            )
+            .await
+            .map_err(|e| JobFailure::system(format!("{:#}", e)))
+        }
+    }
+
+    fn files_in(dir: &Path) -> usize {
+        walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_canceled_restore_stops_writing_before_the_job_moves_on() {
+        const ENTRIES: usize = 20_000;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("cache.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for i in 0..ENTRIES {
+            zip.start_file(format!("vendor/{}/{}.txt", i % 100, i), stored)
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"cached").unwrap();
+        }
+        zip.finish().unwrap();
+        let into = dir.path().join("restored");
+        let restore = ExtractRestore {
+            archive,
+            into: into.clone(),
+        };
+        let executor = ShellExecutor::new(Some(dir.path().to_string_lossy().into_owned()));
+        let j = job(serde_json::json!({
+            "id": 11, "token": "t",
+            "steps": steps(&["echo script-ran"], &["echo cleanup-ran"])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let cancel = CancelSignal::default();
+        let mut trace =
+            TraceWriter::new(None, j.id, &j.token, &scrubber).with_cancel(cancel.clone());
+        // Canceled once the extraction has started
+        let trigger = async {
+            while files_in(&into) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.update(RemoteState::Canceling);
+        };
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(executor.execute(&j, &mut trace, &restore), trigger)
+        })
+        .await
+        .expect("the job did not end");
+
+        assert_eq!(outcome.unwrap_err().reason, FailureReason::JobCanceled);
+        let written = files_in(&into);
+        assert!(written < ENTRIES, "the extraction was not stopped");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(files_in(&into), written, "written after the job moved on");
+        std::fs::remove_dir_all(&into).unwrap();
     }
 
     #[tokio::test]
@@ -2138,7 +2247,12 @@ mod tests {
 
     #[async_trait]
     impl Restore for BumpVersion {
-        async fn restore(&self, _job: &Job, _trace: &mut TraceWriter<'_>) -> JobOutcome {
+        async fn restore(
+            &self,
+            _job: &Job,
+            _trace: &mut TraceWriter<'_>,
+            _stop: &Stop,
+        ) -> JobOutcome {
             std::fs::write(self.0.join("project/VERSION"), "2.0.0\n").map_err(JobFailure::system)
         }
     }
