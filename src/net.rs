@@ -224,7 +224,12 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "the tunnel was closed before TLS");
-        let head = head.await.unwrap();
+        // Bounded: a request that bypassed the proxy also fails, and then
+        // the proxy would wait for a connection forever
+        let head = tokio::time::timeout(std::time::Duration::from_secs(10), head)
+            .await
+            .expect("the proxy received no request")
+            .unwrap();
         let mut lines = head.lines();
         assert_eq!(
             lines.next(),

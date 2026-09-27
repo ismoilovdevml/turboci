@@ -808,6 +808,8 @@ pub fn daemon_warnings(
             let host = registry_host(registry);
             let addrs = match host.parse::<std::net::IpAddr>() {
                 Ok(ip) => vec![ip],
+                // No CIDR could match, so a lookup would only cost time
+                Err(_) if cidrs.is_empty() => Vec::new(),
                 Err(_) => resolve(host),
             };
             addrs
@@ -3271,6 +3273,40 @@ mod tests {
         let warnings = daemon_warnings(&info, &config, false, Path::new("/nonexistent"), &resolve);
 
         assert!(warnings.is_empty(), "{:?}", warnings);
+    }
+
+    #[test]
+    fn registry_names_are_not_resolved_when_listed_or_without_cidrs() {
+        use bollard::models::IndexInfo;
+
+        let never = |host: &str| -> Vec<std::net::IpAddr> { panic!("{host} was resolved") };
+        let certs = Path::new("/nonexistent");
+        let listed = DockerConfig {
+            insecure_registries: vec!["listed.corp:5000".to_string()],
+            ..DockerConfig::default()
+        };
+        let mut info = with_insecure_cidrs(&["127.0.0.0/8"]);
+        info.registry_config.as_mut().unwrap().index_configs =
+            Some(std::collections::HashMap::from([(
+                "listed.corp:5000".to_string(),
+                IndexInfo {
+                    secure: Some(false),
+                    ..Default::default()
+                },
+            )]));
+        assert!(daemon_warnings(&info, &listed, false, certs, &never).is_empty());
+
+        let unlisted = DockerConfig {
+            insecure_registries: vec!["registry.corp:5000".to_string()],
+            ..DockerConfig::default()
+        };
+        let warnings = daemon_warnings(&with_insecure_cidrs(&[]), &unlisted, false, certs, &never);
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(
+            warnings[0].contains("registry.corp:5000"),
+            "{}",
+            warnings[0]
+        );
     }
 
     #[test]

@@ -172,9 +172,14 @@ async fn main() -> Result<()> {
                     info!("🐳 Using Docker executor (isolated containers)");
                     let docker = DockerExecutor::new(runner_config.executor.docker.clone())?
                         .with_owner(&system_id);
-                    for warning in docker.daemon_warnings(runner_config.proxy.is_some()).await {
-                        tracing::warn!("{}", warning);
-                    }
+                    // In the background: resolving registry names with a slow
+                    // DNS must not delay taking jobs
+                    let (check, proxy) = (docker.clone(), runner_config.proxy.is_some());
+                    tokio::spawn(async move {
+                        for warning in check.daemon_warnings(proxy).await {
+                            tracing::warn!("{}", warning);
+                        }
+                    });
                     ExecutorType::Docker(docker)
                 }
                 _ => {
