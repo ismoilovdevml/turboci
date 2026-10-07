@@ -121,7 +121,7 @@ fn executable_arch() -> String {
         "x86" => "386",
         other => other,
     };
-    format!("{}/{}", std::env::consts::OS, arch)
+    format!("{}/{}", crate::gitlab::go_os(), arch)
 }
 
 /// First 9 characters of the runner token after its prefix (glrt-, t1_, ...):
@@ -1632,6 +1632,7 @@ mod tests {
         assert_eq!(short_token("glrt-AbCdEfGhIjKl"), "AbCdEfGhI");
         assert_eq!(short_token("t2_xyz"), "xyz");
         assert!(executable_arch().contains('/'));
+        assert!(!executable_arch().starts_with("macos/"));
     }
 
     #[test]

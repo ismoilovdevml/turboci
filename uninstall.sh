@@ -5,6 +5,7 @@ set -e
 # Removes: service, binary, config (a root-only backup is kept), work and state
 # directories, TurboCI's copy of registry CAs, the turboci user, and leftover
 # job containers/networks. Docker and /etc/docker/certs.d are left alone.
+# On macOS: the launchd agent, binary, config and state directory; the user stays.
 
 BIN_NAME="turboci"
 INSTALL_DIR="/usr/local/bin"
@@ -31,11 +32,36 @@ REGISTRY_CA_DIR="/etc/turboci-registry-ca"
 # The user the service ran as; it is only removed if install.sh created it
 SERVICE_USER=$(sed -n 's/^User=//p' "$SERVICE_FILE" 2>/dev/null)
 SERVICE_USER="${SERVICE_USER:-$INSTANCE}"
-# Containers, networks and volumes carry the runner's system ID
-OWNER=$(cat "$STATE_DIR/.runner_system_id" 2>/dev/null || true)
-# Other TurboCI runners on this host keep the binary and shared directories
-OTHER_RUNNERS=$(grep -l "$INSTALL_DIR/$BIN_NAME runner-start" /etc/systemd/system/*.service 2>/dev/null \
-    | grep -vx "$SERVICE_FILE" || true)
+ROOT_GROUP="root"
+MACOS=0
+if [ "$(uname -s)" = "Darwin" ]; then
+    MACOS=1
+    ROOT_GROUP="wheel"
+    # install.sh puts the agent in the LaunchAgents of the user it runs as
+    LAUNCHD_LABEL="io.github.ismoilovdevml.$INSTANCE"
+    PLIST_FILE=""
+    OTHER_RUNNERS=""
+    for plist in /Users/*/Library/LaunchAgents/io.github.ismoilovdevml.*.plist; do
+        [ -e "$plist" ] || continue
+        if [ -z "$PLIST_FILE" ] && [ "$(basename "$plist")" = "$LAUNCHD_LABEL.plist" ]; then
+            PLIST_FILE="$plist"
+        else
+            OTHER_RUNNERS="$OTHER_RUNNERS $plist"
+        fi
+    done
+    STATE_DIR=""
+    SERVICE_USER=""
+    if [ -n "$PLIST_FILE" ]; then
+        SERVICE_USER=$(stat -f %Su "$PLIST_FILE")
+        STATE_DIR=$(plutil -extract WorkingDirectory raw "$PLIST_FILE" 2>/dev/null || true)
+    fi
+else
+    # Containers, networks and volumes carry the runner's system ID
+    OWNER=$(cat "$STATE_DIR/.runner_system_id" 2>/dev/null || true)
+    # Other TurboCI runners on this host keep the binary and shared directories
+    OTHER_RUNNERS=$(grep -l "$INSTALL_DIR/$BIN_NAME runner-start" /etc/systemd/system/*.service 2>/dev/null \
+        | grep -vx "$SERVICE_FILE" || true)
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -61,6 +87,26 @@ cat << "EOF"
   🗑️  TurboCI Uninstaller
 EOF
 echo -e "${NC}"
+
+# Stop and remove the launchd agent (macOS)
+remove_launch_agent() {
+    echo -e "${YELLOW}🛑 Stopping agent...${NC}"
+    if [ -z "$PLIST_FILE" ]; then
+        echo -e "${BLUE}ℹ️  Agent not found${NC}"
+        return
+    fi
+
+    # bootout stops it with SIGTERM: running jobs are stopped and reported
+    TARGET="gui/$(id -u "$SERVICE_USER")/$LAUNCHD_LABEL"
+    if launchctl print "$TARGET" > /dev/null 2>&1; then
+        launchctl bootout "$TARGET"
+        echo -e "${GREEN}✓${NC} Agent stopped"
+    else
+        echo -e "${BLUE}ℹ️  Agent not loaded${NC}"
+    fi
+    rm -f "$PLIST_FILE"
+    echo -e "${GREEN}✓${NC} Agent removed: $PLIST_FILE"
+}
 
 # Stop and disable service
 remove_service() {
@@ -107,7 +153,7 @@ remove_config() {
 
     if [ -f "$CONFIG_FILE" ]; then
         BACKUP_FILE="${CONFIG_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
-        install -m 0600 -o root -g root "$CONFIG_FILE" "$BACKUP_FILE"
+        install -m 0600 -o root -g "$ROOT_GROUP" "$CONFIG_FILE" "$BACKUP_FILE"
         echo -e "${BLUE}ℹ️  Config backed up to: $BACKUP_FILE (root only)${NC}"
 
         rm -f "$CONFIG_FILE"
@@ -118,7 +164,7 @@ remove_config() {
     # Backups made by install.sh when replacing the config also hold tokens
     for old in "$CONFIG_FILE".bak.*; do
         [ -e "$old" ] || continue
-        chown root:root "$old" && chmod 0600 "$old"
+        chown "root:$ROOT_GROUP" "$old" && chmod 0600 "$old"
     done
 }
 
@@ -160,13 +206,17 @@ remove_workdir() {
     echo -e "\n${YELLOW}📁 Removing work directories...${NC}"
 
     DIRS="$STATE_DIR"
-    [ -n "$OTHER_RUNNERS" ] || DIRS="$DIRS /tmp/turboci-builds /tmp/turboci"
+    [ -n "$OTHER_RUNNERS" ] || [ "$MACOS" -eq 1 ] || DIRS="$DIRS /tmp/turboci-builds /tmp/turboci"
     for dir in $DIRS; do
         if [ -d "$dir" ]; then
             rm -rf "$dir"
             echo -e "${GREEN}✓${NC} Removed: $dir"
         fi
     done
+    # ~/Library/TurboCI goes with the user's last runner
+    if [ "$MACOS" -eq 1 ] && [ -n "$STATE_DIR" ]; then
+        rmdir "$(dirname "$STATE_DIR")" 2> /dev/null || true
+    fi
     if [ -f "$TMPFILES_FILE" ]; then
         rm -f "$TMPFILES_FILE"
         echo -e "${GREEN}✓${NC} Removed: $TMPFILES_FILE"
@@ -235,13 +285,21 @@ print_summary() {
 main() {
     echo -e "${BLUE}Starting uninstallation...${NC}\n"
 
-    remove_service
-    remove_binary
-    remove_config
-    remove_job_containers
-    remove_workdir
-    remove_registry_ca
-    remove_user
+    if [ "$MACOS" -eq 1 ]; then
+        remove_launch_agent
+        remove_binary
+        remove_config
+        remove_workdir
+        [ -z "$SERVICE_USER" ] || echo -e "\n${BLUE}ℹ️  User $SERVICE_USER kept${NC}"
+    else
+        remove_service
+        remove_binary
+        remove_config
+        remove_job_containers
+        remove_workdir
+        remove_registry_ca
+        remove_user
+    fi
     print_summary
 }
 

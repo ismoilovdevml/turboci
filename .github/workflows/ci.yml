@@ -60,22 +60,43 @@ jobs:
           tool: cargo-audit
       - run: cargo audit
 
-  build-musl:
-    name: Build (x86_64-unknown-linux-musl)
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-musl
+          shared-key: release-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: |
+      - if: runner.os == 'Linux'
+        run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      - run: cargo build --locked --release --all-features --target x86_64-unknown-linux-musl
+      - run: cargo build --locked --release --all-features --target ${{ matrix.target }}
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The shell executor runs on macOS hosts; Docker tests stay on Linux
+      - run: cargo test --locked --all-features
 
   docker-integration:
     name: Docker executor integration

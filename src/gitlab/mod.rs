@@ -626,13 +626,21 @@ impl RunnerFeatures {
     }
 }
 
+/// Operating system in Go's naming, as gitlab-runner reports it (darwin, not macos)
+pub fn go_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
 impl RunnerInfo {
     fn new(executor: &str) -> Self {
         Self {
             name: "turboci-runner".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             revision: Some(env!("CARGO_PKG_VERSION").to_string()),
-            platform: std::env::consts::OS.to_string(),
+            platform: go_os().to_string(),
             architecture: std::env::consts::ARCH.to_string(),
             executor: executor.to_string(),
             features: Some(RunnerFeatures::for_executor(executor)),

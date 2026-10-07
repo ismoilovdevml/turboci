@@ -5,7 +5,7 @@ like [gitlab-runner](https://gitlab.com/gitlab-org/gitlab-runner) does, so it
 runs your existing `.gitlab-ci.yml` jobs unchanged. It runs each job in a Docker
 container (default) or directly on the host (shell executor).
 
-It is one static binary (Linux x86_64, musl) with no external services: no
+It is one binary (Linux x86_64 and aarch64, macOS on Apple Silicon) with no external services: no
 Redis, no database, no helper daemon.
 
 <div class="grid cards" markdown>

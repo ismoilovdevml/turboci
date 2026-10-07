@@ -3,7 +3,8 @@ set -e
 
 # TurboCI Automated Installer
 # Installs: TurboCI (+ Docker for the docker executor) + Systemd Service
-# Supports: Ubuntu, Debian, RHEL, Rocky, AlmaLinux, Fedora
+# Supports: Ubuntu, Debian, RHEL, Rocky, AlmaLinux, Fedora (x86_64, aarch64)
+# and macOS on Apple Silicon (shell executor, launchd agent of --user)
 #
 # One command, registered and running:
 #   curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh \
@@ -63,7 +64,8 @@ Usage: install.sh [options]
                      default: turboci
   --user USER        Run the service as this existing user instead of a new
                      system user named after the runner (e.g. the user that
-                     owns the SDKs a shell runner needs)
+                     owns the SDKs a shell runner needs). On macOS the runner
+                     always runs as an existing user: default the sudo caller
   -h, --help         Show this help
 
 Environment: TURBOCI_URL, TURBOCI_TOKEN, TURBOCI_EXECUTOR, TURBOCI_CONCURRENT,
@@ -143,11 +145,48 @@ SERVICE_NAME="$INSTANCE"
 STATE_DIR="/var/lib/$INSTANCE"
 CONFIG_FILE="$CONFIG_DIR/$INSTANCE-runner.toml"
 TMPFILES_FILE="/etc/tmpfiles.d/$INSTANCE.conf"
+ROOT_GROUP="root"
+# The config holds the runner token: owner, group and mode
+CONFIG_OWNER="root"
+CONFIG_MODE="0640"
 # Without --user the runner gets a system user of its own, named after it
 CREATE_USER=0
-if [ -z "$SERVICE_USER" ]; then
-    SERVICE_USER="$INSTANCE"
-    CREATE_USER=1
+if [ "$(uname -s)" = "Darwin" ]; then
+    MACOS=1
+    # Xcode, simulators and the login keychain need the user's login session:
+    # the runner is a launchd agent of an existing user, like gitlab-runner
+    if [ "$EXECUTOR" != "shell" ]; then
+        echo "macOS runners use the shell executor: add --executor shell" >&2
+        exit 1
+    fi
+    if [ ${#INSECURE_REGISTRIES[@]} -gt 0 ] || [ ${#REGISTRY_CAS[@]} -gt 0 ]; then
+        echo "--insecure-registry and --registry-ca are for the docker executor (Linux only)" >&2
+        exit 1
+    fi
+    SERVICE_USER="${SERVICE_USER:-$SUDO_USER}"
+    if [ -z "$SERVICE_USER" ] || [ "$SERVICE_USER" = "root" ]; then
+        echo "On macOS run the installer with sudo as the user the runner runs as, or pass --user USER" >&2
+        exit 1
+    fi
+    if ! id -u "$SERVICE_USER" > /dev/null 2>&1; then
+        echo "--user: user $SERVICE_USER does not exist" >&2
+        exit 1
+    fi
+    USER_HOME=$(dscl . -read "/Users/$SERVICE_USER" NFSHomeDirectory | awk '{ print $2 }')
+    STATE_DIR="$USER_HOME/Library/TurboCI/$INSTANCE"
+    LAUNCHD_LABEL="io.github.ismoilovdevml.$INSTANCE"
+    PLIST_FILE="$USER_HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+    LOG_FILE="$STATE_DIR/runner.log"
+    ROOT_GROUP="wheel"
+    # The primary group (staff) holds every local user: owner-only access
+    CONFIG_OWNER="$SERVICE_USER"
+    CONFIG_MODE="0600"
+else
+    MACOS=0
+    if [ -z "$SERVICE_USER" ]; then
+        SERVICE_USER="$INSTANCE"
+        CREATE_USER=1
+    fi
 fi
 
 # Colors
@@ -179,6 +218,10 @@ echo -e "${NC}"
 detect_os() {
     echo -e "${YELLOW}🔍 Detecting OS...${NC}"
 
+    if [ "$MACOS" -eq 1 ]; then
+        echo -e "${GREEN}✓${NC} OS: ${BLUE}macOS $(sw_vers -productVersion)${NC}"
+        return
+    fi
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS_ID=$ID
@@ -213,15 +256,27 @@ detect_os() {
 # Detect architecture
 detect_arch() {
     ARCH=$(uname -m)
+    # A shell under Rosetta reports x86_64 on Apple Silicon
+    if [ "$MACOS" -eq 1 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+        ARCH="arm64"
+    fi
 
-    case "$ARCH" in
-        x86_64|amd64)
+    case "$MACOS-$ARCH" in
+        0-x86_64|0-amd64)
             TARGET="x86_64-unknown-linux-musl"
             DISPLAY_ARCH="x86_64"
             ;;
+        0-aarch64|0-arm64)
+            TARGET="aarch64-unknown-linux-musl"
+            DISPLAY_ARCH="aarch64"
+            ;;
+        1-arm64)
+            TARGET="aarch64-apple-darwin"
+            DISPLAY_ARCH="arm64 (Apple Silicon)"
+            ;;
         *)
             echo -e "${RED}❌ Unsupported architecture: $ARCH${NC}"
-            echo -e "${YELLOW}Supported: x86_64${NC}"
+            echo -e "${YELLOW}Supported: Linux x86_64 and aarch64, macOS on Apple Silicon${NC}"
             exit 1
             ;;
     esac
@@ -309,6 +364,8 @@ get_latest_version() {
 
 # Download and install TurboCI
 install_turboci() {
+    # A fresh macOS has no /usr/local/bin
+    install -d -m 0755 "$INSTALL_DIR"
     if [ -n "$LOCAL_BINARY" ]; then
         echo -e "\n${YELLOW}📦 Installing $LOCAL_BINARY...${NC}"
         install -m 0755 "$LOCAL_BINARY" "$INSTALL_DIR/$BIN_NAME"
@@ -335,7 +392,12 @@ install_turboci() {
         exit 1
     fi
     EXPECTED=$(awk -v asset="$ASSET" '$2 == asset || $2 == "*" asset { print $1 }' "$SUMS_FILE")
-    ACTUAL=$(sha256sum "$TEMP_FILE" | awk '{ print $1 }')
+    # macOS has shasum, not sha256sum
+    if command -v sha256sum > /dev/null 2>&1; then
+        ACTUAL=$(sha256sum "$TEMP_FILE" | awk '{ print $1 }')
+    else
+        ACTUAL=$(shasum -a 256 "$TEMP_FILE" | awk '{ print $1 }')
+    fi
     if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
         echo -e "${RED}❌ Checksum mismatch for $ASSET (expected '${EXPECTED:-none}', got '$ACTUAL')${NC}"
         exit 1
@@ -420,6 +482,10 @@ create_service_user() {
 create_directories() {
     echo -e "\n${YELLOW}📁 Creating directories...${NC}"
 
+    if [ "$MACOS" -eq 1 ]; then
+        # install -d would create the parent ~/Library/TurboCI owned by root
+        install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$(dirname "$STATE_DIR")"
+    fi
     install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR" "$STATE_DIR/builds"
     echo -e "${GREEN}✓${NC} State directory: ${BLUE}$STATE_DIR${NC}"
 
@@ -477,11 +543,11 @@ create_config() {
     fi
 
     # Create the file with restrictive permissions before writing the token field
-    install -m 0640 -o root -g "$SERVICE_GROUP" /dev/null "$CONFIG_FILE"
+    install -m "$CONFIG_MODE" -o "$CONFIG_OWNER" -g "$SERVICE_GROUP" /dev/null "$CONFIG_FILE"
 
     TLS_CA_LINE=""
     if [ -n "$TLS_CA_FILE" ]; then
-        install -m 0644 -o root -g root "$TLS_CA_FILE" /etc/turboci-ca.pem
+        install -m 0644 -o root -g "$ROOT_GROUP" "$TLS_CA_FILE" /etc/turboci-ca.pem
         TLS_CA_LINE='tls_ca_file = "/etc/turboci-ca.pem"'
         echo -e "${GREEN}✓${NC} CA certificate: ${BLUE}/etc/turboci-ca.pem${NC}"
     fi
@@ -554,9 +620,9 @@ EOF
 
 # The config holds the runner token: readable by the service group only
 secure_config() {
-    chown "root:$SERVICE_GROUP" "$CONFIG_FILE"
-    chmod 0640 "$CONFIG_FILE"
-    echo -e "${GREEN}✓${NC} Config permissions: root:$SERVICE_GROUP 0640"
+    chown "$CONFIG_OWNER:$SERVICE_GROUP" "$CONFIG_FILE"
+    chmod "$CONFIG_MODE" "$CONFIG_FILE"
+    echo -e "${GREEN}✓${NC} Config permissions: $CONFIG_OWNER:$SERVICE_GROUP $CONFIG_MODE"
 }
 
 # Create systemd service
@@ -673,6 +739,169 @@ enable_service() {
     echo -e "${GREEN}✓${NC} Service running and polling ${BLUE}$GITLAB_URL${NC} for jobs"
 }
 
+# Create the launchd agent (macOS): it runs in the user's login session, so
+# jobs reach the login keychain, Xcode and simulators. PATH and LANG reach
+# the jobs too: Homebrew tools and UTF-8 for CocoaPods and fastlane.
+create_launch_agent() {
+    echo -e "\n${YELLOW}🔧 Creating launchd agent...${NC}"
+
+    install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0755 "$(dirname "$PLIST_FILE")"
+    [ -f "$LOG_FILE" ] || install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /dev/null "$LOG_FILE"
+    install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /dev/null "$PLIST_FILE"
+    cat > "$PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LAUNCHD_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$INSTALL_DIR/$BIN_NAME</string>
+        <string>runner-start</string>
+        <string>-c</string>
+        <string>$CONFIG_FILE</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$STATE_DIR</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <!-- SIGTERM stops running jobs and reports them; give that time before SIGKILL -->
+    <key>ExitTimeOut</key>
+    <integer>180</integer>
+    <!-- Not throttled like a background agent -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>$LOG_FILE</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_FILE</string>
+</dict>
+</plist>
+EOF
+    plutil -lint "$PLIST_FILE" > /dev/null
+    echo -e "${GREEN}✓${NC} Agent created: ${BLUE}$PLIST_FILE${NC}"
+}
+
+launch_agent_running() {
+    launchctl print "$LAUNCHD_TARGET" 2>/dev/null | grep -q "state = running"
+}
+
+# Load the agent into the user's login session; start it when a token was given
+enable_launch_agent() {
+    echo -e "\n${YELLOW}🎬 Loading launchd agent...${NC}"
+    LAUNCHD_DOMAIN="gui/$(id -u "$SERVICE_USER")"
+    LAUNCHD_TARGET="$LAUNCHD_DOMAIN/$LAUNCHD_LABEL"
+    echo -e "${GREEN}✓${NC} Agent enabled (starts when $SERVICE_USER logs in)"
+
+    if [ -z "$RUNNER_TOKEN" ] || [ "$START_SERVICE" -eq 0 ]; then
+        STARTED=0
+        if [ "$START_SERVICE" -eq 1 ] && launch_agent_running; then
+            # Upgrade of a configured runner. SIGQUIT lets running jobs finish
+            # (no new ones are taken); launchd then starts the new binary
+            # (KeepAlive). Reloading the agent would fail running jobs.
+            launchctl kill SIGQUIT "$LAUNCHD_TARGET"
+            DRAINING=1
+            echo -e "${GREEN}✓${NC} Agent draining: running jobs finish, then it restarts with the new binary"
+            echo -e "   Follow it with: ${BLUE}tail -f $LOG_FILE${NC}"
+        else
+            echo -e "${YELLOW}ℹ️  Agent NOT started${NC}"
+        fi
+        return
+    fi
+
+    if ! launchctl print "$LAUNCHD_DOMAIN" > /dev/null 2>&1; then
+        echo -e "${RED}❌ $SERVICE_USER has no login session: the runner runs in it (keychain, Xcode)${NC}"
+        echo -e "${YELLOW}   Log in as $SERVICE_USER (enable automatic login on a CI Mac) and run the installer again${NC}"
+        exit 1
+    fi
+
+    LOG_OFFSET=$(stat -f %z "$LOG_FILE")
+    # bootout stops a running agent (SIGTERM) and returns once it is gone; a
+    # bootstrap right after it can still fail while launchd finishes up
+    launchctl bootout "$LAUNCHD_TARGET" 2> /dev/null || true
+    for attempt in $(seq 1 10); do
+        launchctl bootstrap "$LAUNCHD_DOMAIN" "$PLIST_FILE" 2> /dev/null && break
+        if [ "$attempt" -eq 10 ]; then
+            echo -e "${RED}❌ launchctl bootstrap $LAUNCHD_DOMAIN $PLIST_FILE failed${NC}"
+            exit 1
+        fi
+        sleep 1
+    done
+
+    # Wait until the runner reports its first successful request to GitLab
+    for _ in $(seq 1 20); do
+        sleep 1
+        LOG=$(tail -c +$((LOG_OFFSET + 1)) "$LOG_FILE" 2>/dev/null)
+        if echo "$LOG" | grep -q "Connected to GitLab"; then
+            break
+        fi
+        if echo "$LOG" | grep -q "Invalid runner token"; then
+            echo -e "${RED}❌ GitLab rejected the runner token (check --url and --token)${NC}"
+            exit 1
+        fi
+        if ! launch_agent_running; then
+            echo -e "${RED}❌ Agent failed to start:${NC}"
+            echo "$LOG" | tail -20
+            exit 1
+        fi
+    done
+    if ! echo "$LOG" | grep -q "Connected to GitLab"; then
+        echo -e "${RED}❌ The runner could not reach $GITLAB_URL:${NC}"
+        echo "$LOG" | grep -E "WARN|ERROR" | tail -5
+        exit 1
+    fi
+    STARTED=1
+    echo -e "${GREEN}✓${NC} Agent running and polling ${BLUE}$GITLAB_URL${NC} for jobs"
+}
+
+# Print next steps (macOS)
+print_next_steps_macos() {
+    echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}✨ Installation Complete!${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    TARGET_HINT="gui/$(id -u "$SERVICE_USER")/$LAUNCHD_LABEL"
+    if [ "$STARTED" -eq 1 ]; then
+        echo -e "\n${GREEN}🚀 TurboCI is running as $SERVICE_USER.${NC} Jobs for this runner will start automatically."
+        echo -e "   Logs: ${BLUE}tail -f $LOG_FILE${NC}\n"
+        return
+    fi
+    if [ "$DRAINING" -eq 1 ]; then
+        echo -e "\n${GREEN}🔄 TurboCI upgraded.${NC} Running jobs finish, then the agent restarts on the new binary with the kept config."
+        echo -e "   Logs: ${BLUE}tail -f $LOG_FILE${NC}\n"
+        return
+    fi
+
+    echo -e "\n${BLUE}📋 Next Steps:${NC}"
+    echo -e "\n${YELLOW}1. Set the runner token (glrt-...) in:${NC}"
+    echo -e "   ${BLUE}$CONFIG_FILE${NC}"
+    echo -e "\n${YELLOW}2. Start TurboCI (as $SERVICE_USER, logged in):${NC}"
+    echo -e "   ${BLUE}sudo launchctl bootstrap gui/$(id -u "$SERVICE_USER") $PLIST_FILE${NC}"
+    echo -e "\n${YELLOW}3. Check it:${NC}"
+    echo -e "   ${BLUE}launchctl print $TARGET_HINT | grep state${NC}"
+    echo -e "   ${BLUE}tail -f $LOG_FILE${NC}"
+
+    echo -e "\n${BLUE}🔧 Management Commands:${NC}"
+    echo -e "   ${BLUE}sudo launchctl kickstart -k $TARGET_HINT${NC}  # Restart"
+    echo -e "   ${BLUE}sudo launchctl bootout $TARGET_HINT${NC}       # Stop"
+
+    echo -e "\n${BLUE}🗑️  Uninstall:${NC}"
+    echo -e "   ${BLUE}curl -sSL https://raw.githubusercontent.com/$REPO/main/uninstall.sh | sudo bash${NC}"
+    echo ""
+}
+
 # Print next steps
 print_next_steps() {
     echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -744,9 +973,15 @@ main() {
     create_service_user
     create_directories
     create_config
-    create_service
-    enable_service
-    print_next_steps
+    if [ "$MACOS" -eq 1 ]; then
+        create_launch_agent
+        enable_launch_agent
+        print_next_steps_macos
+    else
+        create_service
+        enable_service
+        print_next_steps
+    fi
 }
 
 main "$@"

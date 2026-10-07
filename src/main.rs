@@ -308,6 +308,17 @@ fn spawn_signal_handler(shutdown: runner_daemon::ShutdownHandle) -> Result<()> {
 
 const RELEASES_API: &str = "https://api.github.com/repos/ismoilovdevml/turboci/releases/latest";
 
+/// The release binary built for this platform
+const RELEASE_ASSET: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    Some("turboci-x86_64-unknown-linux-musl")
+} else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    Some("turboci-aarch64-unknown-linux-musl")
+} else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    Some("turboci-aarch64-apple-darwin")
+} else {
+    None
+};
+
 /// Replace this binary with the latest release, after checking it against the
 /// release's SHA256SUMS and making sure it runs
 async fn upgrade() -> Result<()> {
@@ -336,10 +347,8 @@ async fn upgrade() -> Result<()> {
         return Ok(());
     }
 
-    if !(cfg!(target_arch = "x86_64") && cfg!(target_os = "linux")) {
-        anyhow::bail!("Unsupported platform for auto-upgrade");
-    }
-    let asset = "turboci-x86_64-unknown-linux-musl";
+    let asset =
+        RELEASE_ASSET.ok_or_else(|| anyhow::anyhow!("Unsupported platform for auto-upgrade"))?;
     let base = format!(
         "https://github.com/ismoilovdevml/turboci/releases/download/{}",
         tag
@@ -442,5 +451,12 @@ mod upgrade_tests {
         assert!(
             verify_checksum(b"<html>404</html>", "", "turboci-x86_64-unknown-linux-musl").is_err()
         );
+    }
+
+    // CI tests on every platform a release is built for
+    #[test]
+    fn this_platform_has_a_release_asset() {
+        let asset = super::RELEASE_ASSET.unwrap();
+        assert!(asset.contains(std::env::consts::ARCH), "{}", asset);
     }
 }

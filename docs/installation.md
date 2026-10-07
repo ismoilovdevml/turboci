@@ -1,7 +1,9 @@
 # Installation
 
-TurboCI runs on Linux x86_64. The installer supports Ubuntu, Debian, RHEL,
-Rocky Linux, AlmaLinux and Fedora with systemd.
+TurboCI runs on Linux (x86_64 and aarch64) and on macOS with Apple Silicon.
+On Linux the installer supports Ubuntu, Debian, RHEL, Rocky Linux, AlmaLinux
+and Fedora with systemd. On macOS it installs a shell runner as a launchd
+agent: see [macOS](#macos).
 
 ## One command
 
@@ -105,6 +107,42 @@ Each runner has its own system ID, so neither removes the other's containers.
 Remove one with `uninstall.sh --name NAME`; a user given with `--user` is
 never deleted.
 
+### macOS
+
+A Mac runs the shell executor, for builds that need Xcode, simulators or the
+login keychain. Like gitlab-runner, the runner is a launchd agent of an
+existing user and runs in that user's login session, so the user must be
+logged in: on a CI Mac, turn on automatic login. Run the installer with
+`sudo` as that user (or pass `--user`):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh \
+  | sudo bash -s -- --url https://gitlab.example.com --token glrt-XXXX --executor shell
+```
+
+It runs next to an existing gitlab-runner: give each its own token and tag.
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/turboci` | The binary |
+| `/etc/turboci-runner.toml` | Configuration (owned by the user, mode `0600`) |
+| `~/Library/LaunchAgents/io.github.ismoilovdevml.turboci.plist` | The launchd agent |
+| `~/Library/TurboCI/turboci` | State: builds, local cache, `runner.log` |
+
+Jobs get `PATH` with Homebrew (`/opt/homebrew/bin`) and `LANG=en_US.UTF-8`
+from the agent. Scripts run in `bash -c`, not a login shell: what
+`~/.zprofile` or `~/.bash_profile` sets up (rbenv, nvm, `ANDROID_HOME`) is not
+loaded. Put such variables in `environment` in the config, or source the
+profile in `before_script`.
+
+```bash
+tail -f ~/Library/TurboCI/turboci/runner.log                              # logs
+sudo launchctl kickstart -k gui/$(id -u)/io.github.ismoilovdevml.turboci  # restart
+```
+
+`--name` installs more runners for the same or another user. The docker
+executor and the registry options are Linux only.
+
 ## What gets installed
 
 | Path | Purpose |
@@ -122,6 +160,7 @@ never deleted.
 VERSION=$(curl -s https://api.github.com/repos/ismoilovdevml/turboci/releases/latest \
   | grep tag_name | cut -d'"' -f4)
 BASE="https://github.com/ismoilovdevml/turboci/releases/download/${VERSION}"
+# or turboci-aarch64-unknown-linux-musl, turboci-aarch64-apple-darwin
 curl -fLO "$BASE/turboci-x86_64-unknown-linux-musl"
 curl -fLO "$BASE/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
@@ -156,5 +195,6 @@ state directory, and the containers, networks and cache volumes the runner
 created. The service user is removed only if the installer created it. The
 binary, the shared workspace directory and `/etc/turboci-registry-ca` stay
 while other TurboCI runners are installed. Registry CAs installed for dockerd
-in `/etc/docker/certs.d` are never removed. Delete the runner in GitLab
-afterwards.
+in `/etc/docker/certs.d` are never removed. On macOS it removes the launchd
+agent, the binary (unless other runners use it), the config and the state
+directory; the user stays. Delete the runner in GitLab afterwards.
