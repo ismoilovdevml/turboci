@@ -121,6 +121,9 @@ curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.s
 ```
 
 It runs next to an existing gitlab-runner: give each its own token and tag.
+macOS then notifies that "turboci" can run in the background and lists it in
+**System Settings → General → Login Items & Extensions**; switching it off
+there keeps the runner from starting.
 
 | Path | Purpose |
 |---|---|
