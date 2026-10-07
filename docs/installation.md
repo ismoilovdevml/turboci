@@ -181,7 +181,7 @@ For a service, see the unit the installer writes in
 ```bash
 git clone https://github.com/ismoilovdevml/turboci.git
 cd turboci
-cargo build --release --features runner
+cargo build --release
 sudo install -m 0755 target/release/turboci /usr/local/bin/
 ```
 

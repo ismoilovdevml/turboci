@@ -933,7 +933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn minio_shares_the_cache_between_hosts() {
         // minio/minio is no longer published; pgsty/minio is a maintained
         // community fork, pinned to a release and its multi-arch index digest

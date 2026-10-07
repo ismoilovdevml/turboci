@@ -89,9 +89,9 @@ You need a stable Rust toolchain; the Docker tests also need a Docker daemon.
 ```bash
 git clone https://github.com/ismoilovdevml/turboci
 cd turboci
-cargo build --release --features runner
-cargo test --all-features                  # unit tests
-cargo test --all-features -- --ignored     # Docker and MinIO integration tests
+cargo build --release
+cargo test                   # unit tests
+cargo test -- --ignored      # Docker and MinIO integration tests
 ```
 
 | Directory | |

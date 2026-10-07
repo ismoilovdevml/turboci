@@ -1158,7 +1158,7 @@ mod tests {
     use crate::security::secret_scrubber::SecretScrubber;
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_executor_runs_job_and_cleans_up() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -1224,7 +1224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_executor_runs_services_with_limits() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -1286,7 +1286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_runner_services_shm_and_persistent_volumes() {
         use crate::runner_daemon::config::ServiceConfig;
 
@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_executor_checks_out_sources_without_git_in_job_image() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -1449,7 +1449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_next_job_fetches_into_the_workspace_root_files_included() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -1538,7 +1538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_job_replacing_sh_cannot_hang_cleanup() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -1573,7 +1573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_uses_bash_and_expands_image_variables() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -1607,7 +1607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_services_wait_get_their_variables_and_volumes_but_no_secrets() {
         let shared = tempfile::tempdir().unwrap();
         let executor = ExecutorType::Docker(
@@ -1653,7 +1653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_sweep_removes_only_own_leftovers() {
         let owner = format!("sweep-test-{}", std::process::id());
         let mine = DockerExecutor::new(DockerConfig::default())
@@ -1715,7 +1715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_timeout_stops_the_script_before_after_script() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -1776,7 +1776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_dind_pushes_to_an_insecure_registry() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -1806,7 +1806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_dind_trusts_a_registry_ca() {
         // A certificate for host "registry", which is also its own CA
         let certs = tempfile::tempdir().unwrap();
@@ -1881,7 +1881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_lists_untracked_files_with_the_helper() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {

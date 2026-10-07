@@ -2,28 +2,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
-mod cache;
-mod config;
-mod net;
-mod optimizer;
-mod runner;
-
-// Runner modules (optional, for future)
-#[cfg(feature = "runner")]
 mod gitlab;
-#[cfg(feature = "runner")]
+mod net;
 mod runner_daemon;
-#[cfg(feature = "runner")]
 mod security;
-
-use cache::CacheManager;
-use config::Config;
-use optimizer::BuildOptimizer;
-use runner::ParallelRunner;
 
 #[derive(Parser)]
 #[command(name = "turboci")]
-#[command(about = "⚡ Super fast CI/CD runner with distributed caching", long_about = None)]
+#[command(about = "⚡ GitLab CI/CD runner: runs GitLab jobs in Docker containers or on the host", long_about = None)]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
@@ -32,39 +18,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run CI/CD pipeline
-    Run {
-        #[arg(short, long, default_value = "turboci.yml")]
-        config: String,
-    },
-    /// Initialize cache system
-    InitCache {
-        #[arg(short, long)]
-        redis_url: Option<String>,
-    },
-    /// Clear build cache
-    ClearCache,
-    /// Show cache statistics
-    CacheStats,
-    /// Start GitLab runner daemon (requires --features runner)
-    #[cfg(feature = "runner")]
+    /// Start the runner: take jobs from GitLab and run them
     RunnerStart {
         #[arg(short, long, default_value = "runner-config.toml")]
         config: String,
     },
-    /// Show content hash for directory
-    Hash {
-        #[arg(short, long, default_value = ".")]
-        path: String,
-    },
-    /// Create example runner configuration file
-    #[cfg(feature = "runner")]
+    /// Create an example runner configuration file
     InitRunner {
         #[arg(short, long, default_value = "runner-config.toml")]
         output: String,
     },
-    /// Show runner statistics (requires runner daemon)
-    #[cfg(feature = "runner")]
+    /// Check a runner configuration and show local cache usage
     RunnerStats {
         #[arg(short, long, default_value = "runner-config.toml")]
         config: String,
@@ -80,42 +44,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { config } => {
-            info!("🚀 Starting TurboCI pipeline...");
-            let cfg = Config::load(&config)?;
-            let cache = CacheManager::new().await?;
-            let optimizer = BuildOptimizer::new(cache.clone());
-            let runner = ParallelRunner::new(optimizer);
-
-            runner.execute(cfg).await?;
-            info!("✅ Pipeline completed successfully!");
-        }
-        Commands::InitCache { redis_url } => {
-            info!("Initializing cache system...");
-            let url = redis_url.unwrap_or_else(|| "redis://127.0.0.1:6379".to_string());
-            CacheManager::init(&url).await?;
-            info!("✅ Cache initialized");
-        }
-        Commands::ClearCache => {
-            info!("Clearing build cache...");
-            let cache = CacheManager::new().await?;
-            cache.clear().await?;
-            info!("✅ Cache cleared");
-        }
-        Commands::CacheStats => {
-            let cache = CacheManager::new().await?;
-
-            // Test cache functionality
-            if cache.exists("test_key").await? {
-                info!("Found test cache entry");
-                if let Some(data) = cache.get("test_key").await? {
-                    info!("Retrieved {} bytes from cache", data.len());
-                }
-            }
-
-            cache.print_stats().await?;
-        }
-        #[cfg(feature = "runner")]
         Commands::RunnerStart { config } => {
             use gitlab::GitLabClient;
             use runner_daemon::executor::{DockerExecutor, ExecutorType, ShellExecutor};
@@ -212,40 +140,6 @@ async fn main() -> Result<()> {
             spawn_signal_handler(daemon.shutdown_handle())?;
             daemon.start().await?;
         }
-        Commands::Hash { path } => {
-            use cache::content_hash::ContentHasher;
-            use std::path::Path;
-
-            info!("🔍 Computing content hash for: {}", path);
-            let hasher = ContentHasher::new();
-            let hash = hasher.hash_directory(Path::new(&path))?;
-
-            // Also compute dependency hash
-            if let Ok(dep_hash) = hasher.hash_dependencies(Path::new(&path)) {
-                println!("\n🔗 Dependency Hash: {}", dep_hash);
-            }
-
-            println!("\n📊 Content Hash Results:");
-            println!("  Overall Hash: {}", hash.hash);
-            println!("  Total Files: {}", hash.file_hashes.len());
-            println!("\n📁 File Hashes:");
-            for (file, file_hash) in hash.file_hashes.iter().take(10) {
-                println!("  {} -> {}", file, &file_hash[..16]);
-            }
-            if hash.file_hashes.len() > 10 {
-                println!("  ... and {} more files", hash.file_hashes.len() - 10);
-            }
-
-            // Show filtered results
-            let rs_files = hash.filter_files("*.rs");
-            if !rs_files.is_empty() {
-                println!("\n🦀 Rust Files ({}):", rs_files.len());
-                for (file, _) in rs_files.iter().take(5) {
-                    println!("  {}", file);
-                }
-            }
-        }
-        #[cfg(feature = "runner")]
         Commands::InitRunner { output } => {
             use runner_daemon::config::RunnerConfig;
 
@@ -257,7 +151,6 @@ async fn main() -> Result<()> {
             println!("  2. Make sure Docker is installed (default executor)");
             println!("  3. Run: turboci runner-start -c {}", output);
         }
-        #[cfg(feature = "runner")]
         Commands::RunnerStats { config } => {
             let runner_config = runner_daemon::config::RunnerConfig::load(&config)?;
             let cache = runner_daemon::job_cache::LocalCache::new(&runner_config.cache_dir);
@@ -276,7 +169,6 @@ async fn main() -> Result<()> {
 
 /// SIGQUIT: finish running jobs, then exit. SIGTERM/SIGINT: stop running jobs,
 /// report them failed and exit (the same signals gitlab-runner uses)
-#[cfg(feature = "runner")]
 fn spawn_signal_handler(shutdown: runner_daemon::ShutdownHandle) -> Result<()> {
     use runner_daemon::Shutdown;
     use tokio::signal::unix::{signal, SignalKind};

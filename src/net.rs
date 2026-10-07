@@ -53,8 +53,6 @@ pub fn client_builder() -> reqwest::ClientBuilder {
 }
 
 /// Proxy and CA settings shared by every HTTP client of the runner
-// Only the runner (feature `runner`) builds clients from it
-#[cfg_attr(not(feature = "runner"), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct Network {
     /// Proxy for HTTP and HTTPS; without it reqwest reads HTTP(S)_PROXY/NO_PROXY
@@ -65,7 +63,6 @@ pub struct Network {
     pub ca_pem: Option<String>,
 }
 
-#[cfg_attr(not(feature = "runner"), allow(dead_code))]
 impl Network {
     /// A client builder with the IPv4-first resolver, the proxy and the CA
     pub fn client_builder(&self) -> anyhow::Result<reqwest::ClientBuilder> {
@@ -99,8 +96,6 @@ impl Network {
 
 /// NO_PROXY for jobs: the configured entries, loopback, and `extra` (the job's
 /// service aliases, which only exist on the job's network), without repeats
-// Only the runner (feature `runner`) passes it to jobs
-#[cfg_attr(not(feature = "runner"), allow(dead_code))]
 pub fn effective_no_proxy(configured: Option<&str>, extra: &[String]) -> String {
     let mut entries: Vec<String> = Vec::new();
     let given = configured.unwrap_or("").split(',').map(str::trim);
