@@ -98,6 +98,25 @@ jobs:
       # The shell executor runs on macOS hosts; Docker tests stay on Linux
       - run: cargo test --locked --all-features
 
+  installer:
+    name: Installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: installer-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --locked --release --all-features
+      # install.sh and uninstall.sh on the host, as the runner's user: GitHub's
+      # runners have passwordless sudo
+      - run: sudo bash e2e/installer-smoke.sh target/release/turboci
+
   docker-integration:
     name: Docker executor integration
     runs-on: ubuntu-latest

@@ -30,7 +30,8 @@ STATE_DIR="/var/lib/$INSTANCE"
 # install.sh --registry-ca copies; shared by every runner on the host
 REGISTRY_CA_DIR="/etc/turboci-registry-ca"
 # The user the service ran as; it is only removed if install.sh created it
-SERVICE_USER=$(sed -n 's/^User=//p' "$SERVICE_FILE" 2>/dev/null)
+# (no unit on macOS, or one already removed: set -e must not stop here)
+SERVICE_USER=$(sed -n 's/^User=//p' "$SERVICE_FILE" 2>/dev/null || true)
 SERVICE_USER="${SERVICE_USER:-$INSTANCE}"
 ROOT_GROUP="root"
 MACOS=0
