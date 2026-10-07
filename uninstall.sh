@@ -268,13 +268,20 @@ print_summary() {
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
     echo -e "\n${BLUE}📋 Removed:${NC}"
-    echo -e "   ✓ TurboCI service"
-    echo -e "   ✓ TurboCI binary"
-    echo -e "   ✓ Configuration (root-only backup kept)"
-    echo -e "   ✓ Work directories, local cache and leftover job containers"
-    echo -e "   ✓ TurboCI's copy of registry CAs, if no other runner uses it"
-    echo -e "   ✓ Service user, if the installer created it"
-    echo -e "\n${BLUE}ℹ️  Docker was left installed.${NC}"
+    if [ "$MACOS" -eq 1 ]; then
+        echo -e "   ✓ TurboCI launchd agent"
+        echo -e "   ✓ TurboCI binary, if no other runner uses it"
+        echo -e "   ✓ Configuration (root-only backup kept)"
+        echo -e "   ✓ State directory: builds, local cache and logs"
+    else
+        echo -e "   ✓ TurboCI service"
+        echo -e "   ✓ TurboCI binary"
+        echo -e "   ✓ Configuration (root-only backup kept)"
+        echo -e "   ✓ Work directories, local cache and leftover job containers"
+        echo -e "   ✓ TurboCI's copy of registry CAs, if no other runner uses it"
+        echo -e "   ✓ Service user, if the installer created it"
+        echo -e "\n${BLUE}ℹ️  Docker was left installed.${NC}"
+    fi
 
     echo -e "\n${BLUE}📚 To reinstall:${NC}"
     echo -e "   ${BLUE}curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.sh | sudo bash${NC}"
