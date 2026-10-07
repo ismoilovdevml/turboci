@@ -555,13 +555,13 @@ mod tests {
 
     #[test]
     fn shipped_configs_load() {
-        let readme = toml_block_after(include_str!("../../README.md"), "Minimal configuration");
-        let config = RunnerConfig::parse(&readme).unwrap();
+        let docs = toml_block_after(include_str!("../../docs/configuration.md"), "## Example");
+        let config = RunnerConfig::parse(&docs).unwrap();
         config.validate().unwrap();
         assert!(
-            unknown_keys(&readme, &config).is_empty(),
+            unknown_keys(&docs, &config).is_empty(),
             "{:?}",
-            unknown_keys(&readme, &config)
+            unknown_keys(&docs, &config)
         );
 
         let example = include_str!("../../runner-config.example.toml");
