@@ -151,6 +151,8 @@ executor and the registry options are Linux only.
 | `/etc/turboci-runner.toml` | Configuration, including the runner token |
 | `/etc/systemd/system/turboci.service` | Service unit (hardened: `ProtectSystem=strict`, `NoNewPrivileges`, ...) |
 | `/var/lib/turboci` | State: local cache, job workspaces (`builds/`), rotated token |
+| `/tmp/turboci-builds` | Docker job workspaces of versions up to 0.9 |
+| `/etc/tmpfiles.d/turboci.conf` | Recreates `/tmp/turboci-builds` after a reboot (versions up to 0.9) |
 
 ## Manual installation
 

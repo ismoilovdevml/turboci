@@ -18,6 +18,8 @@ BIN_NAME="turboci"
 # beside a docker runner: its own service, config and state directory
 INSTANCE="${TURBOCI_NAME:-turboci}"
 SERVICE_USER="${TURBOCI_USER:-}"
+# The Docker executor currently uses this fixed host path for job workspaces.
+DOCKER_BUILDS_DIR="/tmp/turboci-builds"
 # Settings: command line options, or the TURBOCI_* environment variables
 EXECUTOR="${TURBOCI_EXECUTOR:-docker}"
 GITLAB_URL="${TURBOCI_URL:-https://gitlab.com}"
@@ -487,13 +489,28 @@ create_directories() {
     install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR" "$STATE_DIR/builds"
     echo -e "${GREEN}✓${NC} State directory: ${BLUE}$STATE_DIR${NC}"
 
-    # Workspaces are kept between jobs in $STATE_DIR/builds now. Earlier
-    # versions used /tmp/turboci-builds with a tmpfiles rule that aged out its
-    # files, which would break kept workspaces; drop the rule.
-    if [ -f "$TMPFILES_FILE" ]; then
-        rm -f "$TMPFILES_FILE"
-        echo -e "${GREEN}✓${NC} Removed the old workspace rule ${BLUE}$TMPFILES_FILE${NC}"
+    # The shell executor does not use the Docker workspace directory
+    [ "$EXECUTOR" = "docker" ] || return 0
+
+    # Job containers run as root, so files they create in the workspace can
+    # not always be removed by the service user. Let systemd-tmpfiles create
+    # the workspace root with the right owner and age out leftovers.
+    if [ -d /etc/tmpfiles.d ]; then
+        echo "d $DOCKER_BUILDS_DIR 0750 $SERVICE_USER $SERVICE_GROUP 1d" > "$TMPFILES_FILE"
+        if command -v systemd-tmpfiles > /dev/null 2>&1; then
+            systemd-tmpfiles --create "$TMPFILES_FILE" || true
+        fi
+        echo -e "${GREEN}✓${NC} tmpfiles rule: ${BLUE}$TMPFILES_FILE${NC}"
     fi
+
+    # Workspaces left behind by an earlier root-run install cannot be
+    # written or cleaned up by the unprivileged service user.
+    for dir in "$DOCKER_BUILDS_DIR" /tmp/turboci; do
+        if [ -e "$dir" ] && [ "$(stat -c %U "$dir" 2>/dev/null)" != "$SERVICE_USER" ]; then
+            echo -e "${YELLOW}⚠️  $dir exists and is not owned by $SERVICE_USER${NC}"
+            echo -e "${YELLOW}   Remove it before starting the service: rm -rf $dir${NC}"
+        fi
+    done
 }
 
 # Create TurboCI config
@@ -647,9 +664,9 @@ StandardError=journal
 
 # Security
 NoNewPrivileges=true
-# PrivateTmp stays off: dockerd resolves bind-mount paths in the host's /tmp,
-# so a private /tmp would hand a job container an empty directory if
-# executor.docker.builds_dir (default $STATE_DIR/builds) is set below /tmp.
+# PrivateTmp must stay off: the Docker executor bind-mounts job workspaces
+# from $DOCKER_BUILDS_DIR, and dockerd resolves that path in the host's /tmp.
+# A private /tmp would hand every job container an empty workspace.
 PrivateTmp=false
 $PROTECT
 ProtectKernelTunables=true
