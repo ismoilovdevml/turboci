@@ -38,11 +38,18 @@ pub fn step_script(lines: &[String]) -> String {
 pub fn argv_script(commands: &[Vec<String>]) -> String {
     let mut script = String::from(shell_prelude());
     for argv in commands {
-        let line: Vec<String> = argv.iter().map(|arg| quote(arg)).collect();
-        script.push_str(&line.join(" "));
+        script.push_str(&argv_line(argv));
         script.push('\n');
     }
     script
+}
+
+/// One argv command as a shell line, every argument quoted
+pub fn argv_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Environment of a job, plus the files backing `file`-type variables
@@ -197,8 +204,10 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
     }
     if let Some(pem) = &runner.ca_pem {
         let key = "CI_SERVER_TLS_CA_FILE";
-        env.files
-            .push((host_job_dir.join("project.tmp").join(key), pem.clone()));
+        env.files.push((
+            host_job_dir.join(format!("{}.tmp", subdir)).join(key),
+            pem.clone(),
+        ));
         let path = format!("{}/{}", tmp_dir, key);
         // git (sources, submodules, LFS) trusts the same CA
         env.set("GIT_SSL_CAINFO", path.clone());
@@ -231,8 +240,10 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
         };
         if var.file {
             env.files.retain(|(path, _)| !path.ends_with(&var.key));
-            env.files
-                .push((host_job_dir.join("project.tmp").join(&var.key), value));
+            env.files.push((
+                host_job_dir.join(format!("{}.tmp", subdir)).join(&var.key),
+                value,
+            ));
             env.set(&var.key, format!("{}/{}", tmp_dir, var.key));
         } else {
             env.set(&var.key, value);

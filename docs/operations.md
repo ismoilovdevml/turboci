@@ -30,8 +30,10 @@ sudo systemctl kill -s SIGQUIT turboci
 
 ## Cleanup
 
-Every job's containers, network and workspace are removed when it ends, also
-when it fails, times out or is canceled. Containers and networks carry the
+Every job's containers and network are removed when it ends, also when it
+fails, times out or is canceled. Its workspace is kept for the project's next
+job and deleted after `workspace_max_age_days` without a job (see
+[workspaces](configuration.md#workspaces)); file variables are always removed. Containers and networks carry the
 label `turboci.runner=<system id>`; on start the runner removes any it left
 behind (for example after a power loss). Containers of other runners on the
 same Docker daemon are never touched.
@@ -105,9 +107,10 @@ run untagged jobs if the job has none. Check the runner's tags and the
 
 **`Permission denied` on job workspaces after upgrading from an old version**
 
-Versions that ran as root left root-owned workspaces. Remove them once:
+Versions that ran as root left root-owned workspaces in `/tmp`. Current
+versions keep workspaces under the state directory and no longer use these;
+remove them once:
 
 ```bash
 sudo rm -rf /tmp/turboci-builds /tmp/turboci
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/turboci.conf
 ```

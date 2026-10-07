@@ -684,6 +684,10 @@ pub struct Job {
     pub hooks: Vec<serde_json::Value>,
     #[serde(default)]
     pub features: Option<serde_json::Value>,
+    /// Set by the runner, never by GitLab: the job's concurrency slot within
+    /// its project (`CI_CONCURRENT_PROJECT_ID`), which picks its workspace
+    #[serde(skip)]
+    pub project_slot: u32,
 }
 
 impl Job {

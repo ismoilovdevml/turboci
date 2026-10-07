@@ -4,13 +4,17 @@
 
 use anyhow::{bail, Result};
 
+use super::script;
 use crate::gitlab::{GitInfo, Variable};
 
 /// How sources are prepared, from `GIT_STRATEGY`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitStrategy {
-    /// Fresh workspace: init + fetch + checkout (`clone` and `fetch` behave the same here)
+    /// Update the checkout an earlier job left in the workspace, or clone when
+    /// there is none (the default)
     Fetch,
+    /// Always clone into an emptied project directory
+    Clone,
     /// Do not touch sources at all
     None,
     /// Leave an empty project directory
@@ -35,11 +39,16 @@ fn variable<'a>(variables: &'a [Variable], key: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
-pub fn strategy(variables: &[Variable]) -> GitStrategy {
+/// `GIT_STRATEGY`, else the project's setting (`allow_git_fetch`), as in
+/// gitlab-runner
+pub fn strategy(variables: &[Variable], allow_git_fetch: bool) -> GitStrategy {
     match variable(variables, "GIT_STRATEGY") {
         Some("none") => GitStrategy::None,
         Some("empty") => GitStrategy::Empty,
-        _ => GitStrategy::Fetch,
+        Some("clone") => GitStrategy::Clone,
+        Some("fetch") => GitStrategy::Fetch,
+        _ if allow_git_fetch => GitStrategy::Fetch,
+        _ => GitStrategy::Clone,
     }
 }
 
@@ -63,7 +72,8 @@ fn is_commit_sha(sha: &str) -> bool {
     matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Argv lists that check out `git_info.sha` into `dest`, run in order.
+/// Argv lists that check out `git_info.sha` into a new repository at `dest`,
+/// run in order.
 ///
 /// Values coming from the job payload are validated so none of them can be parsed
 /// as a git option (e.g. a refspec of `--upload-pack=...`).
@@ -71,6 +81,28 @@ pub fn checkout_commands(
     git_info: &GitInfo,
     variables: &[Variable],
     dest: &str,
+) -> Result<Vec<Vec<String>>> {
+    sync_commands(git_info, variables, dest, false)
+}
+
+/// Like `checkout_commands`, for `dest` holding the checkout of an earlier job
+/// of the same project. That job may have changed `.git`, so its config and
+/// hooks are replaced (a `core.fsmonitor` or hook would run commands during
+/// the checkout and the job's own git calls); untracked and ignored files are
+/// removed like gitlab-runner does (`GIT_CLEAN_FLAGS`, default `-ffdx`).
+pub fn update_commands(
+    git_info: &GitInfo,
+    variables: &[Variable],
+    dest: &str,
+) -> Result<Vec<Vec<String>>> {
+    sync_commands(git_info, variables, dest, true)
+}
+
+fn sync_commands(
+    git_info: &GitInfo,
+    variables: &[Variable],
+    dest: &str,
+    existing: bool,
 ) -> Result<Vec<Vec<String>>> {
     if !is_commit_sha(&git_info.sha) {
         bail!("Invalid commit SHA from GitLab: {:?}", git_info.sha);
@@ -117,14 +149,42 @@ pub fn checkout_commands(
         fetch.extend(git_info.refspecs.iter().cloned());
     }
 
-    let mut commands = vec![
+    let mut commands = Vec::new();
+    if existing {
+        let git_dir = format!("{}/.git", dest);
+        // Locks left by a job that was killed, and everything of the earlier
+        // job's repository that can run commands; `git init` writes a new config
+        let mut remove = vec!["rm".to_string(), "-f".to_string()];
+        for name in [
+            "index.lock",
+            "shallow.lock",
+            "HEAD.lock",
+            "config.lock",
+            "config",
+        ] {
+            remove.push(format!("{}/{}", git_dir, name));
+        }
+        commands.push(remove);
+        commands.push(vec![
+            "rm".to_string(),
+            "-rf".to_string(),
+            format!("{}/hooks", git_dir),
+        ]);
+    }
+    commands.extend([
         init,
         git(&["remote", "add", "origin", &git_info.repo_url]),
         fetch,
-    ];
+    ]);
     // GIT_CHECKOUT=false fetches without checking out, as in gitlab-runner
     if variable(variables, "GIT_CHECKOUT") != Some("false") {
         commands.push(git(&["checkout", "-q", "-f", &git_info.sha]));
+        let flags = variable(variables, "GIT_CLEAN_FLAGS").unwrap_or("-ffdx");
+        if existing && flags != "none" {
+            let mut clean = git(&["clean", "-q"]);
+            clean.extend(flags.split_whitespace().map(str::to_string));
+            commands.push(clean);
+        }
     }
 
     let recursive = match submodule_strategy(variables) {
@@ -174,6 +234,50 @@ pub fn checkout_commands(
     }
 
     Ok(commands)
+}
+
+/// The script that prepares the sources in `dest` for `GitStrategy::Fetch` or
+/// `Clone`. Fetch updates a checkout an earlier job left there and clones
+/// again when there is none or updating it fails (a killed job may leave a
+/// broken repository). Repositories with submodules are always cloned: their
+/// `.git/modules` hold repositories with configs and hooks of their own.
+pub fn checkout_script(
+    git_info: &GitInfo,
+    variables: &[Variable],
+    dest: &str,
+    strategy: GitStrategy,
+) -> Result<String> {
+    let fresh = checkout_commands(git_info, variables, dest)?;
+    let wipe = vec!["rm".to_string(), "-rf".to_string(), dest.to_string()];
+    let mut out = String::new();
+    let reuse =
+        strategy == GitStrategy::Fetch && submodule_strategy(variables) == SubmoduleStrategy::None;
+    if reuse {
+        let update: Vec<String> = update_commands(git_info, variables, dest)?
+            .iter()
+            .map(|argv| script::argv_line(argv))
+            .collect();
+        let git_dir = script::quote(&format!("{}/.git", dest));
+        out.push_str(&format!(
+            "updated=0\n\
+             if [ -d {git_dir} ] && [ ! -e {git_dir}/modules ]; then\n\
+             echo 'Reusing the checkout of an earlier job'\n\
+             if {}; then updated=1; else echo 'WARNING: Updating the earlier checkout failed, cloning again'; fi\n\
+             fi\n\
+             if [ \"$updated\" = 0 ]; then\n",
+            update.join(" && ")
+        ));
+    }
+    out.push_str(&script::argv_line(&wipe));
+    out.push('\n');
+    for argv in &fresh {
+        out.push_str(&script::argv_line(argv));
+        out.push('\n');
+    }
+    if reuse {
+        out.push_str("fi\n");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -431,16 +535,152 @@ mod tests {
         assert!(cmds[2].contains(&"--prune-tags".to_string()));
     }
 
+    /// Run the checkout script like the executor does; its output
+    fn run_script(
+        info: &GitInfo,
+        variables: &[Variable],
+        dest: &Path,
+        strategy: GitStrategy,
+    ) -> String {
+        let body = checkout_script(info, variables, dest.to_str().unwrap(), strategy).unwrap();
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -e\n{}", body))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{}", log);
+        log
+    }
+
+    /// Origin with commit A at refs/pipelines/1; then commit B at refs/pipelines/2
+    fn pipeline_info(url: &str, sha: &str, pipeline: u32) -> GitInfo {
+        let refspec = format!("+refs/pipelines/{0}:refs/pipelines/{0}", pipeline);
+        git_info(url, sha, &[refspec.as_str()], Some(20))
+    }
+
+    #[test]
+    fn fetch_updates_the_checkout_of_an_earlier_job_without_running_its_config() {
+        let root = tempdir().unwrap();
+        let (url, a, b) = origin_with_two_commits(root.path());
+        let origin = root.path().join("origin");
+        run(&origin, &["update-ref", "refs/pipelines/2", &b]);
+        let dest = root.path().join("project");
+
+        let first = run_script(&pipeline_info(&url, &a, 1), &[], &dest, GitStrategy::Fetch);
+        assert!(!first.contains("Reusing"), "{}", first);
+        assert_eq!(run(&dest, &["rev-parse", "HEAD"]), a);
+
+        // What the earlier job leaves behind: files, a config that runs
+        // commands and a hook
+        let marker = root.path().join("ran");
+        std::fs::write(dest.join("leftover"), "x").unwrap();
+        run(
+            &dest,
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!("touch {}", marker.display()),
+            ],
+        );
+        let hook = dest.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let second = run_script(&pipeline_info(&url, &b, 2), &[], &dest, GitStrategy::Fetch);
+        assert!(second.contains("Reusing the checkout"), "{}", second);
+        assert!(!second.contains("WARNING"), "{}", second);
+        assert_eq!(run(&dest, &["rev-parse", "HEAD"]), b);
+        assert_eq!(std::fs::read_to_string(dest.join("f")).unwrap(), "B");
+        assert!(!dest.join("leftover").exists());
+        assert!(!marker.exists(), "the earlier job's config or hook ran");
+        // The job's own git calls run with a config of the runner's
+        run(&dest, &["status"]);
+        assert!(!marker.exists(), "the earlier job's config survived");
+    }
+
+    #[test]
+    fn a_broken_checkout_is_cloned_again() {
+        let root = tempdir().unwrap();
+        let (url, a, b) = origin_with_two_commits(root.path());
+        run(
+            &root.path().join("origin"),
+            &["update-ref", "refs/pipelines/2", &b],
+        );
+        let dest = root.path().join("project");
+        run_script(&pipeline_info(&url, &a, 1), &[], &dest, GitStrategy::Fetch);
+        // A job killed in the middle of a git command
+        std::fs::write(dest.join(".git/HEAD"), "garbage").unwrap();
+
+        let log = run_script(&pipeline_info(&url, &b, 2), &[], &dest, GitStrategy::Fetch);
+        assert!(log.contains("cloning again"), "{}", log);
+        assert_eq!(run(&dest, &["rev-parse", "HEAD"]), b);
+    }
+
+    #[test]
+    fn clone_and_submodules_never_reuse_the_checkout() {
+        let root = tempdir().unwrap();
+        let (url, a, _) = origin_with_two_commits(root.path());
+        let dest = root.path().join("project");
+        let info = pipeline_info(&url, &a, 1);
+        run_script(&info, &[], &dest, GitStrategy::Fetch);
+        std::fs::write(dest.join("leftover"), "x").unwrap();
+
+        let log = run_script(&info, &[], &dest, GitStrategy::Clone);
+        assert!(!log.contains("Reusing"), "{}", log);
+        assert!(!dest.join("leftover").exists());
+
+        let submodules = [var("GIT_SUBMODULE_STRATEGY", "normal")];
+        let body = checkout_script(&info, &submodules, "/w", GitStrategy::Fetch).unwrap();
+        assert!(!body.contains("Reusing"), "{}", body);
+    }
+
+    #[test]
+    fn clean_flags_follow_the_variable() {
+        let info = git_info("https://g/r.git", &"a".repeat(40), &[], None);
+        let cmds = update_commands(&info, &[], "/w").unwrap();
+        assert!(cmds
+            .iter()
+            .any(|c| c.ends_with(&["clean".into(), "-q".into(), "-ffdx".into()])));
+        let custom = [var("GIT_CLEAN_FLAGS", "-ffd -e node_modules/")];
+        let cmds = update_commands(&info, &custom, "/w").unwrap();
+        assert!(cmds.iter().any(|c| c.ends_with(&[
+            "-ffd".into(),
+            "-e".into(),
+            "node_modules/".into()
+        ])));
+        let none = [var("GIT_CLEAN_FLAGS", "none")];
+        let cmds = update_commands(&info, &none, "/w").unwrap();
+        assert!(!cmds.iter().any(|c| c.contains(&"clean".to_string())));
+    }
+
     #[test]
     fn strategy_from_variables() {
-        assert_eq!(strategy(&[]), GitStrategy::Fetch);
+        assert_eq!(strategy(&[], true), GitStrategy::Fetch);
+        assert_eq!(strategy(&[], false), GitStrategy::Clone);
         assert_eq!(
-            strategy(&[var("GIT_STRATEGY", "clone")]),
+            strategy(&[var("GIT_STRATEGY", "clone")], true),
+            GitStrategy::Clone
+        );
+        assert_eq!(
+            strategy(&[var("GIT_STRATEGY", "fetch")], false),
             GitStrategy::Fetch
         );
-        assert_eq!(strategy(&[var("GIT_STRATEGY", "none")]), GitStrategy::None);
         assert_eq!(
-            strategy(&[var("GIT_STRATEGY", "empty")]),
+            strategy(&[var("GIT_STRATEGY", "none")], true),
+            GitStrategy::None
+        );
+        assert_eq!(
+            strategy(&[var("GIT_STRATEGY", "empty")], true),
             GitStrategy::Empty
         );
     }

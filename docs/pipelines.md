@@ -33,7 +33,8 @@ lists what a runner has to do, and how TurboCI does it.
 
 | Variable | Notes |
 |---|---|
-| `GIT_STRATEGY` | `fetch`, `clone`, `none`, `empty`. Every job starts from a fresh workspace, so `fetch` and `clone` behave the same |
+| `GIT_STRATEGY` | `fetch` updates the checkout an earlier job of the project left in the workspace (see [workspaces](configuration.md#workspaces)), `clone` always clones, `none` leaves the workspace as it is, `empty` empties the project directory. Default: the project's *Git strategy* setting |
+| `GIT_CLEAN_FLAGS` | `git clean` flags after a `fetch` into an existing checkout; default `-ffdx`, `none` skips it |
 | `GIT_DEPTH` | Shallow fetch depth; the project setting is the default |
 | `GIT_CHECKOUT` | `false` fetches without checking out |
 | `GIT_FETCH_EXTRA_FLAGS` | Extra `git fetch` flags, e.g. `--filter=blob:none` |
@@ -99,7 +100,7 @@ TurboCI adds the variables gitlab-runner adds:
 - Interactive web terminal and the session server
 - External secrets (`secrets:` with Vault, Azure Key Vault, ...)
 - Docker credential helpers (`credsStore`, `credHelpers`)
-- `GIT_SUBMODULE_FORCE_HTTPS`, `GIT_CLEAN_FLAGS`
+- `GIT_SUBMODULE_FORCE_HTTPS`
 - Feature flags (`FF_*`)
 
 The runner tells GitLab which features it has, so jobs that need an

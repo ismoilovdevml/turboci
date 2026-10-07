@@ -57,8 +57,33 @@ const RESTORE_STOP_GRACE: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(10)
 };
-/// Host directory holding Docker job workspaces (bind-mounted as /builds)
+/// Host directory holding Docker job workspaces when the config names none
 const DOCKER_BUILDS_ROOT: &str = "/tmp/turboci-builds";
+/// File in a workspace whose mtime says when a job last used it
+const LAST_USED: &str = ".turboci-last-used";
+
+/// Directory name of the workspace a job uses, below the builds root, and
+/// whether a later job may reuse it. Jobs of a project share workspaces, one
+/// per concurrency slot so concurrent jobs never share one. Protected refs
+/// never share one with unprotected refs: a job can leave files, git config
+/// or hooks behind for the next job in its workspace. Both come from the
+/// runner and GitLab, never from variables a pipeline could set; when GitLab
+/// does not say whether the ref is protected, the job gets a workspace of its own.
+pub fn workspace(job: &Job) -> (String, bool) {
+    let project = job.job_info.as_ref().map_or(0, |info| info.project_id);
+    match job.git_info.as_ref().and_then(|info| info.protected) {
+        Some(protected) => (
+            format!(
+                "project-{}-{}{}",
+                project,
+                job.project_slot,
+                if protected { "-protected" } else { "" }
+            ),
+            true,
+        ),
+        None => (format!("job-{}", job.id), false),
+    }
+}
 
 /// Why a job did not succeed
 #[derive(Debug, Clone)]
@@ -90,14 +115,18 @@ pub enum ExecutorType {
 }
 
 impl ExecutorType {
-    /// Host directory of the job; the project is checked out in `<job_dir>/project`
-    pub fn job_dir(&self, job_id: u64) -> PathBuf {
+    /// Host directory holding the workspaces
+    pub fn builds_root(&self) -> PathBuf {
         match self {
-            ExecutorType::Docker(_) => {
-                Path::new(DOCKER_BUILDS_ROOT).join(format!("job-{}", job_id))
-            }
-            ExecutorType::Shell(executor) => executor.job_dir(job_id),
+            ExecutorType::Docker(executor) => executor.builds_root(),
+            ExecutorType::Shell(executor) => executor.builds_root(),
         }
+    }
+
+    /// Host directory of the job's workspace (its builds directory); the
+    /// project is checked out in `<job_dir>/project`
+    pub fn job_dir(&self, job: &Job) -> PathBuf {
+        self.builds_root().join(workspace(job).0)
     }
 
     /// Check out sources and run the job's steps, writing output to `trace`
@@ -113,7 +142,7 @@ impl ExecutorType {
             match self {
                 ExecutorType::Docker(executor) => {
                     executor
-                        .execute(job, &self.job_dir(job.id), trace, restore)
+                        .execute(job, &self.job_dir(job), trace, restore)
                         .await
                 }
                 ExecutorType::Shell(executor) => executor.execute(job, trace, restore).await,
@@ -140,7 +169,7 @@ impl ExecutorType {
     /// `cache:untracked`
     pub async fn untracked_files(&self, job: &Job) -> Result<Vec<String>> {
         let subdir = script::project_subdir(job).unwrap_or_else(|_| "project".to_string());
-        let job_dir = self.job_dir(job.id);
+        let job_dir = self.job_dir(job);
         let output = match self {
             ExecutorType::Docker(executor) => {
                 executor.untracked_files(job.id, &job_dir, &subdir).await?
@@ -163,13 +192,76 @@ impl ExecutorType {
         }
     }
 
-    /// Remove the job's host directory
-    pub async fn cleanup(&self, job_id: u64) {
-        let dir = self.job_dir(job_id);
-        match tokio::fs::remove_dir_all(&dir).await {
-            Ok(()) => info!("💾 Removed workspace {}", dir.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!("Failed to remove workspace {}: {}", dir.display(), e),
+    /// Mark the job's workspace as used now (see `evict_workspaces`) and
+    /// remove what an earlier job left of its file variables
+    pub async fn prepare(&self, job: &Job) -> Result<()> {
+        let dir = self.job_dir(job);
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(dir.join(LAST_USED), b"").await?;
+        remove_dir(&variables_dir(&dir, job)).await;
+        Ok(())
+    }
+
+    /// Remove the job's file variables (they hold secrets) and, unless the
+    /// workspace is kept for the project's next job, the whole workspace
+    pub async fn cleanup(&self, job: &Job, keep_workspace: bool) {
+        let dir = self.job_dir(job);
+        if keep_workspace && workspace(job).1 {
+            remove_dir(&variables_dir(&dir, job)).await;
+        } else if remove_dir(&dir).await {
+            info!("💾 Removed workspace {}", dir.display());
+        }
+    }
+
+    /// Remove workspaces no job used for `max_age`, except those in `in_use`
+    pub async fn evict_workspaces(
+        &self,
+        max_age: Duration,
+        in_use: &std::collections::HashSet<PathBuf>,
+    ) {
+        let Ok(mut entries) = tokio::fs::read_dir(self.builds_root()).await else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if in_use.contains(&path) || !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            // Directories of older versions (job-<id>) have no marker
+            let used = match tokio::fs::metadata(path.join(LAST_USED)).await {
+                Ok(meta) => meta.modified(),
+                Err(_) => entry.metadata().await.and_then(|meta| meta.modified()),
+            };
+            let idle = used
+                .ok()
+                .and_then(|used| now.duration_since(used).ok())
+                .unwrap_or_default();
+            if idle > max_age && remove_dir(&path).await {
+                info!(
+                    "💾 Removed workspace {} (unused for {} days)",
+                    path.display(),
+                    idle.as_secs() / 86400
+                );
+            }
+        }
+    }
+}
+
+/// Host directory of the job's file variables (`<project>.tmp`, see `script::job_env`)
+fn variables_dir(job_dir: &Path, job: &Job) -> PathBuf {
+    let subdir = script::project_subdir(job).unwrap_or_else(|_| "project".to_string());
+    job_dir.join(format!("{}.tmp", subdir))
+}
+
+/// `rm -rf`; true when something was removed
+async fn remove_dir(dir: &Path) -> bool {
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            warn!("Failed to remove {}: {}", dir.display(), e);
+            false
         }
     }
 }
@@ -531,19 +623,22 @@ async fn checkout(
         return Ok(());
     };
 
-    let strategy = git::strategy(&job.variables);
-    let commands = match strategy {
+    let strategy = git::strategy(&job.variables, job.allow_git_fetch);
+    let sources = match strategy {
         GitStrategy::None => {
             trace.write("Skipping Git repository setup\n").await;
             return Ok(());
         }
-        GitStrategy::Empty => vec![vec![
-            "mkdir".to_string(),
-            "-p".to_string(),
-            dirs.project.clone(),
-        ]],
-        GitStrategy::Fetch => git::checkout_commands(git_info, &job.variables, &dirs.project)
-            .map_err(|e| RunError::Failed(JobFailure::system(e)))?,
+        // The workspace may hold an earlier job's files
+        GitStrategy::Empty => script::argv_script(&[
+            vec!["rm".to_string(), "-rf".to_string(), dirs.project.clone()],
+            vec!["mkdir".to_string(), "-p".to_string(), dirs.project.clone()],
+        ]),
+        GitStrategy::Fetch | GitStrategy::Clone => {
+            let body = git::checkout_script(git_info, &job.variables, &dirs.project, strategy)
+                .map_err(|e| RunError::Failed(JobFailure::system(e)))?;
+            format!("{}{}", script::argv_script(&[]), body)
+        }
     };
 
     // repo_url embeds the job token, so only the ref and SHA are shown
@@ -557,7 +652,7 @@ async fn checkout(
 
     // Like gitlab-runner: skip LFS objects during checkout, then pull them if
     // git-lfs is available and the pipeline did not opt out
-    let lfs = if matches!(strategy, GitStrategy::Fetch)
+    let lfs = if matches!(strategy, GitStrategy::Fetch | GitStrategy::Clone)
         && variable_value(job, "GIT_LFS_SKIP_SMUDGE") != Some("1")
     {
         let dest = script::quote(&dirs.project);
@@ -571,8 +666,7 @@ async fn checkout(
     };
     let script = format!(
         "umask 0000\nexport GIT_LFS_SKIP_SMUDGE=1\n{}{}",
-        script::argv_script(&commands),
-        lfs
+        sources, lfs
     );
     // GET_SOURCES_ATTEMPTS retries flaky fetches (1 to 10, default 1)
     let attempts = variable_value(job, "GET_SOURCES_ATTEMPTS")
@@ -1048,7 +1142,11 @@ mod tests {
         let mut trace = TraceWriter::new(None, 8, "t", &scrubber);
 
         let outcome = executor
-            .execute(&j, &mut trace, &BumpVersion(executor.job_dir(8)))
+            .execute(
+                &j,
+                &mut trace,
+                &BumpVersion(executor.builds_root().join("job-8")),
+            )
             .await;
         trace.finish().await;
         let log = trace.text();
@@ -1144,7 +1242,7 @@ mod tests {
         let executor = ExecutorType::Shell(ShellExecutor::new(Some(
             dir.path().to_string_lossy().into_owned(),
         )));
-        let project = executor.job_dir(17).join("project");
+        let project = executor.builds_root().join("job-17").join("project");
         std::fs::create_dir_all(&project).unwrap();
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")

@@ -84,6 +84,10 @@ impl std::fmt::Debug for S3CacheConfig {
 #[serde(default)]
 pub struct ExecutorConfig {
     pub executor_type: String, // "docker", "shell"
+    /// A project's next job reuses its workspace (the checkout is fetched
+    /// instead of cloned); workspaces no job used for this many days are
+    /// deleted. 0 deletes every workspace when its job ends.
+    pub workspace_max_age_days: u64,
     #[serde(default)]
     pub docker: DockerConfig,
     #[serde(default)]
@@ -93,6 +97,10 @@ pub struct ExecutorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DockerConfig {
+    /// Host directory of the job workspaces, bind-mounted as /builds.
+    /// Default: `<state_dir>/builds`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builds_dir: Option<String>,
     pub default_image: String,
     pub privileged: bool,
     /// Extra binds for job containers, e.g. "/cache:/cache:rw"
@@ -236,6 +244,15 @@ impl DockerConfig {
                 );
             }
         }
+        if let Some(dir) = self.builds_dir.as_deref() {
+            // dockerd rejects relative bind mount sources
+            if !Path::new(dir).is_absolute() {
+                anyhow::bail!(
+                    "executor.docker.builds_dir must be an absolute path, got {:?}",
+                    dir
+                );
+            }
+        }
         if let Some(bad) = self.services.iter().find(|s| s.name.trim().is_empty()) {
             anyhow::bail!(
                 "executor.docker.services: every service needs a name ({:?})",
@@ -369,6 +386,7 @@ impl Default for ExecutorConfig {
             // Docker isolates jobs from the host. The shell executor runs job
             // scripts directly as the runner's user and must be chosen explicitly.
             executor_type: "docker".to_string(),
+            workspace_max_age_days: 7,
             docker: DockerConfig::default(),
             shell: ShellConfig::default(),
         }
@@ -395,6 +413,7 @@ impl Default for DockerConfig {
             auth_config_file: None,
             insecure_registries: Vec::new(),
             registry_ca: std::collections::BTreeMap::new(),
+            builds_dir: None,
         }
     }
 }
@@ -413,9 +432,19 @@ impl RunnerConfig {
 
     /// Parse TOML, warning about keys the runner does not know (they are ignored)
     pub fn parse(content: &str) -> Result<Self> {
-        let config: RunnerConfig = toml::from_str(content)?;
+        let mut config: RunnerConfig = toml::from_str(content)?;
         for key in unknown_keys(content, &config) {
             tracing::warn!("Ignoring unknown config key `{}`", key);
+        }
+        // On disk with the runner's state: a /tmp cleaner (or tmpfs) must not
+        // remove parts of workspaces kept between jobs
+        if config.executor.docker.builds_dir.is_none() {
+            config.executor.docker.builds_dir = Some(
+                Path::new(&config.state_dir)
+                    .join("builds")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
         Ok(config)
     }

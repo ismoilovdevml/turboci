@@ -288,7 +288,14 @@ pub struct RunnerDaemon {
     tokens: Arc<token::TokenStore>,
     /// Held while a token is reset and saved, so shutdown never cuts it short
     rotating: Arc<tokio::sync::Mutex<()>>,
+    /// Workspaces of running jobs, never evicted
+    workspaces_in_use: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    /// When unused workspaces were last looked for
+    last_eviction: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
+
+/// How often unused workspaces are looked for
+const EVICTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 impl RunnerDaemon {
     pub fn new(
@@ -334,6 +341,8 @@ impl RunnerDaemon {
             runner_token: Arc::new(std::sync::RwLock::new(runner_token)),
             tokens: Arc::new(tokens),
             rotating: Arc::default(),
+            workspaces_in_use: Arc::default(),
+            last_eviction: Arc::default(),
         }
     }
 
@@ -422,7 +431,7 @@ impl RunnerDaemon {
     /// The checked-out project on the host (see `script::project_subdir`)
     fn project_dir(&self, job: &Job) -> std::path::PathBuf {
         self.executor
-            .job_dir(job.id)
+            .job_dir(job)
             .join(script::project_subdir(job).unwrap_or_else(|_| "project".to_string()))
     }
 
@@ -534,6 +543,7 @@ impl RunnerDaemon {
                 .expect("valid variable"),
             );
         }
+        job.project_slot = slot.1;
         apply_runner_config(&mut job, &self.config);
         let result = self.run_job(&job).await;
         if let Ok(mut slots) = self.slots.lock() {
@@ -570,9 +580,19 @@ impl RunnerDaemon {
             .await;
 
         let project_dir = self.project_dir(&job);
-        let mut outcome = tokio::fs::create_dir_all(&project_dir)
-            .await
-            .map_err(|e| JobFailure::system(format!("Failed to create workspace: {}", e)));
+        let workspace = self.executor.job_dir(&job);
+        if let Ok(mut in_use) = self.workspaces_in_use.lock() {
+            in_use.insert(workspace.clone());
+        }
+        self.evict_workspaces();
+        let prepared = match self.executor.prepare(&job).await {
+            Ok(()) => tokio::fs::create_dir_all(&project_dir)
+                .await
+                .map_err(anyhow::Error::from),
+            Err(e) => Err(e),
+        };
+        let mut outcome = prepared
+            .map_err(|e| JobFailure::system(format!("Failed to create workspace: {:#}", e)));
         if outcome.is_ok() {
             outcome = self
                 .executor
@@ -627,7 +647,12 @@ impl RunnerDaemon {
                 trace.section_end("archive_cache").await;
             }
         }
-        self.executor.cleanup(job.id).await;
+        self.executor
+            .cleanup(&job, self.config.executor.workspace_max_age_days > 0)
+            .await;
+        if let Ok(mut in_use) = self.workspaces_in_use.lock() {
+            in_use.remove(&workspace);
+        }
         drop(_heartbeat);
 
         // Jobs stopped by a runner shutdown are the runner's failure, not the user's
@@ -665,6 +690,34 @@ impl RunnerDaemon {
         self.gitlab
             .update_job(job.id, &job.token, state, reason, exit_code)
             .await
+    }
+
+    /// Remove workspaces no job used for `workspace_max_age_days`, in the
+    /// background and at most once per `EVICTION_INTERVAL`
+    fn evict_workspaces(&self) {
+        let days = self.config.executor.workspace_max_age_days;
+        let due = self.last_eviction.lock().is_ok_and(|mut last| {
+            let due = days > 0 && last.is_none_or(|at| at.elapsed() >= EVICTION_INTERVAL);
+            if due {
+                *last = Some(std::time::Instant::now());
+            }
+            due
+        });
+        if !due {
+            return;
+        }
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            let in_use = daemon
+                .workspaces_in_use
+                .lock()
+                .map(|in_use| in_use.clone())
+                .unwrap_or_default();
+            daemon
+                .executor
+                .evict_workspaces(Duration::from_secs(days * 24 * 60 * 60), &in_use)
+                .await;
+        });
     }
 
     /// Keep-alive for the job: learns about remote cancellation even when the job
@@ -813,7 +866,7 @@ impl RunnerDaemon {
                     dependency.id, dependency.name
                 ))
                 .await;
-            let job_dir = self.executor.job_dir(job.id);
+            let job_dir = self.executor.job_dir(job);
             let tries = attempts(job, "ARTIFACT_DOWNLOAD_ATTEMPTS");
             let mut result = Err(anyhow::anyhow!("not attempted"));
             for attempt in 1..=tries {
@@ -905,7 +958,7 @@ impl RunnerDaemon {
                 &paths,
                 &expand_all(&artifact.exclude),
                 format,
-                &self.executor.job_dir(job.id),
+                &self.executor.job_dir(job),
             )
             .await
             {
@@ -1115,6 +1168,14 @@ mod tests {
 
     /// A daemon with the shell executor talking to a mock GitLab
     async fn daemon(server: &MockServer, dir: &std::path::Path) -> RunnerDaemon {
+        daemon_with(server, dir, |_| {}).await
+    }
+
+    async fn daemon_with(
+        server: &MockServer,
+        dir: &std::path::Path,
+        configure: impl FnOnce(&mut config::RunnerConfig),
+    ) -> RunnerDaemon {
         for (verb, route, status) in [
             ("PATCH", r"^/api/v4/jobs/\d+/trace$", 202),
             ("PUT", r"^/api/v4/jobs/\d+$", 200),
@@ -1126,13 +1187,14 @@ mod tests {
                 .mount(server)
                 .await;
         }
-        let config = config::RunnerConfig {
+        let mut config = config::RunnerConfig {
             runner_token: "glrt-test".to_string(),
             gitlab_url: server.uri(),
             cache_dir: dir.join("cache").to_string_lossy().into_owned(),
             state_dir: dir.to_string_lossy().into_owned(),
             ..config::RunnerConfig::default()
         };
+        configure(&mut config);
         let executor = executor::ExecutorType::Shell(executor::ShellExecutor::new(Some(
             dir.join("builds").to_string_lossy().into_owned(),
         )));
@@ -1470,6 +1532,151 @@ mod tests {
             "ignored files are untracked too"
         );
         assert!(!body.contains("README"));
+    }
+
+    /// Origin repository with one commit; its file:// URL and the commit
+    fn origin_repo(dir: &std::path::Path) -> (String, String) {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.join("origin"))
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::create_dir(dir.join("origin")).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("origin/README"), "tracked").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        (format!("file://{}", dir.join("origin").display()), sha)
+    }
+
+    fn checkout_job(id: u64, url: &str, sha: &str, protected: bool, script: &[&str]) -> Job {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "token": "t", "allow_git_fetch": true,
+            "job_info": {"name": "build", "stage": "test", "project_id": 5, "project_name": "app"},
+            "git_info": {"repo_url": url, "ref": "main", "ref_type": "branch", "sha": sha,
+                         "before_sha": "", "protected": protected,
+                         "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]},
+            "variables": [{"key": "DEPLOY_KEY", "value": "key-content", "file": true}],
+            "steps": [{"name": "script", "when": "on_success", "timeout": 60, "script": script}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_next_job_of_a_project_fetches_into_its_workspace() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let (url, sha) = origin_repo(dir.path());
+        let workspace = dir.path().join("builds/project-5-0");
+
+        let first = checkout_job(
+            301,
+            &url,
+            &sha,
+            false,
+            &["echo x > leftover", "cat \"$DEPLOY_KEY\""],
+        );
+        daemon.execute_job(first).await.unwrap();
+        assert_eq!(final_update(&server, 301).await["state"], "success");
+        assert!(workspace.join("project/.git").is_dir());
+        assert!(
+            !workspace.join("project.tmp").exists(),
+            "file variables are removed when the job ends"
+        );
+
+        let second = checkout_job(
+            302,
+            &url,
+            &sha,
+            false,
+            &["test ! -e leftover", "cat README"],
+        );
+        daemon.execute_job(second).await.unwrap();
+        let trace = trace_of(&server, 302).await;
+        assert_eq!(
+            final_update(&server, 302).await["state"],
+            "success",
+            "{}",
+            trace
+        );
+        assert!(
+            trace.contains("Reusing the checkout of an earlier job"),
+            "{}",
+            trace
+        );
+
+        // A protected ref never gets an unprotected ref's workspace
+        let protected = checkout_job(303, &url, &sha, true, &["test ! -e leftover"]);
+        daemon.execute_job(protected).await.unwrap();
+        let trace = trace_of(&server, 303).await;
+        assert!(!trace.contains("Reusing"), "{}", trace);
+        assert!(dir
+            .path()
+            .join("builds/project-5-0-protected/project")
+            .is_dir());
+    }
+
+    #[tokio::test]
+    async fn workspaces_are_removed_after_each_job_when_not_kept() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon_with(&server, dir.path(), |config| {
+            config.executor.workspace_max_age_days = 0;
+        })
+        .await;
+        let (url, sha) = origin_repo(dir.path());
+
+        daemon
+            .execute_job(checkout_job(311, &url, &sha, false, &["true"]))
+            .await
+            .unwrap();
+        assert_eq!(final_update(&server, 311).await["state"], "success");
+        assert!(!dir.path().join("builds/project-5-0").exists());
+    }
+
+    #[tokio::test]
+    async fn file_variables_are_found_with_a_custom_clone_path() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let (url, sha) = origin_repo(dir.path());
+        let mut job = checkout_job(
+            321,
+            &url,
+            &sha,
+            false,
+            &["grep -q key-content \"$DEPLOY_KEY\""],
+        );
+        job.variables.push(
+            serde_json::from_value(serde_json::json!(
+                {"key": "GIT_CLONE_PATH", "value": "$CI_BUILDS_DIR/group/app"}
+            ))
+            .unwrap(),
+        );
+
+        daemon.execute_job(job).await.unwrap();
+        let trace = trace_of(&server, 321).await;
+        assert_eq!(
+            final_update(&server, 321).await["state"],
+            "success",
+            "{}",
+            trace
+        );
     }
 
     #[tokio::test]

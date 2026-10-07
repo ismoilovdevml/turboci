@@ -39,7 +39,8 @@ Redis, no database, no helper daemon.
 2. **Payload.** GitLab answers with the script, variables, image, services,
    cache and artifact settings.
 3. **Checkout.** A small helper container checks out the pipeline's exact
-   commit, so job images need no `git`.
+   commit, so job images need no `git`. A project's next job fetches into the
+   checkout the previous one left instead of cloning again.
 4. **Restore.** The cache and the artifacts of earlier jobs are put into the
    workspace.
 5. **Run.** Each step runs in the job container; services are reachable by
@@ -47,7 +48,8 @@ Redis, no database, no helper daemon.
 6. **Live log.** Output streams to GitLab while the job runs, with secrets
    masked.
 7. **Finish.** Artifacts are uploaded, the cache is saved and the result is
-   reported. Every container, network and workspace of the job is removed.
+   reported. Every container and network of the job is removed; the
+   workspace is kept for the project's next job.
 
 ## Status
 

@@ -189,6 +189,7 @@ aliases.
 
 | Key | Default | Description |
 |---|---|---|
+| `builds_dir` | `<state_dir>/builds` | Host directory of the job workspaces, mounted as `/builds` |
 | `default_image` | `alpine:latest` | Image for jobs that do not set `image:` |
 | `pull_policy` | `always` | `always`, `if-not-present` or `never` |
 | `allowed_pull_policies` | `[]` | Policies a job may request with `image:pull_policy`. Empty: only `pull_policy`. This stops a project from using `if-not-present` to run another project's cached private image |
@@ -289,12 +290,35 @@ The installer does the second for you: `--registry-ca HOST=FILE` installs the
 CA for dockerd and writes `registry_ca`. `--insecure-registry HOST` writes
 `insecure_registries`; `daemon.json` is left to you.
 
-Workspaces live under `/tmp/turboci-builds/job-<id>` on the host and are
-removed when the job ends.
+Files that jobs create in the workspace belong to root in the container; the
+runner hands them back to its own user after every job.
 
 !!! warning "The docker group is root-equivalent"
     The `turboci` user is in the `docker` group, which can start privileged
     containers. Treat the runner host accordingly.
+
+### Workspaces
+
+Like gitlab-runner, the runner keeps a project's workspace for its next job:
+with `GIT_STRATEGY: fetch` (the default when the project's *Git strategy*
+setting is *git fetch*), that job updates the existing checkout with
+`git fetch` instead of cloning the repository again, then removes untracked
+and ignored files (`GIT_CLEAN_FLAGS`, default `-ffdx`).
+
+| Key | Default | Description |
+|---|---|---|
+| `[executor] workspace_max_age_days` | `7` | Workspaces no job used for this many days are deleted. `0` deletes every workspace when its job ends, so every job clones |
+
+- Each project has one workspace per job running at the same time
+  (`CI_CONCURRENT_PROJECT_ID`), and protected branches and tags never share
+  a workspace with unprotected ones. They live in
+  `<builds directory>/project-<id>-<slot>[-protected]`.
+- An earlier job may have changed the repository, so its git config and
+  hooks are replaced before the checkout. Repositories with submodules
+  (`GIT_SUBMODULE_STRATEGY`) are always cloned, and a checkout that cannot be
+  updated (for example after a job was killed mid-fetch) is cloned again.
+- When GitLab does not say whether the ref is protected, the job gets a
+  workspace of its own that is deleted when it ends.
 
 ### Shell
 

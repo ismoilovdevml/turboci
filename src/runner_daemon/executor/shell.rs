@@ -40,8 +40,8 @@ impl ShellExecutor {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    pub(super) fn job_dir(&self, job_id: u64) -> PathBuf {
-        Path::new(&self.work_dir).join(format!("job-{}", job_id))
+    pub(super) fn builds_root(&self) -> PathBuf {
+        PathBuf::from(&self.work_dir)
     }
 
     pub(super) async fn execute(
@@ -52,7 +52,7 @@ impl ShellExecutor {
     ) -> JobOutcome {
         trace.write("Using Shell executor...\n").await;
 
-        let job_dir = self.job_dir(job.id);
+        let job_dir = self.builds_root().join(workspace(job).0);
         let dirs = JobDirs {
             builds: job_dir.to_string_lossy().into_owned(),
             project: job_dir

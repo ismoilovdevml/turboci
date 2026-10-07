@@ -186,6 +186,16 @@ impl DockerExecutor {
         })
     }
 
+    /// Host directory holding the workspaces (`builds_dir` in the config)
+    pub(super) fn builds_root(&self) -> PathBuf {
+        PathBuf::from(
+            self.config
+                .builds_dir
+                .as_deref()
+                .unwrap_or(DOCKER_BUILDS_ROOT),
+        )
+    }
+
     /// Identify this runner (its system ID) in container and network labels
     pub fn with_owner(mut self, owner: &str) -> Self {
         self.owner = owner.to_string();
@@ -351,7 +361,9 @@ impl DockerExecutor {
             .await
             .map_err(|e| JobFailure::system(format!("Failed to create host workspace: {}", e)))?;
 
-        if job.git_info.is_some() && git::strategy(&job.variables) != GitStrategy::None {
+        if job.git_info.is_some()
+            && git::strategy(&job.variables, job.allow_git_fetch) != GitStrategy::None
+        {
             let helper = self.config.helper_image.clone();
             self.ensure_image(&helper, None, job, trace).await?;
             let id = self
@@ -1192,7 +1204,7 @@ mod tests {
         assert!(log.contains("after-ran"), "{}", log);
 
         // Files the container created as root are left for artifact upload...
-        let job_dir = executor.job_dir(job_id);
+        let job_dir = executor.job_dir(&j);
         assert_eq!(
             std::fs::read_to_string(job_dir.join("project/out/a.txt")).unwrap(),
             "artifact\n"
@@ -1207,7 +1219,7 @@ mod tests {
             .await
             .is_err());
         // ...and the runner's user can delete the workspace
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
         assert!(!job_dir.exists());
     }
 
@@ -1270,7 +1282,7 @@ mod tests {
             )
             .await
             .is_err());
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
     }
 
     #[tokio::test]
@@ -1323,7 +1335,7 @@ mod tests {
             trace.finish().await;
             assert!(outcome.is_ok(), "{:?}\n{}", outcome, trace.text());
             log.push_str(&trace.text());
-            executor.cleanup(j.id).await;
+            executor.cleanup(j, false).await;
         }
 
         assert!(log.contains("runner-service PONG"), "{}", log);
@@ -1366,7 +1378,8 @@ mod tests {
             .unwrap(),
         );
         let job_id = 920_000_000 + u64::from(std::process::id());
-        let job_dir = executor.job_dir(job_id);
+        // A job without git_info.protected gets a workspace of its own
+        let job_dir = executor.builds_root().join(format!("job-{}", job_id));
 
         // Origin repository inside the workspace, visible to containers as /builds/origin.git
         let git = |dir: &Path, args: &[&str]| {
@@ -1432,7 +1445,96 @@ mod tests {
             )
             .await
             .is_err());
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test --all-features -- --ignored"]
+    async fn docker_next_job_fetches_into_the_workspace_root_files_included() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let project = 930_000_000 + u64::from(std::process::id());
+        let workspace = executor
+            .builds_root()
+            .join(format!("project-{}-0", project));
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // Origin next to the project in the workspace, seen as /builds/origin.git
+        let work = workspace.join("origin-work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "hello from git\n").unwrap();
+        git(&work, &["add", "file.txt"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        let sha = git(&work, &["rev-parse", "HEAD"]);
+        git(
+            &workspace,
+            &["clone", "-q", "--bare", "origin-work", "origin.git"],
+        );
+
+        let run = |id: u64, script: &'static [&'static str]| {
+            let j = job(serde_json::json!({
+                "id": id, "token": "t", "allow_git_fetch": true,
+                "image": {"name": "alpine:3.20"},
+                "job_info": {"name": "build", "stage": "test", "project_id": project, "project_name": "app"},
+                "git_info": {
+                    "repo_url": "file:///builds/origin.git", "ref": "main", "ref_type": "branch",
+                    "sha": sha, "before_sha": "", "protected": false,
+                    "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]
+                },
+                // The origin repo belongs to the host user, not root in the helper
+                "variables": [
+                    {"key": "GIT_CONFIG_COUNT", "value": "1"},
+                    {"key": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+                    {"key": "GIT_CONFIG_VALUE_0", "value": "*"}
+                ],
+                "steps": steps(script, &[])
+            }));
+            let executor = executor.clone();
+            async move {
+                let scrubber = SecretScrubber::new(vec![]);
+                let mut trace = TraceWriter::new(None, j.id, "t", &scrubber);
+                let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+                trace.finish().await;
+                (outcome, trace.text(), j)
+            }
+        };
+
+        // Files the job creates belong to root in the container
+        let (outcome, log, _) = run(project, &["echo x > leftover"]).await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        let (outcome, log, last) = run(project + 1, &["test ! -e leftover", "cat file.txt"]).await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(
+            log.contains("Reusing the checkout of an earlier job"),
+            "{}",
+            log
+        );
+        assert!(!log.contains("cloning again"), "{}", log);
+        assert!(log.contains("hello from git"), "{}", log);
+        executor.cleanup(&last, false).await;
+        assert!(!workspace.exists());
     }
 
     #[tokio::test]
@@ -1466,11 +1568,8 @@ mod tests {
         trace.finish().await;
 
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, trace.text());
-        executor.cleanup(job_id).await;
-        assert!(
-            !executor.job_dir(job_id).exists(),
-            "workspace not removable"
-        );
+        executor.cleanup(&j, false).await;
+        assert!(!executor.job_dir(&j).exists(), "workspace not removable");
     }
 
     #[tokio::test]
@@ -1504,7 +1603,7 @@ mod tests {
         assert!(log.contains("image debian:bookworm-slim"), "{}", log);
         assert!(log.contains("bash-syntax-ok"), "{}", log);
         assert!(log.contains("array=b"), "{}", log);
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
     }
 
     #[tokio::test]
@@ -1550,7 +1649,7 @@ mod tests {
             std::fs::read_to_string(shared.path().join("env.txt")).unwrap(),
             "svc=svc-value public=pub secret=\n"
         );
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
     }
 
     #[tokio::test]
@@ -1647,7 +1746,7 @@ mod tests {
             FailureReason::JobExecutionTimeout
         );
         assert!(log.contains("script-stopped"), "{}", log);
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
     }
 
     /// A job that builds an image in docker:dind and pushes it to the
@@ -1703,7 +1802,7 @@ mod tests {
 
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
         assert!(log.contains("pushed-ok"), "{}", log);
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
     }
 
     #[tokio::test]
@@ -1778,7 +1877,7 @@ mod tests {
 
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
         assert!(log.contains("pushed-ok"), "{}", log);
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
     }
 
     #[tokio::test]
@@ -1792,7 +1891,10 @@ mod tests {
             .unwrap(),
         );
         let job_id = 970_000_000 + u64::from(std::process::id());
-        let project = executor.job_dir(job_id).join("project");
+        let project = executor
+            .builds_root()
+            .join(format!("job-{}", job_id))
+            .join("project");
         std::fs::create_dir_all(&project).unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| {
             let out = std::process::Command::new("git")
@@ -1831,7 +1933,7 @@ mod tests {
         let files = executor.untracked_files(&j).await.unwrap();
 
         let ran = project.join("fsmonitor-ran").exists();
-        executor.cleanup(job_id).await;
+        executor.cleanup(&j, false).await;
         assert_eq!(files, vec!["new.txt".to_string()]);
         assert!(!ran, "the job's core.fsmonitor command ran");
     }

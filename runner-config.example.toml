@@ -56,6 +56,11 @@ cache_max_age_days = 14
 #         Only use shell when every project on this runner is trusted.
 executor_type = "docker"
 
+# A project's next job reuses its workspace: the checkout is updated with
+# `git fetch` instead of cloned again (GIT_STRATEGY=fetch). Workspaces no job
+# used for this many days are deleted; 0 deletes each workspace when its job ends.
+workspace_max_age_days = 7
+
 # Shell executor configuration (used when executor_type = "shell")
 [executor.shell]
 work_dir = "/var/lib/turboci/builds"
