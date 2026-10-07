@@ -75,7 +75,8 @@ The documentation is at **[ismoilovdevml.github.io/turboci](https://ismoilovdevm
 ## Status
 
 TurboCI runs the CI of a team's projects in production on a self-hosted GitLab 19 instance, next
-to gitlab-runner on the same host. Release binaries are built for x86_64 Linux.
+to gitlab-runner on the same host. Release binaries are built for x86_64 and aarch64 Linux, and
+macOS on Apple Silicon.
 
 Not supported yet: Kubernetes and autoscaling executors, Windows jobs, interactive web
 terminals, Vault secrets and Docker credential helpers. GitLab never sends a job that needs a
