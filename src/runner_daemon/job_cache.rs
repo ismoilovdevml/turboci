@@ -254,7 +254,7 @@ impl LocalCache {
             .with_context(|| format!("Failed to create cache directory {}", dir.display()))?;
         // Staged in the cache directory and renamed into place, so concurrent
         // jobs never read a partial archive and nothing is held in memory
-        let Some(archive) = artifacts::create_zip_from_paths(workspace, paths, dir).await? else {
+        let Some(archive) = artifacts::create_cache_archive(workspace, paths, dir).await? else {
             return Ok(None);
         };
         let len = archive.len;
@@ -753,6 +753,40 @@ mod tests {
             .unwrap();
 
         assert!(!stale.exists() && !sidecar(&stale).exists());
+    }
+
+    #[tokio::test]
+    async fn caches_saved_by_older_versions_still_restore() {
+        let cache_root = tempdir().unwrap();
+        let cache = LocalCache::new(cache_root.path());
+        // Older versions wrote deflate entries
+        let path = cache.archive_path(42, "main");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file(
+            "vendor/lib.txt",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut zip, b"old").unwrap();
+        zip.finish().unwrap();
+
+        let consumer = tempdir().unwrap();
+        let restored = cache
+            .restore(
+                42,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+        assert!(restored.hit.is_some());
+        assert_eq!(
+            std::fs::read(consumer.path().join("vendor/lib.txt")).unwrap(),
+            b"old"
+        );
     }
 
     #[tokio::test]

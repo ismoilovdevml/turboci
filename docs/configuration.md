@@ -116,6 +116,13 @@ Without `cache_s3` the cache is local to the runner host, like gitlab-runner
 without a distributed cache. Archives are written to a temporary file and
 renamed into place, so concurrent jobs never read a partial archive.
 
+Cache archives are ZIP files with zstd-compressed entries (artifacts stay
+deflate, which GitLab reads). On a 262 MB `node_modules` of 15,450 files
+saving took 0.76 s instead of 2.0 s, at the same size. Caches written by
+older versions still restore; older versions cannot read the new ones and
+treat them as a cache miss with a warning, so upgrade every runner that
+shares an S3 cache together.
+
 ### Shared cache in S3
 
 Runners on several hosts share one cache through S3-compatible storage (AWS

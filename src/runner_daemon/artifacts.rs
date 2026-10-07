@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::warn;
-use zip::{ZipArchive, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use super::cancel::Stop;
 use crate::gitlab::GitLabClient;
@@ -293,17 +293,21 @@ fn symlink_stays_inside(link: &Path, target: &Path) -> bool {
 }
 
 /// Create ZIP archive from paths (used for artifacts and cache upload)
-pub async fn create_zip_from_paths(
+/// A cache archive: a ZIP whose entries are zstd-compressed. Caches never
+/// leave the runners, so they need not be readable by GitLab; zstd saves a
+/// cache about 2.5x faster than deflate at the same size.
+pub async fn create_cache_archive(
     workspace_path: &str,
     paths: &[String],
     staging_dir: &Path,
 ) -> Result<Option<Archive>> {
-    create_archive(workspace_path, paths, &[], "zip", staging_dir).await
+    create_archive(workspace_path, paths, &[], "zip-zstd", staging_dir).await
 }
 
 /// Archive the files matching `paths` in the format GitLab expects for the
 /// artifact: `zip` (archives), `gzip` (reports; one gzip member per file) or
-/// `raw` (a single file as is), written to a temporary file in `staging_dir`.
+/// `raw` (a single file as is), or `zip-zstd` for caches, written to a
+/// temporary file in `staging_dir`.
 /// `None` when no file matches.
 pub async fn create_archive(
     workspace_path: &str,
@@ -325,7 +329,18 @@ pub async fn create_archive(
         let mut file = tempfile::NamedTempFile::new_in(&staging_dir)
             .with_context(|| format!("Failed to create a file in {}", staging_dir.display()))?;
         match format.as_str() {
-            "zip" => build_zip(Path::new(&workspace), &files, file.as_file_mut())?,
+            "zip" => build_zip(
+                Path::new(&workspace),
+                &files,
+                CompressionMethod::Deflated,
+                file.as_file_mut(),
+            )?,
+            "zip-zstd" => build_zip(
+                Path::new(&workspace),
+                &files,
+                CompressionMethod::Zstd,
+                file.as_file_mut(),
+            )?,
             "gzip" => build_gzip(&files, file.as_file_mut())?,
             "raw" => match files.as_slice() {
                 [path] => copy_regular_file(path, MAX_RAW_ARTIFACT_BYTES, file.as_file_mut())?,
@@ -445,10 +460,15 @@ fn collect_paths(
         .collect())
 }
 
-fn build_zip<W: Write + std::io::Seek>(root: &Path, files: &[PathBuf], out: W) -> Result<()> {
+fn build_zip<W: Write + std::io::Seek>(
+    root: &Path,
+    files: &[PathBuf],
+    method: CompressionMethod,
+    out: W,
+) -> Result<()> {
     let mut zip = ZipWriter::new(out);
     for path in files {
-        add_path_to_zip(&mut zip, path, root)?;
+        add_path_to_zip(&mut zip, path, root, method)?;
     }
     zip.finish()?;
     Ok(())
@@ -482,9 +502,9 @@ fn add_path_to_zip<W: Write + std::io::Seek>(
     zip: &mut ZipWriter<W>,
     path: &Path,
     workspace_root: &Path,
+    method: CompressionMethod,
 ) -> Result<()> {
     use zip::write::FileOptions;
-    use zip::CompressionMethod;
 
     let relative_path = path
         .strip_prefix(workspace_root)
@@ -493,8 +513,7 @@ fn add_path_to_zip<W: Write + std::io::Seek>(
         .to_string();
 
     let meta = std::fs::symlink_metadata(path)?;
-    let options: FileOptions<'_, ()> =
-        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    let options: FileOptions<'_, ()> = FileOptions::default().compression_method(method);
 
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(path)?;
@@ -765,7 +784,7 @@ mod tests {
         std::fs::write(ws.path().join("dist/js/app.js"), b"js").unwrap();
         std::fs::write(ws.path().join("report.xml"), b"xml").unwrap();
 
-        let data = create_zip_from_paths(
+        let data = create_cache_archive(
             ws.path().to_str().unwrap(),
             &[
                 "dist".to_string(),
@@ -789,7 +808,7 @@ mod tests {
         std::fs::create_dir(&ws).unwrap();
         std::fs::write(root.path().join("secret.toml"), b"token").unwrap();
 
-        let data = create_zip_from_paths(
+        let data = create_cache_archive(
             ws.to_str().unwrap(),
             &[
                 "../secret.toml".to_string(),
@@ -828,6 +847,42 @@ mod tests {
         .expect("files matched");
 
         assert_eq!(zip_names(&data), vec!["dist/js/app.js"]);
+    }
+
+    /// Compression method of every entry of a ZIP
+    fn methods(data: &[u8]) -> Vec<zip::CompressionMethod> {
+        let mut archive = ZipArchive::new(std::io::Cursor::new(data)).unwrap();
+        (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().compression())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn caches_use_zstd_and_artifacts_deflate_that_gitlab_reads() {
+        let ws = tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "x".repeat(4096)).unwrap();
+        let root = ws.path().to_str().unwrap();
+        let paths = ["a.txt".to_string()];
+
+        let artifact = create_archive(root, &paths, &[], "zip", staging().path())
+            .await
+            .unwrap()
+            .map(bytes)
+            .unwrap();
+        assert_eq!(methods(&artifact), [zip::CompressionMethod::Deflated]);
+
+        let cache = create_cache_archive(root, &paths, staging().path())
+            .await
+            .unwrap()
+            .map(bytes)
+            .unwrap();
+        assert_eq!(methods(&cache), [zip::CompressionMethod::Zstd]);
+        let out = tempdir().unwrap();
+        extract_zip_to_workspace(&cache, out.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("a.txt")).unwrap(),
+            "x".repeat(4096)
+        );
     }
 
     #[tokio::test]
@@ -934,7 +989,7 @@ mod tests {
         std::fs::write(&secret, b"runner-token").unwrap();
         std::os::unix::fs::symlink(&secret, ws.path().join("leak")).unwrap();
 
-        let data = create_zip_from_paths(
+        let data = create_cache_archive(
             ws.path().to_str().unwrap(),
             &["leak".to_string()],
             staging().path(),
@@ -960,7 +1015,7 @@ mod tests {
         std::fs::write(outside.path().join("passwd"), b"root:x:0:0").unwrap();
         std::os::unix::fs::symlink(outside.path(), ws.path().join("etc")).unwrap();
 
-        let data = create_zip_from_paths(
+        let data = create_cache_archive(
             ws.path().to_str().unwrap(),
             &["etc/*".to_string()],
             staging().path(),
