@@ -29,7 +29,7 @@ async-trait = "0.1"
 # miniz_oxide and zopfli, which only serves compression levels above 9.
 # runtime_detection lets zlib-rs pick SSE/AVX2 code paths on x86_64.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
-zip = { version = "5", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
 bollard = "0.19"
 futures-util = "0.3"
 hmac = "0.12"

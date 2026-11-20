@@ -188,6 +188,16 @@ fn extract_zip_with_limits(
     )
 }
 
+/// Whether an archive entry name is absolute: a leading `/` or `\\`, or a
+/// Windows drive prefix like `C:`
+fn is_rooted_name(name: &[u8]) -> bool {
+    match name {
+        [b'/' | b'\\', ..] => true,
+        [drive, b':', ..] => drive.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
 /// Extract an untrusted ZIP archive into `workspace_path`.
 ///
 /// The whole archive is rejected if any entry would land outside the workspace
@@ -224,9 +234,20 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
     for i in 0..archive.len() {
         stop.check()?;
         let mut file = archive.by_index(i)?;
-        let rel_path = file
-            .enclosed_name()
-            .with_context(|| format!("Unsafe path in archive: {:?}", file.name()))?;
+        // zip's enclosed_name() turns "/etc/x" or "C:\x" into a relative path;
+        // an archive carrying such names is rejected instead
+        if is_rooted_name(file.name_raw()) {
+            anyhow::bail!(
+                "Unsafe path in archive: {:?}",
+                String::from_utf8_lossy(file.name_raw())
+            );
+        }
+        let rel_path = file.enclosed_name().with_context(|| {
+            format!(
+                "Unsafe path in archive: {:?}",
+                String::from_utf8_lossy(file.name_raw())
+            )
+        })?;
 
         if file.is_dir() {
             dirs.open(&root_dir, &rel_path)?;
@@ -849,7 +870,7 @@ mod tests {
     fn zip_names(data: &[u8]) -> Vec<String> {
         let mut archive = ZipArchive::new(std::io::Cursor::new(data)).unwrap();
         let mut names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         names.sort();
         names
@@ -879,6 +900,16 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!root.path().join("escaped.txt").exists());
+    }
+
+    #[test]
+    fn rooted_entry_names_are_detected() {
+        for name in ["/etc/passwd", "\\\\server\\x", "\\x", "C:\\x", "c:x"] {
+            assert!(is_rooted_name(name.as_bytes()), "{name}");
+        }
+        for name in ["a/b", "./a", "..", "dir:x", "1:x", ""] {
+            assert!(!is_rooted_name(name.as_bytes()), "{name}");
+        }
     }
 
     #[test]
