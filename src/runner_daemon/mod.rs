@@ -412,7 +412,9 @@ impl RunnerDaemon {
 
         Self {
             cache: job_cache::LocalCache::new(&config.cache_dir)
-                .with_max_age_days(config.cache_max_age_days),
+                .with_max_age_days(config.cache_max_age_days)
+                // Checked by `RunnerConfig::validate` when it was loaded
+                .with_max_size(config.cache_max_size_bytes().unwrap_or(None)),
             config: Arc::new(config),
             gitlab: Arc::new(gitlab),
             executor: Arc::new(executor),
@@ -1218,7 +1220,15 @@ impl RunnerDaemon {
                         .write(&format!("Created cache {} ({} bytes)\n", key, saved.size))
                         .await;
                     match saved.upload {
-                        Some(Ok(())) => {
+                        Some(Ok(job_cache::Upload::Unchanged)) => {
+                            trace
+                                .write(&format!(
+                                    "Cache {} unchanged, S3 holds it already: not uploaded\n",
+                                    key
+                                ))
+                                .await
+                        }
+                        Some(Ok(job_cache::Upload::Sent)) => {
                             trace
                                 .write(&format!(
                                     "Uploaded cache {} to S3 ({:.1} MB)\n",

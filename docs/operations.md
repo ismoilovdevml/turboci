@@ -39,7 +39,8 @@ behind (for example after a power loss). Containers of other runners on the
 same Docker daemon are never touched.
 
 The local cache removes archives not used for `cache_max_age_days` (default
-14). To see or clear it:
+14), and with `cache_max_size` the least recently used archives of any
+project once all of them together exceed that size. To see or clear it:
 
 ```bash
 turboci runner-stats -c /etc/turboci-runner.toml

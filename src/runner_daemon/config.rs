@@ -36,6 +36,10 @@ pub struct RunnerConfig {
     pub cache_dir: String,
     /// Cache archives not used for this many days are deleted (0 = keep forever)
     pub cache_max_age_days: u64,
+    /// Total size of the cache archives of all projects, such as "50g"; the
+    /// least recently used are deleted beyond it (unset or "0" = no limit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_max_size: Option<String>,
     /// Where the runner keeps state it must write, like a rotated runner token
     pub state_dir: String,
 
@@ -373,6 +377,7 @@ impl Default for RunnerConfig {
             cache_enabled: true,
             cache_dir: default_cache_dir(),
             cache_max_age_days: 14,
+            cache_max_size: None,
             state_dir: "/var/lib/turboci".to_string(),
             environment: Vec::new(),
             pre_get_sources_script: None,
@@ -496,6 +501,7 @@ impl RunnerConfig {
                 bad
             );
         }
+        self.cache_max_size_bytes()?;
         if let Some(s3) = &self.cache_s3 {
             super::s3::S3Location::parse(&s3.url, s3.region.as_deref())?;
             if s3.access_key.trim().is_empty() || s3.secret_key.trim().is_empty() {
@@ -509,6 +515,17 @@ impl RunnerConfig {
                 other
             ),
         }
+    }
+
+    /// `cache_max_size` in bytes; `None` when unset or 0 (no limit)
+    pub fn cache_max_size_bytes(&self) -> Result<Option<u64>> {
+        let Some(value) = self.cache_max_size.as_deref() else {
+            return Ok(None);
+        };
+        let bytes = parse_size("cache_max_size", value)?;
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| anyhow::anyhow!("cache_max_size must not be negative"))?;
+        Ok((bytes > 0).then_some(bytes))
     }
 
     /// `cache_s3` to use: S3 is the job cache's second layer, so it is
@@ -698,6 +715,30 @@ mod tests {
                     .unwrap();
             assert!(config.validate().is_err(), "accepted {}", bad);
         }
+    }
+
+    #[test]
+    fn parses_the_cache_size_limit() {
+        let size = |line: &str| {
+            let config = RunnerConfig::parse(&format!("runner_token = \"t\"\n{}", line)).unwrap();
+            config
+                .validate()
+                .map(|()| config.cache_max_size_bytes().unwrap())
+        };
+
+        assert_eq!(size("").unwrap(), None);
+        assert_eq!(size("cache_max_size = \"0\"").unwrap(), None);
+        assert_eq!(size("cache_max_size = \"20g\"").unwrap(), Some(20 << 30));
+        assert_eq!(size("cache_max_size = \"1048576\"").unwrap(), Some(1 << 20));
+        for bad in ["\"-1\"", "\"lots\"", "\"5t\""] {
+            assert!(
+                size(&format!("cache_max_size = {}", bad)).is_err(),
+                "accepted {}",
+                bad
+            );
+        }
+        let known = RunnerConfig::parse("runner_token = \"t\"\ncache_max_size = \"1g\"").unwrap();
+        assert!(unknown_keys("cache_max_size = \"1g\"", &known).is_empty());
     }
 
     #[test]

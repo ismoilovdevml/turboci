@@ -6,6 +6,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -17,6 +18,9 @@ pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c
 
 /// S3 accepts at most 5 GiB in one PUT
 const MAX_SINGLE_PUT: u64 = 5 << 30;
+
+/// Size of the pieces an upload is read in, and of the download's write buffer
+const IO_CHUNK: usize = 256 * 1024;
 
 const ATTEMPTS: u32 = 3;
 
@@ -176,23 +180,27 @@ fn percent_decode(text: &str) -> String {
 }
 
 /// When an upload body last handed a chunk to the connection. Without a
-/// body it stays at the start of the request.
+/// body it stays at the start of the request. Bumped for every chunk, so
+/// it is an atomic (nanoseconds after `start`) rather than a lock.
 #[derive(Clone)]
-struct Progress(Arc<Mutex<Instant>>);
+struct Progress(Arc<(Instant, AtomicU64)>);
 
 impl Progress {
     fn new() -> Self {
-        Self(Arc::new(Mutex::new(Instant::now())))
+        Self(Arc::new((Instant::now(), AtomicU64::new(0))))
     }
 
     fn bump(&self) {
-        if let Ok(mut last) = self.0.lock() {
-            *last = Instant::now();
-        }
+        let (start, last) = &*self.0;
+        let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        last.store(elapsed, Ordering::Relaxed);
     }
 
     fn idle(&self) -> Duration {
-        self.0.lock().map(|last| last.elapsed()).unwrap_or_default()
+        let (start, last) = &*self.0;
+        start
+            .elapsed()
+            .saturating_sub(Duration::from_nanos(last.load(Ordering::Relaxed)))
     }
 }
 
@@ -236,7 +244,59 @@ pub enum Download {
         file: tempfile::NamedTempFile,
         etag: Option<String>,
         bytes: u64,
+        /// SHA-256 of the object (hex), computed while it was received
+        sha256: String,
     },
+}
+
+/// The body of an upload: `file` read in `IO_CHUNK` pieces at increasing
+/// offsets (never through the shared file position, so an attempt that is
+/// still being torn down cannot move the next one's), bumping `progress`
+/// for every piece. Returns the length sent.
+fn upload_stream(
+    file: &std::fs::File,
+    progress: Progress,
+) -> Result<(
+    u64,
+    impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static,
+)> {
+    let source = Arc::new(file.try_clone().context("Failed to open the archive")?);
+    let len = source.metadata()?.len();
+    let stream = futures_util::stream::unfold((0u64, progress), move |(offset, progress)| {
+        let source = source.clone();
+        async move {
+            if offset >= len {
+                return None;
+            }
+            let want = (len - offset).min(IO_CHUNK as u64) as usize;
+            let read = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; want];
+                let n = source.read_at(&mut buf, offset)?;
+                buf.truncate(n);
+                Ok(buf)
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+            match read {
+                Ok(buf) if buf.is_empty() => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the archive shrank while it was uploaded",
+                    )),
+                    (len, progress),
+                )),
+                Ok(buf) => {
+                    progress.bump();
+                    let next = offset + buf.len() as u64;
+                    Some((Ok(buf), (next, progress)))
+                }
+                // Ends the stream after the error
+                Err(e) => Some((Err(e), (len, progress))),
+            }
+        }
+    });
+    Ok((len, stream))
 }
 
 /// A bucket (and prefix) holding cache archives. `Debug` is written by hand
@@ -378,7 +438,7 @@ impl Bucket {
         key: &str,
         payload_hash: &str,
         extra: &[(&str, String)],
-        body: Option<&Path>,
+        body: Option<&std::fs::File>,
     ) -> Result<reqwest::Response> {
         let path = self.object_path(key);
         let url = format!(
@@ -423,28 +483,8 @@ impl Bucket {
             }
             let progress = Progress::new();
             if let Some(file) = body {
-                let opened = tokio::fs::File::open(file)
-                    .await
-                    .with_context(|| format!("Failed to open {}", file.display()))?;
-                let len = opened.metadata().await?.len();
-                // Streamed in 64 KiB pieces; S3 needs the length up front
-                // (it rejects chunked uploads)
-                let stream = futures_util::stream::unfold(
-                    (opened, progress.clone()),
-                    |(mut file, progress)| async move {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = vec![0u8; 64 * 1024];
-                        match file.read(&mut buf).await {
-                            Ok(0) => None,
-                            Ok(n) => {
-                                buf.truncate(n);
-                                progress.bump();
-                                Some((Ok::<Vec<u8>, std::io::Error>(buf), (file, progress)))
-                            }
-                            Err(e) => Some((Err(e), (file, progress))),
-                        }
-                    },
-                );
+                let (len, stream) = upload_stream(file, progress.clone())?;
+                // S3 needs the length up front (it rejects chunked uploads)
                 request = request
                     .header("content-length", len)
                     .body(reqwest::Body::wrap_stream(stream));
@@ -507,7 +547,12 @@ impl Bucket {
             .map(str::to_string);
         let file = tempfile::NamedTempFile::new_in(dir)
             .with_context(|| format!("Failed to create a file in {}", dir.display()))?;
-        let mut out = tokio::fs::File::from_std(file.reopen()?);
+        // Network chunks are small (often 16 KiB): written in larger pieces
+        let mut out = tokio::io::BufWriter::with_capacity(
+            IO_CHUNK,
+            tokio::fs::File::from_std(file.reopen()?),
+        );
+        let mut hasher = Sha256::new();
         let mut bytes = 0u64;
         use tokio::io::AsyncWriteExt;
         while let Some(chunk) = tokio::time::timeout(self.stall_timeout, response.chunk())
@@ -520,34 +565,58 @@ impl Bucket {
             })
             .map_err(|e| self.trip(e))?
         {
+            hasher.update(&chunk);
             out.write_all(&chunk).await?;
             bytes += chunk.len() as u64;
         }
+        // Writes the rest of the buffer: the file is complete before it is used
         out.flush().await?;
-        Ok(Download::Downloaded { file, etag, bytes })
+        Ok(Download::Downloaded {
+            file,
+            etag,
+            bytes,
+            sha256: hex(&hasher.finalize()),
+        })
     }
 
-    /// Upload the file at `path` as `key`; returns the new object's ETag
-    pub async fn put_file(&self, key: &str, path: &Path) -> Result<Option<String>> {
-        // Before hashing: a large archive takes a while
+    /// Whether S3 still holds `key` with this `etag` (a HEAD request, no body)
+    pub async fn holds(&self, key: &str, etag: &str) -> Result<bool> {
+        let response = self
+            .send(
+                reqwest::Method::HEAD,
+                key,
+                EMPTY_SHA256,
+                &[("if-none-match", etag.to_string())],
+                None,
+            )
+            .await?;
+        match response.status().as_u16() {
+            304 => Ok(true),
+            200 | 404 => Ok(false),
+            _ => Err(status_error(response, self.stall_timeout).await),
+        }
+    }
+
+    /// Upload `file` as `key`; returns the new object's ETag. `sha256` is
+    /// the file's hash (hex), which the caller computed while writing it:
+    /// the payload is signed without reading the file twice. The file is
+    /// read at offsets, so the handle may be shared and is never moved.
+    pub async fn put_file(
+        &self,
+        key: &str,
+        file: &std::fs::File,
+        sha256: &str,
+    ) -> Result<Option<String>> {
         self.check_breaker(false)?;
-        let len = tokio::fs::metadata(path).await?.len();
+        let len = file.metadata()?.len();
         if len > MAX_SINGLE_PUT {
             anyhow::bail!(
                 "the archive is {} MB, above S3's 5 GiB single-upload limit",
                 len >> 20
             );
         }
-        let owned = path.to_path_buf();
-        let hash = tokio::task::spawn_blocking(move || -> Result<String> {
-            let mut file = std::fs::File::open(&owned)?;
-            let mut hasher = Sha256::new();
-            std::io::copy(&mut file, &mut hasher)?;
-            Ok(hex(&hasher.finalize()))
-        })
-        .await??;
         let response = self
-            .send(reqwest::Method::PUT, key, &hash, &[], Some(path))
+            .send(reqwest::Method::PUT, key, sha256, &[], Some(file))
             .await?;
         if !response.status().is_success() {
             return Err(status_error(response, self.stall_timeout).await);
@@ -833,10 +902,16 @@ mod tests {
             Download::NotModified
         ));
         match b.get_to_file(&key, None, dir.path()).await.unwrap() {
-            Download::Downloaded { file, etag, bytes } => {
+            Download::Downloaded {
+                file,
+                etag,
+                bytes,
+                sha256,
+            } => {
                 assert_eq!(std::fs::read(file.path()).unwrap(), b"zip-bytes");
                 assert_eq!(etag.as_deref(), Some("\"def\""));
                 assert_eq!(bytes, 9);
+                assert_eq!(sha256, hex(&Sha256::digest(b"zip-bytes")));
             }
             other => panic!("{:?}", other),
         }
@@ -907,11 +982,74 @@ mod tests {
         let file = dir.path().join("k.zip");
         std::fs::write(&file, &body).unwrap();
 
-        let etag = b.put_file(&b.object_key(3, "k.zip"), &file).await.unwrap();
+        let etag = b
+            .put_file(
+                &b.object_key(3, "k.zip"),
+                &std::fs::File::open(&file).unwrap(),
+                &hash,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(etag.as_deref(), Some("\"e1\""));
         let received = &server.received_requests().await.unwrap()[0];
         assert_eq!(received.body, body);
+    }
+
+    #[tokio::test]
+    async fn uploads_larger_than_a_chunk_arrive_whole() {
+        let server = MockServer::start().await;
+        let body: Vec<u8> = (0..IO_CHUNK * 2 + 123).map(|i| (i % 251) as u8).collect();
+        let hash = hex(&Sha256::digest(&body));
+        Mock::given(method("PUT"))
+            .and(header("x-amz-content-sha256", hash.as_str()))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let b = bucket(&server, "");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.zip");
+        std::fs::write(&file, &body).unwrap();
+
+        b.put_file(
+            &b.object_key(1, "big.zip"),
+            &std::fs::File::open(&file).unwrap(),
+            &hash,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(server.received_requests().await.unwrap()[0].body, body);
+    }
+
+    #[tokio::test]
+    async fn holds_tells_whether_the_object_is_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/ci-cache/project-1/k.zip"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/ci-cache/project-1/k.zip"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/ci-cache/project-1/gone.zip"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let b = bucket(&server, "");
+
+        assert!(b.holds(&b.object_key(1, "k.zip"), "\"v1\"").await.unwrap());
+        assert!(!b.holds(&b.object_key(1, "k.zip"), "\"v0\"").await.unwrap());
+        assert!(!b
+            .holds(&b.object_key(1, "gone.zip"), "\"v1\"")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1017,7 +1155,11 @@ mod tests {
         // A new bucket: the stalled GET opened this one's breaker
         let b = bucket(&server, "").with_stall_timeout(Duration::from_millis(300));
         let upload = b
-            .put_file(&b.object_key(1, "stuck.zip"), &file)
+            .put_file(
+                &b.object_key(1, "stuck.zip"),
+                &std::fs::File::open(&file).unwrap(),
+                EMPTY_SHA256,
+            )
             .await
             .unwrap_err();
         assert!(upload.to_string().contains("S3 stalled"), "{:#}", upload);
@@ -1056,7 +1198,11 @@ mod tests {
             skipped
         );
         let upload = other
-            .put_file(&other.object_key(1, "k.zip"), &file)
+            .put_file(
+                &other.object_key(1, "k.zip"),
+                &std::fs::File::open(&file).unwrap(),
+                EMPTY_SHA256,
+            )
             .await
             .unwrap_err();
         assert!(upload.to_string().contains("S3 skipped"), "{:#}", upload);

@@ -2,7 +2,9 @@
 //! kept on the runner host, at `<root>/project-<id>/<encoded key>.zip`, and with
 //! `cache_s3` also in a bucket shared by runners (gitlab-runner's distributed
 //! cache). The local copy is the first layer; `<archive>.etag` holds the ETag
-//! of its S3 object, so an unchanged object is not downloaded again.
+//! of its S3 object, so an unchanged object is not downloaded again, and
+//! `<archive>.sha256` the hash of that object, so an archive with the same
+//! content is not uploaded again.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -17,6 +19,9 @@ pub struct LocalCache {
     root: PathBuf,
     /// Archives unused for longer are deleted; `None` keeps them forever
     max_age: Option<std::time::Duration>,
+    /// Total size of all projects' archives; the least recently used go
+    /// first. `None`: no limit.
+    max_size: Option<u64>,
     /// S3 storage shared with other runners; the local directory is the first layer
     remote: Option<super::s3::Bucket>,
 }
@@ -52,18 +57,146 @@ pub struct Restore {
     pub warnings: Vec<String>,
 }
 
+/// What happened to a saved archive in S3
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Upload {
+    Sent,
+    /// S3 holds an object with the same content already: nothing was sent
+    Unchanged,
+}
+
 /// A saved archive and, with S3, whether it was uploaded
 #[derive(Debug)]
 pub struct Saved {
     pub size: u64,
-    pub upload: Option<std::result::Result<(), String>>,
+    pub upload: Option<std::result::Result<Upload, String>>,
 }
 
 /// File next to an archive holding the ETag of its S3 object
 fn sidecar(archive: &Path) -> PathBuf {
-    let mut name = archive.as_os_str().to_owned();
-    name.push(".etag");
+    with_suffix(archive, ".etag")
+}
+
+/// File next to an archive holding `<sha256> <etag>`: the hash of an S3
+/// object this host uploaded or downloaded, and that object's ETag. A new
+/// archive with that hash is not uploaded again while S3 still has that
+/// ETag. The pair is one fact about S3, true whatever the local archive is.
+fn hash_sidecar(archive: &Path) -> PathBuf {
+    with_suffix(archive, ".sha256")
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
     PathBuf::from(name)
+}
+
+/// Sidecar extensions: a sidecar goes with its archive
+const SIDECARS: [&str; 2] = ["etag", "sha256"];
+
+async fn read_hash_sidecar(archive: &Path) -> Option<(String, String)> {
+    let text = tokio::fs::read_to_string(hash_sidecar(archive))
+        .await
+        .ok()?;
+    let (sha256, etag) = text.split_once(' ')?;
+    (!sha256.is_empty() && !etag.is_empty()).then(|| (sha256.to_string(), etag.to_string()))
+}
+
+/// Record (or forget, without an ETag) the S3 object the archive came from
+/// or went to
+async fn write_sidecars(archive: &Path, etag: Option<&str>, sha256: &str) {
+    let _ = match etag {
+        Some(etag) => {
+            let _ = tokio::fs::write(sidecar(archive), etag).await;
+            tokio::fs::write(hash_sidecar(archive), format!("{} {}", sha256, etag)).await
+        }
+        None => {
+            let _ = tokio::fs::remove_file(sidecar(archive)).await;
+            tokio::fs::remove_file(hash_sidecar(archive)).await
+        }
+    };
+}
+
+fn remove_with_sidecars(archive: &Path) -> bool {
+    let removed = std::fs::remove_file(archive).is_ok();
+    for extension in SIDECARS {
+        let _ = std::fs::remove_file(with_suffix(archive, &format!(".{}", extension)));
+    }
+    removed
+}
+
+/// Remove archives of a project that were not used within `max_age`, and
+/// staging files a crash left behind
+fn evict_old(dir: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // A sidecar goes with its archive (its own age says nothing about use)
+        if path
+            .extension()
+            .is_some_and(|ext| SIDECARS.iter().any(|sidecar| ext == *sidecar))
+        {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if old {
+            remove_with_sidecars(&path);
+        }
+    }
+}
+
+/// Remove the least recently used archives of all projects under `root`
+/// until they take at most `max_size` bytes. `keep`, the archive just
+/// saved or downloaded, stays even if it is larger on its own.
+fn evict_over_size(root: &Path, max_size: u64, keep: &Path) {
+    let mut archives: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let Ok(projects) = std::fs::read_dir(root) else {
+        return;
+    };
+    for project in projects.flatten() {
+        let Ok(files) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_none_or(|ext| ext != "zip") {
+                continue;
+            }
+            let Ok(meta) = file.metadata() else { continue };
+            if meta.is_file() {
+                let used = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                archives.push((used, meta.len(), path));
+            }
+        }
+    }
+    let mut total: u64 = archives.iter().map(|(_, len, _)| len).sum();
+    if total <= max_size {
+        return;
+    }
+    archives.sort();
+    let (mut removed, mut freed) = (0usize, 0u64);
+    for (_, len, path) in archives {
+        if total <= max_size {
+            break;
+        }
+        if path != keep && remove_with_sidecars(&path) {
+            total -= len;
+            removed += 1;
+            freed += len;
+        }
+    }
+    tracing::info!(
+        "Cache above cache_max_size: removed {} least recently used archives ({:.1} MB)",
+        removed,
+        freed as f64 / 1_048_576.0
+    );
 }
 
 /// Percent-encode a cache key into a single safe file name component; long keys
@@ -99,6 +232,7 @@ impl LocalCache {
         Self {
             root: root.into(),
             max_age: None,
+            max_size: None,
             remote: None,
         }
     }
@@ -115,30 +249,31 @@ impl LocalCache {
         self
     }
 
-    /// Remove archives of a project that were not used within `max_age`, and
-    /// staging files a crash left behind
-    fn evict(&self, dir: &Path) {
-        let Some(max_age) = self.max_age else { return };
-        let Ok(entries) = std::fs::read_dir(dir) else {
+    /// Keep the archives of all projects within `bytes`, deleting the least
+    /// recently used first (`None` or 0: no limit)
+    pub fn with_max_size(mut self, bytes: Option<u64>) -> Self {
+        self.max_size = bytes.filter(|bytes| *bytes > 0);
+        self
+    }
+
+    /// Apply the age limit to `dir` (a project's directory) and the size
+    /// limit to the whole cache, off the async runtime; `keep` is the
+    /// archive just written
+    async fn evict(&self, dir: &Path, keep: &Path) {
+        let (max_age, max_size) = (self.max_age, self.max_size);
+        if max_age.is_none() && max_size.is_none() {
             return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // A sidecar goes with its archive (its own age says nothing about use)
-            if path.extension().is_some_and(|ext| ext == "etag") {
-                continue;
-            }
-            let old = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > max_age);
-            if old {
-                let _ = std::fs::remove_file(&path);
-                let _ = std::fs::remove_file(sidecar(&path));
-            }
         }
+        let (root, dir, keep) = (self.root.clone(), dir.to_path_buf(), keep.to_path_buf());
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(max_age) = max_age {
+                evict_old(&dir, max_age);
+            }
+            if let Some(max_size) = max_size {
+                evict_over_size(&root, max_size, &keep);
+            }
+        })
+        .await;
     }
 
     fn archive_path(&self, project_id: u64, key: &str) -> PathBuf {
@@ -184,9 +319,13 @@ impl LocalCache {
             match tokio::fs::metadata(&path).await {
                 Ok(_) => {
                     // Mark the archive as used, so eviction keeps it
-                    if let Ok(file) = std::fs::File::options().append(true).open(&path) {
-                        let _ = file.set_modified(std::time::SystemTime::now());
-                    }
+                    let touched = path.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(file) = std::fs::File::options().append(true).open(&touched) {
+                            let _ = file.set_modified(std::time::SystemTime::now());
+                        }
+                    })
+                    .await;
                     artifacts::extract_archive_file(&path, workspace, stop).await?;
                     outcome.hit = Some((key.clone(), source));
                     return Ok(outcome);
@@ -213,7 +352,7 @@ impl LocalCache {
 
         let dir = path.parent().unwrap_or(Path::new("."));
         tokio::fs::create_dir_all(dir).await?;
-        let etag = if path.exists() {
+        let etag = if tokio::fs::try_exists(path).await.unwrap_or(false) {
             tokio::fs::read_to_string(sidecar(path)).await.ok()
         } else {
             None
@@ -222,17 +361,17 @@ impl LocalCache {
         match remote.get_to_file(&object, etag.as_deref(), dir).await? {
             Download::NotModified => Ok(Some(Source::S3NotModified)),
             Download::NotFound => Ok(None),
-            Download::Downloaded { file, etag, bytes } => {
+            Download::Downloaded {
+                file,
+                etag,
+                bytes,
+                sha256,
+            } => {
                 file.persist(path)
                     .with_context(|| format!("Failed to save {}", path.display()))?;
-                match etag {
-                    Some(etag) => tokio::fs::write(sidecar(path), etag).await?,
-                    None => {
-                        let _ = tokio::fs::remove_file(sidecar(path)).await;
-                    }
-                }
+                write_sidecars(path, etag.as_deref(), &sha256).await;
                 // Hosts that only pull must keep the local layer bounded too
-                self.evict(dir);
+                self.evict(dir, path).await;
                 Ok(Some(Source::S3Downloaded(bytes)))
             }
         }
@@ -258,36 +397,65 @@ impl LocalCache {
             return Ok(None);
         };
         let len = archive.len;
-        archive
+        let sha256 = archive
+            .sha256
+            .clone()
+            .context("Cache archive written without its hash")?;
+        // The handle uploads this archive even if a concurrent job saving
+        // the same key renames its own into place meanwhile
+        let file = archive
             .file
             .persist(&path)
             .with_context(|| format!("Failed to save {}", path.display()))?;
         let upload = match &self.remote {
             None => {
                 // Without S3 the old ETag describes nothing any more
-                let _ = tokio::fs::remove_file(sidecar(&path)).await;
+                write_sidecars(&path, None, &sha256).await;
                 None
             }
             Some(remote) => {
-                // Until the upload succeeds the sidecar keeps the ETag of the
-                // object this archive replaced: while S3 still holds that
-                // object, a restore gets 304 and keeps this newer archive.
-                // A failed or interrupted upload leaves it that way.
                 let object = remote.object_key(project_id, &format!("{}.zip", encode_key(key)));
-                Some(match remote.put_file(&object, &path).await {
-                    Ok(etag) => {
-                        let _ = match etag {
-                            Some(etag) => tokio::fs::write(sidecar(&path), etag).await,
-                            None => tokio::fs::remove_file(sidecar(&path)).await,
-                        };
-                        Ok(())
-                    }
-                    Err(e) => Err(format!("{:#}", e)),
-                })
+                Some(upload(remote, &object, &path, &file, &sha256).await)
             }
         };
-        self.evict(dir);
+        drop(file);
+        self.evict(dir, &path).await;
         Ok(Some(Saved { size: len, upload }))
+    }
+}
+
+/// Upload the archive at `path` (open as `file`, hashing to `sha256`) as
+/// `object`, unless S3 holds the same content already
+async fn upload(
+    remote: &super::s3::Bucket,
+    object: &str,
+    path: &Path,
+    file: &std::fs::File,
+    sha256: &str,
+) -> std::result::Result<Upload, String> {
+    // Archives are deterministic (sorted entries, fixed timestamps): the
+    // same files give the same hash, typically a pull-push cache the job did
+    // not change. One HEAD request then replaces the upload.
+    if let Some((known, etag)) = read_hash_sidecar(path).await {
+        if known == sha256 {
+            match remote.holds(object, &etag).await {
+                Ok(true) => return Ok(Upload::Unchanged),
+                Ok(false) => {}
+                // The upload below reports S3's state
+                Err(e) => tracing::debug!("Cannot compare the cache with S3: {:#}", e),
+            }
+        }
+    }
+    // Until the upload succeeds the sidecar keeps the ETag of the object
+    // this archive replaced: while S3 still holds that object, a restore
+    // gets 304 and keeps this newer archive. A failed or interrupted upload
+    // leaves it that way.
+    match remote.put_file(object, file, sha256).await {
+        Ok(etag) => {
+            write_sidecars(path, etag.as_deref(), sha256).await;
+            Ok(Upload::Sent)
+        }
+        Err(e) => Err(format!("{:#}", e)),
     }
 }
 
@@ -343,7 +511,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(saved.upload, Some(Ok(())));
+        assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
         assert_eq!(
             std::fs::read_to_string(host_a.path().join("project-5/main.zip.etag")).unwrap(),
             "\"v1\""
@@ -597,7 +765,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(saved.upload, Some(Ok(())));
+        assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
         assert!(!sidecar(&archive).exists());
     }
 
@@ -906,6 +1074,171 @@ mod tests {
         assert!(cache.archive_path(1, "fresh").exists());
     }
 
+    /// Set the last use of `file` to `days` days ago
+    fn used_days_ago(file: &Path, days: u64) {
+        std::fs::File::options()
+            .append(true)
+            .open(file)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400),
+            )
+            .unwrap();
+    }
+
+    /// pull-push: a job that restored a cache and did not change it does not
+    /// upload it again; a changed one is uploaded
+    #[tokio::test]
+    async fn an_unchanged_cache_is_not_uploaded_again() {
+        let server = MockServer::start().await;
+        // S3 holds, as "v1", an archive of the files another host saved
+        let producer = workspace("dep");
+        let elsewhere = tempdir().unwrap();
+        LocalCache::new(elsewhere.path())
+            .save(
+                5,
+                "main",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        let archive = std::fs::read(elsewhere.path().join("project-5/main.zip")).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/main.zip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(archive),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/ci/project-5/main.zip"))
+            .and(wiremock::matchers::header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/ci/project-5/main.zip"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v2\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+        let job = tempdir().unwrap();
+        let job_path = job.path().to_str().unwrap();
+        let restored = cache
+            .restore(5, &["main".to_string()], job_path, &Stop::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(restored.hit, Some((_, Source::S3Downloaded(_)))),
+            "{:?}",
+            restored
+        );
+
+        let unchanged = cache
+            .save(5, "main", job_path, &["vendor".to_string()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.upload, Some(Ok(Upload::Unchanged)));
+
+        std::fs::write(job.path().join("vendor/lib.txt"), "changed").unwrap();
+        let changed = cache
+            .save(5, "main", job_path, &["vendor".to_string()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.upload, Some(Ok(Upload::Sent)));
+        let local = cache.archive_path(5, "main");
+        assert_eq!(std::fs::read_to_string(sidecar(&local)).unwrap(), "\"v2\"");
+        let hash = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(std::fs::read(&local).unwrap()))
+        };
+        assert_eq!(
+            std::fs::read_to_string(hash_sidecar(&local)).unwrap(),
+            format!("{} \"v2\"", hash)
+        );
+    }
+
+    /// The same content is uploaded again once S3 lost the object (expired
+    /// by a lifecycle rule, say)
+    #[tokio::test]
+    async fn an_unchanged_cache_s3_lost_is_uploaded_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v1\""))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+        let ws = workspace("dep");
+        let ws_path = ws.path().to_str().unwrap();
+
+        for _ in 0..2 {
+            let saved = cache
+                .save(5, "main", ws_path, &["vendor".to_string()])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_size_limit_removes_the_least_recently_used_archives_of_all_projects() {
+        let root = tempdir().unwrap();
+        let ws = workspace("dep");
+        let ws_path = ws.path().to_str().unwrap();
+        let paths = ["vendor".to_string()];
+        let unlimited = LocalCache::new(root.path());
+        for project in 1..=3 {
+            unlimited
+                .save(project, "main", ws_path, &paths)
+                .await
+                .unwrap();
+        }
+        let archive = |project| unlimited.archive_path(project, "main");
+        for (project, days) in [(1, 3), (2, 2), (3, 1)] {
+            used_days_ago(&archive(project), days);
+        }
+        std::fs::write(sidecar(&archive(1)), "\"e\"").unwrap();
+        std::fs::write(hash_sidecar(&archive(1)), "h \"e\"").unwrap();
+        let size = std::fs::metadata(archive(1)).unwrap().len();
+
+        // Four archives, room for two and a half
+        LocalCache::new(root.path())
+            .with_max_size(Some(size * 5 / 2))
+            .save(4, "main", ws_path, &paths)
+            .await
+            .unwrap();
+
+        assert!(!archive(1).exists() && !archive(2).exists());
+        assert!(!sidecar(&archive(1)).exists() && !hash_sidecar(&archive(1)).exists());
+        assert!(archive(3).exists() && archive(4).exists());
+
+        // The archive just saved stays, even alone above the limit
+        LocalCache::new(root.path())
+            .with_max_size(Some(1))
+            .save(5, "main", ws_path, &paths)
+            .await
+            .unwrap();
+        assert!(archive(5).exists());
+        assert!(!archive(3).exists() && !archive(4).exists());
+        assert_eq!(unlimited.stats().0, 1);
+    }
+
     /// Runs `docker` with `args`, returning stdout
     fn docker(args: &[&str]) -> String {
         let output = std::process::Command::new("docker")
@@ -999,7 +1332,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(saved.upload, Some(Ok(())));
+        assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
 
         let consumer = tempdir().unwrap();
         let first = cache_b

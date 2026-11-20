@@ -19,6 +19,7 @@ gitlab_url = "https://gitlab.example.com"
 cache_enabled = true
 cache_dir = "/var/lib/turboci/cache"
 cache_max_age_days = 14
+# cache_max_size = "50g"
 state_dir = "/var/lib/turboci"
 
 [executor]
@@ -111,6 +112,7 @@ writes the runner's side with `--proxy URL --no-proxy LIST`.
 | `cache_enabled` | `true` | Enables `cache:` in jobs |
 | `cache_dir` | `/var/lib/turboci/cache` | Local cache, one directory per project |
 | `cache_max_age_days` | `14` | Archives not used for this many days are deleted (`0` keeps them forever) |
+| `cache_max_size` | unset | Total size of the archives of all projects (`"512m"`, `"50g"`, bytes); after each save or download the least recently used archives are deleted until the cache fits, whatever their project. The archive just written is kept even if it is larger on its own. Unset or `"0"`: no limit |
 
 Without `cache_s3` the cache is local to the runner host, like gitlab-runner
 without a distributed cache. Archives are written to a temporary file and
@@ -154,12 +156,18 @@ archives work.
 `cache_dir` stays the first layer. To restore, the runner asks S3 whether the
 archive changed (`If-None-Match`): an unchanged one is taken from the local
 disk, a changed one is downloaded. Saved archives are written locally and
-uploaded. The job log shows which happened:
+uploaded. An archive is the same for the same files (entries in path order,
+fixed timestamps), so a `pull-push` cache the job did not change is not
+uploaded again: the runner keeps the SHA-256 of the object it last
+downloaded or uploaded (`<archive>.sha256`) and, when the new archive has
+that hash, only checks with a HEAD request that S3 still holds that object.
+The job log shows which happened:
 
 ```
 Successfully restored cache main (S3: not modified, local copy)
 Successfully restored cache main (downloaded 120.0 MB from S3)
 Uploaded cache main to S3 (45.2 MB)
+Cache main unchanged, S3 holds it already: not uploaded
 ```
 
 When S3 cannot be reached the job uses the local copy and the log shows a

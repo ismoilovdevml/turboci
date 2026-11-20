@@ -41,6 +41,10 @@ cache_enabled = true
 cache_dir = "/var/lib/turboci/cache"
 # Cache archives not used for this many days are deleted (0 = keep forever)
 cache_max_age_days = 14
+# Total size of the cache archives of all projects ("512m", "50g", bytes);
+# beyond it the least recently used archives are deleted, whatever their
+# project. Unset or "0": no limit (only cache_max_age_days applies)
+# cache_max_size = "50g"
 # Share the cache between runner hosts through S3-compatible storage
 # (MinIO, AWS S3, Ceph, R2, ...); cache_dir stays the local first layer
 # [cache_s3]
