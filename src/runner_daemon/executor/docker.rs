@@ -1117,35 +1117,45 @@ struct DockerRunner<'a> {
 
 impl DockerRunner<'_> {
     /// Kill every process in the container except its init (the idle loop), so a
-    /// timed-out or canceled script stops before after_script runs. Runs `kill`
-    /// directly (no shell), as root, bounded in time.
+    /// timed-out or canceled script stops before after_script runs. Runs the
+    /// `kill` binary directly (no shell), as root, bounded in time; images
+    /// without one (distroless, scratch-based) use sh's builtin `kill`
+    /// instead: sh is always there, the container's idle loop runs in it.
     async fn stop_scripts(&self) {
-        let stop = async {
-            let exec = self
-                .docker
-                .create_exec(
-                    self.container_id,
-                    CreateExecOptions {
-                        cmd: Some(vec!["kill", "-KILL", "-1"]),
-                        user: Some("0"),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            if let StartExecResults::Attached { mut output, .. } =
-                self.docker.start_exec(&exec.id, None).await?
-            {
-                while output.next().await.is_some() {}
+        let mut problem = String::new();
+        for cmd in [&["kill", "-KILL", "-1"][..], &["sh", "-c", "kill -9 -1"]] {
+            match tokio::time::timeout(Duration::from_secs(10), self.exec_as_root(cmd)).await {
+                Ok(Ok(0)) => return,
+                Ok(Ok(code)) => problem = format!("{} exited with {}", cmd[0], code),
+                Ok(Err(e)) => problem = format!("{}: {:#}", cmd[0], e),
+                Err(_) => problem = format!("{}: timed out", cmd[0]),
             }
-            anyhow::Ok(())
-        };
-        match tokio::time::timeout(Duration::from_secs(10), stop).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Could not stop the script: {:#}", e),
-            Err(_) => warn!("Could not stop the script: timed out"),
         }
+        warn!("Could not stop the script: {}", problem);
+    }
+
+    /// Run `cmd` as root in the container and return its exit code
+    async fn exec_as_root(&self, cmd: &[&str]) -> Result<i64> {
+        let exec = self
+            .docker
+            .create_exec(
+                self.container_id,
+                CreateExecOptions {
+                    cmd: Some(cmd.to_vec()),
+                    user: Some("0"),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if let StartExecResults::Attached { mut output, .. } =
+            self.docker.start_exec(&exec.id, None).await?
+        {
+            while output.next().await.is_some() {}
+        }
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        Ok(inspect.exit_code.unwrap_or(-1))
     }
 }
 
@@ -1784,23 +1794,58 @@ mod tests {
         assert!(kept, "another runner's container was removed");
     }
 
+    /// An executor with alpine:3.20 already present: the job timeout includes
+    /// image pulls, which short timeouts in tests must not depend on
+    async fn with_alpine_pulled() -> ExecutorType {
+        let executor = DockerExecutor::new(DockerConfig {
+            pull_policy: "if-not-present".to_string(),
+            ..DockerConfig::default()
+        })
+        .unwrap();
+        executor.pull_if_missing("alpine:3.20").await.unwrap();
+        ExecutorType::Docker(executor)
+    }
+
     #[tokio::test]
     #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_timeout_stops_the_script_before_after_script() {
-        let executor = ExecutorType::Docker(
-            DockerExecutor::new(DockerConfig {
-                pull_policy: "if-not-present".to_string(),
-                ..DockerConfig::default()
-            })
-            .unwrap(),
-        );
+        let executor = with_alpine_pulled().await;
         let job_id = 960_000_000 + u64::from(std::process::id());
         let j = job(serde_json::json!({
             "id": job_id, "token": "t",
             "image": {"name": "alpine:3.20"},
-            "runner_info": {"timeout": 2},
+            "runner_info": {"timeout": 4},
             "steps": steps(
                 &["sleep 30"],
+                &["if ps | grep -v grep | grep -q 'sleep 30'; then echo script-still-running; else echo script-stopped; fi"]
+            )
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::JobExecutionTimeout
+        );
+        assert!(log.contains("script-stopped"), "{}", log);
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_timeout_stops_the_script_in_an_image_without_kill() {
+        let executor = with_alpine_pulled().await;
+        let job_id = 961_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "alpine:3.20"},
+            "runner_info": {"timeout": 4},
+            "steps": steps(
+                &["rm -f /bin/kill /usr/bin/kill", "sleep 30"],
                 &["if ps | grep -v grep | grep -q 'sleep 30'; then echo script-still-running; else echo script-stopped; fi"]
             )
         }));
