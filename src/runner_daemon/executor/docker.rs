@@ -67,6 +67,14 @@ fn workspace_owner(dir: &Path) -> Option<String> {
     }
 }
 
+fn pull_failure(message: String) -> JobFailure {
+    JobFailure {
+        reason: FailureReason::ImagePullFailure,
+        exit_code: None,
+        message,
+    }
+}
+
 /// `work`, dropped with an error once `limits` (when given) are reached
 async fn within<T>(
     limits: Option<&Limits<'_>>,
@@ -376,37 +384,6 @@ impl DockerExecutor {
             .write(&format!("Using Docker executor with image {} ...\n", image))
             .await;
         info!("🐳 Using Docker image: {}", image);
-        self.ensure_image(&image, Some(&policies), job, trace, &limits)
-            .await?;
-
-        write_variable_files(&env)
-            .await
-            .map_err(JobFailure::system)?;
-        let subdir = script::project_subdir(job).map_err(JobFailure::system)?;
-        tokio::fs::create_dir_all(job_dir.join(&subdir))
-            .await
-            .map_err(|e| JobFailure::system(format!("Failed to create host workspace: {}", e)))?;
-
-        if job.git_info.is_some()
-            && git::strategy(&job.variables, job.allow_git_fetch) != GitStrategy::None
-        {
-            let helper = self.config.helper_image.clone();
-            self.ensure_image(&helper, None, job, trace, &limits)
-                .await?;
-            // Container API calls are not interrupted (a dropped create could
-            // leave a container nobody removes), so a cancel is seen between them
-            limits.check(job)?;
-            let id = self
-                .start_helper(job, job_dir, &env)
-                .await
-                .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-            containers.helper = Some(id);
-        }
-
-        let volumes = self
-            .job_volumes(job)
-            .await
-            .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
         // Services from the runner config come first, then the job's own
         let services: Vec<crate::gitlab::Service> = self
             .config
@@ -422,6 +399,47 @@ impl DockerExecutor {
             })
             .chain(job.services.iter().cloned())
             .collect();
+        let service_images: Vec<String> = services.iter().map(|s| expand(&s.name)).collect();
+        let checkout = job.git_info.is_some()
+            && git::strategy(&job.variables, job.allow_git_fetch) != GitStrategy::None;
+
+        // The job image, the helper (only to check out sources) and the
+        // service images are pulled at the same time
+        let mut images = vec![(image.as_str(), Some(policies.as_slice()))];
+        if checkout {
+            images.push((self.config.helper_image.as_str(), None));
+        }
+        images.extend(
+            service_images
+                .iter()
+                .zip(&services)
+                .map(|(name, service)| (name.as_str(), Some(service.pull_policy.as_slice()))),
+        );
+        self.ensure_images(&images, job, trace, &limits).await?;
+
+        write_variable_files(&env)
+            .await
+            .map_err(JobFailure::system)?;
+        let subdir = script::project_subdir(job).map_err(JobFailure::system)?;
+        tokio::fs::create_dir_all(job_dir.join(&subdir))
+            .await
+            .map_err(|e| JobFailure::system(format!("Failed to create host workspace: {}", e)))?;
+
+        if checkout {
+            // Container API calls are not interrupted (a dropped create could
+            // leave a container nobody removes), so a cancel is seen between them
+            limits.check(job)?;
+            let id = self
+                .start_helper(job, job_dir, &env)
+                .await
+                .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+            containers.helper = Some(id);
+        }
+
+        let volumes = self
+            .job_volumes(job)
+            .await
+            .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
 
         // Services need a network of their own to be reachable by alias
         if !services.is_empty() {
@@ -432,19 +450,10 @@ impl DockerExecutor {
                 .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
             containers.network = Some(network);
         }
-        for (index, service) in services.iter().enumerate() {
-            let service_image = expand(&service.name);
+        for (index, (service, service_image)) in services.iter().zip(service_images).enumerate() {
             trace
                 .write(&format!("Starting service {} ...\n", service_image))
                 .await;
-            self.ensure_image(
-                &service_image,
-                Some(&service.pull_policy),
-                job,
-                trace,
-                &limits,
-            )
-            .await?;
             limits.check(job)?;
             let mut host_config = self.host_config(volumes.clone(), containers.network.as_deref());
             let mut service = service.clone();
@@ -619,7 +628,7 @@ impl DockerExecutor {
     /// Registry login for `image`, in gitlab-runner's order: the job's
     /// DOCKER_AUTH_CONFIG, the runner's Docker config file, then the
     /// credentials GitLab sent (its container registry)
-    fn registry_login(&self, image: &str, job: &Job) -> Option<(String, String)> {
+    async fn registry_login(&self, image: &str, job: &Job) -> Option<(String, String)> {
         if let Some(login) = variable_value(job, "DOCKER_AUTH_CONFIG")
             .and_then(|config| image::docker_config_auth(config, image))
         {
@@ -630,92 +639,106 @@ impl DockerExecutor {
                 .ok()
                 .map(|home| format!("{}/.docker/config.json", home))
         });
-        if let Some(login) = file
-            .and_then(|file| std::fs::read_to_string(file).ok())
-            .and_then(|config| image::docker_config_auth(&config, image))
-        {
+        let config = match file {
+            Some(file) => tokio::fs::read_to_string(file).await.ok(),
+            None => None,
+        };
+        if let Some(login) = config.and_then(|config| image::docker_config_auth(&config, image)) {
             return Some(login);
         }
         image::credentials_for(image, &job.credentials)
             .map(|c| (c.username.clone(), c.password.clone()))
     }
 
-    /// Make `image` available according to the pull policy, using the registry
-    /// credentials GitLab sent with the job
-    /// `job_policies` is `None` for the runner's own helper image, which is pulled
-    /// only when missing
-    async fn ensure_image(
+    /// Make `images` available according to their pull policies, pulling the
+    /// ones that need it at the same time (each image once), with the registry
+    /// credentials of `registry_login`. A `None` policy is for the runner's
+    /// own helper image, which is pulled only when missing.
+    async fn ensure_images(
         &self,
-        image: &str,
-        job_policies: Option<&[String]>,
+        images: &[(&str, Option<&[String]>)],
         job: &Job,
         trace: &mut TraceWriter<'_>,
         limits: &Limits<'_>,
     ) -> JobOutcome {
-        let pull_failure = |message: String| JobFailure {
-            reason: FailureReason::ImagePullFailure,
-            exit_code: None,
-            message,
-        };
-        let reference = image::with_default_tag(image);
-        let present = self.docker.inspect_image(&reference).await.is_ok();
-        let policy = match job_policies {
-            None => PullPolicy::IfNotPresent,
-            Some(policies) => PullPolicy::resolve(
-                policies,
-                &self.config.pull_policy,
-                &self.config.allowed_pull_policies,
-            )
-            .map_err(pull_failure)?,
-        };
-        match policy {
-            PullPolicy::Never if present => return Ok(()),
-            PullPolicy::Never => {
-                return Err(pull_failure(format!(
-                    "image {} is not present and pull_policy is never",
-                    image
-                )))
+        let mut pulls: Vec<&str> = Vec::new();
+        for &(image, job_policies) in images {
+            let policy = match job_policies {
+                None => PullPolicy::IfNotPresent,
+                Some(policies) => PullPolicy::resolve(
+                    policies,
+                    &self.config.pull_policy,
+                    &self.config.allowed_pull_policies,
+                )
+                .map_err(pull_failure)?,
+            };
+            let reference = image::with_default_tag(image);
+            // `always` pulls whether the image is present or not
+            let present =
+                policy != PullPolicy::Always && self.docker.inspect_image(&reference).await.is_ok();
+            match policy {
+                PullPolicy::Never if present => {}
+                PullPolicy::Never => {
+                    return Err(pull_failure(format!(
+                        "image {} is not present and pull_policy is never",
+                        image
+                    )))
+                }
+                PullPolicy::IfNotPresent if present => {
+                    trace
+                        .write(&format!("Using locally found image {}\n", image))
+                        .await;
+                }
+                _ if pulls
+                    .iter()
+                    .any(|pull| image::with_default_tag(pull) == reference) => {}
+                _ => {
+                    trace.write(&format!("Pulling image {} ...\n", image)).await;
+                    pulls.push(image);
+                }
             }
-            PullPolicy::IfNotPresent if present => {
-                trace
-                    .write(&format!("Using locally found image {}\n", image))
-                    .await;
-                return Ok(());
-            }
-            _ => {}
         }
+        let pulling =
+            futures_util::future::try_join_all(pulls.iter().map(|image| self.pull(image, job)));
+        limits
+            .bound(pulling)
+            .await
+            .map_err(|stop| stop.failure(job))?
+            .map(drop)
+    }
 
-        trace.write(&format!("Pulling image {} ...\n", image)).await;
-        let credentials = self.registry_login(image, job).map(|(username, password)| {
-            bollard::auth::DockerCredentials {
+    /// Pull `image` from its registry
+    async fn pull(&self, image: &str, job: &Job) -> JobOutcome {
+        use bollard::image::CreateImageOptions;
+
+        let credentials = self
+            .registry_login(image, job)
+            .await
+            .map(|(username, password)| bollard::auth::DockerCredentials {
                 username: Some(username),
                 password: Some(password),
                 serveraddress: Some(image::registry(image).to_string()),
                 ..Default::default()
-            }
-        });
-        use bollard::image::CreateImageOptions;
+            });
+        let reference = image::with_default_tag(image);
         let options = Some(CreateImageOptions {
             from_image: reference.as_str(),
             ..Default::default()
         });
-        let pull = async {
-            let mut stream = self.docker.create_image(options, None, credentials);
-            while let Some(progress) = stream.next().await {
-                if let Err(e) = progress {
-                    let error = e.to_string();
-                    let hint = image::registry_pull_hint(&error, image::registry(image))
-                        .map(|hint| format!("\n{}", hint))
-                        .unwrap_or_default();
-                    return Err(pull_failure(format!(
-                        "failed to pull image {}: {}{}",
-                        image, error, hint
-                    )));
-                }
+        let mut stream = self.docker.create_image(options, None, credentials);
+        while let Some(progress) = stream.next().await {
+            if let Err(e) = progress {
+                let error = e.to_string();
+                let hint = image::registry_pull_hint(&error, image::registry(image))
+                    .map(|hint| format!("\n{}", hint))
+                    .unwrap_or_default();
+                return Err(pull_failure(format!(
+                    "failed to pull image {}: {}{}",
+                    image, error, hint
+                )));
             }
-            Ok(())
-        };
-        limits.bound(pull).await.map_err(|stop| stop.failure(job))?
+        }
+        Ok(())
     }
 
     /// Create a bridge network for the job (replacing a leftover one)
