@@ -196,9 +196,10 @@ run untagged jobs if the job has none. Check the runner's tags and the
 
 **`Permission denied` on job workspaces after upgrading from an old version**
 
-Versions that ran as root left root-owned workspaces. Remove them once:
+Versions that ran as root left root-owned workspaces, and versions up to
+0.9 kept them in `/tmp`, which the service no longer sees. Remove the old
+ones once:
 
 ```bash
 sudo rm -rf /tmp/turboci-builds /tmp/turboci
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/turboci.conf
 ```

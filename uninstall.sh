@@ -207,6 +207,8 @@ remove_workdir() {
     echo -e "\n${YELLOW}📁 Removing work directories...${NC}"
 
     DIRS="$STATE_DIR"
+    # Workspaces of versions up to 0.9 were in the host's /tmp, shared by
+    # every runner on the host
     [ -n "$OTHER_RUNNERS" ] || [ "$MACOS" -eq 1 ] || DIRS="$DIRS /tmp/turboci-builds /tmp/turboci"
     for dir in $DIRS; do
         if [ -d "$dir" ]; then
@@ -218,6 +220,7 @@ remove_workdir() {
     if [ "$MACOS" -eq 1 ] && [ -n "$STATE_DIR" ]; then
         rmdir "$(dirname "$STATE_DIR")" 2> /dev/null || true
     fi
+    # The rule versions up to 0.9 wrote to recreate /tmp/turboci-builds
     if [ -f "$TMPFILES_FILE" ]; then
         rm -f "$TMPFILES_FILE"
         echo -e "${GREEN}✓${NC} Removed: $TMPFILES_FILE"

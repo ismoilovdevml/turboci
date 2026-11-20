@@ -18,8 +18,8 @@ BIN_NAME="turboci"
 # beside a docker runner: its own service, config and state directory
 INSTANCE="${TURBOCI_NAME:-turboci}"
 SERVICE_USER="${TURBOCI_USER:-}"
-# The Docker executor currently uses this fixed host path for job workspaces.
-DOCKER_BUILDS_DIR="/tmp/turboci-builds"
+# Docker job workspaces of versions up to 0.9 (now <state dir>/builds)
+OLD_BUILDS_DIR="/tmp/turboci-builds"
 # Settings: command line options, or the TURBOCI_* environment variables
 EXECUTOR="${TURBOCI_EXECUTOR:-docker}"
 GITLAB_URL="${TURBOCI_URL:-https://gitlab.com}"
@@ -144,6 +144,7 @@ fi
 SERVICE_NAME="$INSTANCE"
 STATE_DIR="/var/lib/$INSTANCE"
 CONFIG_FILE="$CONFIG_DIR/$INSTANCE-runner.toml"
+# Written by versions up to 0.9 to recreate $OLD_BUILDS_DIR; removed on upgrade
 TMPFILES_FILE="/etc/tmpfiles.d/$INSTANCE.conf"
 ROOT_GROUP="root"
 # The config holds the runner token: owner, group and mode
@@ -284,6 +285,21 @@ detect_arch() {
     echo -e "${GREEN}✓${NC} Architecture: ${BLUE}$DISPLAY_ARCH${NC}"
 }
 
+# Whether a version ("v0.10.0", "0.9.1" or "turboci 0.10.0") keeps docker
+# workspaces in the state directory (0.10.0 and newer). Unknown versions
+# (none given: the latest release) pass.
+workspaces_in_state_dir() {
+    local version="${1##* }"
+    version="${version#v}"
+    local major="${version%%.*}"
+    local rest="${version#*.}"
+    local minor="${rest%%.*}"
+    if ! [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+    [ "$major" -gt 0 ] || [ "$minor" -ge 10 ]
+}
+
 # Check option values before changing anything on the host
 validate_options() {
     case "$GITLAB_URL" in
@@ -297,6 +313,19 @@ validate_options() {
     if [ -n "$LOCAL_BINARY" ] && [ ! -f "$LOCAL_BINARY" ]; then
         echo -e "${RED}❌ --binary: $LOCAL_BINARY not found${NC}"
         exit 1
+    fi
+    # Versions up to 0.9 keep docker workspaces in the host's /tmp, which the
+    # unit written here hides from the service (PrivateTmp)
+    if [ "$EXECUTOR" = "docker" ]; then
+        WANTED="$VERSION"
+        if [ -n "$LOCAL_BINARY" ]; then
+            WANTED=$("$LOCAL_BINARY" --version 2>/dev/null || true)
+        fi
+        if ! workspaces_in_state_dir "$WANTED"; then
+            echo -e "${RED}❌ TurboCI ${WANTED##* } keeps docker workspaces in /tmp; this installer is for v0.10.0 and newer.${NC}"
+            echo -e "${RED}   Use that release's installer: https://raw.githubusercontent.com/$REPO/v${WANTED##*[ v]}/install.sh${NC}"
+            exit 1
+        fi
     fi
     if [ -n "$TLS_CA_FILE" ] && ! grep -q "BEGIN CERTIFICATE" "$TLS_CA_FILE" 2>/dev/null; then
         echo -e "${RED}❌ --tls-ca-file: $TLS_CA_FILE is not a PEM certificate${NC}"
@@ -489,28 +518,16 @@ create_directories() {
     install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR" "$STATE_DIR/builds"
     echo -e "${GREEN}✓${NC} State directory: ${BLUE}$STATE_DIR${NC}"
 
-    # The shell executor does not use the Docker workspace directory
-    [ "$EXECUTOR" = "docker" ] || return 0
-
-    # Job containers run as root, so files they create in the workspace can
-    # not always be removed by the service user. Let systemd-tmpfiles create
-    # the workspace root with the right owner and age out leftovers.
-    if [ -d /etc/tmpfiles.d ]; then
-        echo "d $DOCKER_BUILDS_DIR 0750 $SERVICE_USER $SERVICE_GROUP 1d" > "$TMPFILES_FILE"
-        if command -v systemd-tmpfiles > /dev/null 2>&1; then
-            systemd-tmpfiles --create "$TMPFILES_FILE" || true
-        fi
-        echo -e "${GREEN}✓${NC} tmpfiles rule: ${BLUE}$TMPFILES_FILE${NC}"
+    # Upgrade from a version up to 0.9: workspaces are in $STATE_DIR/builds
+    # now, so the rule that recreated them in /tmp goes. The old directory
+    # stays: a draining old runner may still be using it.
+    if [ -f "$TMPFILES_FILE" ]; then
+        rm -f "$TMPFILES_FILE"
+        echo -e "${GREEN}✓${NC} Removed the old tmpfiles rule ${BLUE}$TMPFILES_FILE${NC}"
     fi
-
-    # Workspaces left behind by an earlier root-run install cannot be
-    # written or cleaned up by the unprivileged service user.
-    for dir in "$DOCKER_BUILDS_DIR" /tmp/turboci; do
-        if [ -e "$dir" ] && [ "$(stat -c %U "$dir" 2>/dev/null)" != "$SERVICE_USER" ]; then
-            echo -e "${YELLOW}⚠️  $dir exists and is not owned by $SERVICE_USER${NC}"
-            echo -e "${YELLOW}   Remove it before starting the service: rm -rf $dir${NC}"
-        fi
-    done
+    if [ "$MACOS" -eq 0 ] && [ -d "$OLD_BUILDS_DIR" ]; then
+        echo -e "${BLUE}ℹ️  $OLD_BUILDS_DIR holds workspaces of an older version; remove it once no old runner runs: rm -rf $OLD_BUILDS_DIR${NC}"
+    fi
 }
 
 # Create TurboCI config
@@ -633,14 +650,26 @@ create_service() {
 
     # Shell jobs run as the service user and use its home (SDKs, package
     # caches), so the home directories stay reachable and only /usr, /boot
-    # and /etc are read-only. Docker jobs only need the state directory.
+    # and /etc are read-only. Docker jobs only need the state directory:
+    # workspaces and the cache are in it.
     if [ "$EXECUTOR" = "shell" ]; then
         PROTECT="ProtectSystem=full
 ProtectHome=false"
     else
         PROTECT="ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$STATE_DIR /tmp"
+ReadWritePaths=$STATE_DIR"
+    fi
+    # The runner and its shell jobs get a /tmp of their own, emptied when the
+    # service stops. Docker workspaces must not be in it: dockerd bind-mounts
+    # them from the host's /tmp, so a kept config that puts them there keeps
+    # the host's /tmp.
+    PRIVATE_TMP="PrivateTmp=true"
+    if [ -f "$CONFIG_FILE" ] && grep -Eq '^[[:space:]]*builds_dir[[:space:]]*=[[:space:]]*"/tmp(/|")' "$CONFIG_FILE"; then
+        PRIVATE_TMP="PrivateTmp=false"
+        [ "$EXECUTOR" = "shell" ] || PROTECT="$PROTECT /tmp"
+        echo -e "${YELLOW}⚠️  $CONFIG_FILE puts builds_dir in /tmp: the service keeps the host's /tmp.${NC}"
+        echo -e "${YELLOW}   Remove builds_dir (default $STATE_DIR/builds) and run the installer again.${NC}"
     fi
 
     cat > "$SERVICE_FILE" << EOF
@@ -666,10 +695,7 @@ StandardError=journal
 
 # Security
 NoNewPrivileges=true
-# PrivateTmp must stay off: the Docker executor bind-mounts job workspaces
-# from $DOCKER_BUILDS_DIR, and dockerd resolves that path in the host's /tmp.
-# A private /tmp would hand every job container an empty workspace.
-PrivateTmp=false
+$PRIVATE_TMP
 $PROTECT
 ProtectKernelTunables=true
 ProtectKernelModules=true

@@ -12,6 +12,12 @@ cd "$(dirname "$0")/.."
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# An upgrade from a version up to 0.9 removes its tmpfiles rule for /tmp
+TMPFILES="/etc/tmpfiles.d/$NAME.conf"
+if [ -d /etc/tmpfiles.d ]; then
+    echo "d /tmp/turboci-builds 0750 $SUDO_USER $SUDO_USER 1d" > "$TMPFILES"
+fi
+
 bash install.sh --binary "$BINARY" --executor shell --name "$NAME" --user "$SUDO_USER"
 
 CONFIG="/etc/$NAME-runner.toml"
@@ -28,8 +34,16 @@ else
     UNIT="/etc/systemd/system/$NAME.service"
     STATE="/var/lib/$NAME"
     grep -q "^User=$SUDO_USER$" "$UNIT" || fail "unit does not run as $SUDO_USER"
+    grep -qx 'PrivateTmp=true' "$UNIT" || fail "unit has no private /tmp"
+    ! grep -q '/tmp' "$UNIT" || fail "unit still uses the host's /tmp"
+    # shellcheck disable=SC2016 # $MAINPID is systemd's, not the shell's
+    grep -qx 'ExecReload=/bin/kill -HUP $MAINPID' "$UNIT" || fail "unit cannot reload"
+    [ ! -e "$TMPFILES" ] || fail "old tmpfiles rule kept"
+    if command -v systemd-analyze > /dev/null 2>&1; then
+        systemd-analyze verify "$UNIT" || fail "systemd rejects the unit"
+    fi
     [ "$(stat -c '%U:%G %a' "$CONFIG")" = "root:$(id -gn "$SUDO_USER") 640" ] || fail "config permissions"
-    LEFT_BEHIND=("$UNIT" "$STATE")
+    LEFT_BEHIND=("$UNIT" "$STATE" "$TMPFILES")
 fi
 [ -d "$STATE/builds" ] || fail "no builds directory in $STATE"
 

@@ -152,10 +152,18 @@ executor and the registry options are Linux only.
 |---|---|
 | `/usr/local/bin/turboci` | The binary |
 | `/etc/turboci-runner.toml` | Configuration, including the runner token |
-| `/etc/systemd/system/turboci.service` | Service unit (hardened: `ProtectSystem=strict`, `NoNewPrivileges`, ...) |
+| `/etc/systemd/system/turboci.service` | Service unit (hardened: `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`, ...; `systemctl reload` sends `SIGHUP`) |
 | `/var/lib/turboci` | State: local cache, job workspaces (`builds/`), rotated token |
-| `/tmp/turboci-builds` | Docker job workspaces of versions up to 0.9 |
-| `/etc/tmpfiles.d/turboci.conf` | Recreates `/tmp/turboci-builds` after a reboot (versions up to 0.9) |
+
+The service gets a `/tmp` of its own (`PrivateTmp=true`), emptied when it
+stops; shell jobs see that one too. Versions up to 0.9 kept docker
+workspaces in `/tmp/turboci-builds`, recreated by
+`/etc/tmpfiles.d/turboci.conf`: an upgrade removes that rule and leaves the
+directory to you (`sudo rm -rf /tmp/turboci-builds` once no old runner is
+draining), and the uninstaller removes both. A kept config that sets
+`builds_dir` under `/tmp` keeps the host's `/tmp` (`PrivateTmp=false`), with
+a warning. The installer installs v0.10.0 or newer for the docker executor;
+for an older `--version` use the `install.sh` of that release.
 
 ## Manual installation
 
@@ -196,7 +204,7 @@ curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/uninstall
 It stops the service and removes the config (a `0600` backup is kept), the
 state directory, and the containers, networks and cache volumes the runner
 created. The service user is removed only if the installer created it. The
-binary, the shared workspace directory and `/etc/turboci-registry-ca` stay
+binary, the old shared `/tmp` workspace directory and `/etc/turboci-registry-ca` stay
 while other TurboCI runners are installed. Registry CAs installed for dockerd
 in `/etc/docker/certs.d` are never removed. On macOS it removes the launchd
 agent, the binary (unless other runners use it), the config and the state
