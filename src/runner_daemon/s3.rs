@@ -1,5 +1,6 @@
 //! S3-compatible object storage for the job cache: path-style URLs, SigV4
-//! header signing and the three calls the cache needs.
+//! header signing and the calls the cache needs (GET, HEAD, PUT, and the
+//! multipart upload of large archives).
 
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
@@ -16,8 +17,27 @@ use super::config::S3CacheConfig;
 /// SHA-256 of an empty payload (GET and HEAD requests)
 pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// S3 accepts at most 5 GiB in one PUT
-const MAX_SINGLE_PUT: u64 = 5 << 30;
+/// User metadata holding the SHA-256 of an uploaded archive: the same in a
+/// single PUT and a multipart upload, whose ETags differ for one content
+pub const META_SHA256: &str = "x-amz-meta-sha256";
+
+/// Archives larger than this are uploaded in parts. A single PUT takes at
+/// most 5 GiB and must start over after any failure.
+const MULTIPART_THRESHOLD: u64 = 64 << 20;
+
+/// Smallest part uploaded (S3 needs 5 MiB but for the last part); larger
+/// for archives that would need more than `MAX_PARTS` parts
+const MIN_PART_SIZE: u64 = 16 << 20;
+
+/// S3's limits on a multipart upload
+const MAX_PARTS: u64 = 10_000;
+const MAX_OBJECT_SIZE: u64 = 5 << 40;
+
+/// Parts uploaded at the same time
+const PART_CONCURRENCY: usize = 4;
+
+/// Longest XML reply read (CreateMultipartUpload, CompleteMultipartUpload)
+const MAX_REPLY: usize = 1 << 20;
 
 /// Size of the pieces an upload is read in, and of the download's write buffer
 const IO_CHUNK: usize = 256 * 1024;
@@ -53,6 +73,41 @@ fn encode_path(path: &str) -> String {
         .collect()
 }
 
+/// A query string as sent and as signed: parameters sorted by name, names
+/// and values percent-encoded but for unreserved characters. A parameter
+/// with an empty value is sent bare (`?uploads`) and signed as `uploads=`.
+fn encode_query(params: &[(&str, &str)]) -> (String, String) {
+    let encode = |text: &str| -> String {
+        text.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{:02X}", b),
+            })
+            .collect()
+    };
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
+        .map(|(name, value)| (encode(name), encode(value)))
+        .collect();
+    encoded.sort();
+    let sent = encoded
+        .iter()
+        .map(|(name, value)| match value.as_str() {
+            "" => name.clone(),
+            _ => format!("{}={}", name, value),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let signed = encoded
+        .iter()
+        .map(|(name, value)| format!("{}={}", name, value))
+        .collect::<Vec<_>>()
+        .join("&");
+    (sent, signed)
+}
+
 /// AWS Signature Version 4 for the `s3` service
 pub struct Signer<'a> {
     pub access_key: &'a str,
@@ -61,12 +116,14 @@ pub struct Signer<'a> {
 }
 
 impl Signer<'_> {
-    /// `Authorization` header for a request without a query string. `headers`
-    /// are the signed headers: lowercase names, trimmed values, sorted by name.
+    /// `Authorization` header of a request. `canonical_query` comes from
+    /// `encode_query`; `headers` are the signed headers: lowercase names,
+    /// trimmed values, sorted by name.
     pub fn authorization(
         &self,
         method: &str,
         canonical_uri: &str,
+        canonical_query: &str,
         headers: &[(&str, &str)],
         payload_hash: &str,
         amz_date: &str,
@@ -83,8 +140,8 @@ impl Signer<'_> {
             .collect::<Vec<_>>()
             .join(";");
         let canonical_request = format!(
-            "{}\n{}\n\n{}\n{}\n{}",
-            method, canonical_uri, canonical_headers, signed_headers, payload_hash
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method, canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash
         );
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}\n{}",
@@ -255,26 +312,176 @@ pub enum Download {
     },
 }
 
-/// The body of an upload: `file` read in `IO_CHUNK` pieces at increasing
-/// offsets (never through the shared file position, so an attempt that is
-/// still being torn down cannot move the next one's), bumping `progress`
-/// for every piece. Returns the length sent.
+/// What an object's HEAD tells about it
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectInfo {
+    pub etag: Option<String>,
+    /// `x-amz-meta-sha256`: the hash of the archive, set by the runners that
+    /// upload it
+    pub sha256: Option<String>,
+}
+
+/// The body of a request
+#[derive(Clone, Copy)]
+enum Payload<'a> {
+    Empty,
+    /// `len` bytes of `file` from `offset`, hashing to `sha256` (hex)
+    File {
+        file: &'a std::fs::File,
+        offset: u64,
+        len: u64,
+        sha256: &'a str,
+    },
+    /// A short body (the XML of CompleteMultipartUpload)
+    Bytes(&'a [u8]),
+}
+
+/// A part of a multipart upload: `len` bytes of the file from `offset`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Part {
+    number: u32,
+    offset: u64,
+    len: u64,
+}
+
+/// Split `len` bytes into parts of `min_part` bytes (whole MiB), larger when
+/// that would make more than `MAX_PARTS` parts; the last part takes the rest
+fn plan_parts(len: u64, min_part: u64) -> Result<Vec<Part>> {
+    if len > MAX_OBJECT_SIZE {
+        anyhow::bail!(
+            "the archive is {} GB, above S3's 5 TiB object limit",
+            len >> 30
+        );
+    }
+    const MIB: u64 = 1 << 20;
+    let needed = len.div_ceil(MAX_PARTS);
+    let size = if needed > min_part {
+        needed.div_ceil(MIB) * MIB
+    } else {
+        min_part
+    };
+    let count = len.div_ceil(size).max(1);
+    Ok((0..count)
+        .map(|index| Part {
+            number: index as u32 + 1,
+            offset: index * size,
+            len: size.min(len - index * size),
+        })
+        .collect())
+}
+
+/// SHA-256 (hex) of `len` bytes of `file` from `offset`, read at offsets
+/// off the async runtime
+async fn hash_range(file: &std::fs::File, offset: u64, len: u64) -> Result<String> {
+    let source = file.try_clone().context("Failed to open the archive")?;
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        use std::os::unix::fs::FileExt;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; IO_CHUNK];
+        let mut done = 0u64;
+        while done < len {
+            let want = (len - done).min(IO_CHUNK as u64) as usize;
+            let n = source.read_at(&mut buf[..want], offset + done)?;
+            if n == 0 {
+                anyhow::bail!("the archive shrank while it was uploaded");
+            }
+            hasher.update(&buf[..n]);
+            done += n as u64;
+        }
+        Ok(hex(&hasher.finalize()))
+    })
+    .await
+    .context("Hashing task panicked")?
+}
+
+/// The text of `<tag>` in an S3 XML reply, unescaped
+fn xml_value(xml: &str, tag: &str) -> Option<String> {
+    let (_, rest) = xml.split_once(&format!("<{}>", tag))?;
+    let (value, _) = rest.split_once(&format!("</{}>", tag))?;
+    Some(
+        value
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The body of CompleteMultipartUpload; `parts` are in order
+fn complete_multipart_xml(parts: &[(u32, String)]) -> String {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (number, etag) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+            number,
+            xml_escape(etag)
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml
+}
+
+/// A multipart upload that is aborted if it is dropped before it completed
+/// or was aborted (the job was canceled while uploading): S3 would keep
+/// its parts, and bill them, until a lifecycle rule removes them
+struct PendingUpload {
+    bucket: Bucket,
+    key: String,
+    upload_id: Option<String>,
+}
+
+impl PendingUpload {
+    fn completed(mut self) {
+        self.upload_id = None;
+    }
+
+    async fn abort(mut self) {
+        if let Some(upload_id) = self.upload_id.take() {
+            self.bucket.abort_multipart(&self.key, &upload_id).await;
+        }
+    }
+}
+
+impl Drop for PendingUpload {
+    fn drop(&mut self) {
+        let Some(upload_id) = self.upload_id.take() else {
+            return;
+        };
+        let (bucket, key) = (self.bucket.clone(), std::mem::take(&mut self.key));
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { bucket.abort_multipart(&key, &upload_id).await });
+        }
+    }
+}
+
+/// The body of an upload: `len` bytes of `file` from `offset`, read in
+/// `IO_CHUNK` pieces at increasing offsets (never through the shared file
+/// position, so an attempt that is still being torn down cannot move the
+/// next one's, and parts can be read at the same time), bumping `progress`
+/// for every piece
 fn upload_stream(
     file: &std::fs::File,
+    start: u64,
+    len: u64,
     progress: Progress,
-) -> Result<(
-    u64,
-    impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static,
-)> {
+) -> Result<impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static> {
     let source = Arc::new(file.try_clone().context("Failed to open the archive")?);
-    let len = source.metadata()?.len();
-    let stream = futures_util::stream::unfold((0u64, progress), move |(offset, progress)| {
+    let end = start + len;
+    let stream = futures_util::stream::unfold((start, progress), move |(offset, progress)| {
         let source = source.clone();
         async move {
-            if offset >= len {
+            if offset >= end {
                 return None;
             }
-            let want = (len - offset).min(IO_CHUNK as u64) as usize;
+            let want = (end - offset).min(IO_CHUNK as u64) as usize;
             let read = tokio::task::spawn_blocking(move || {
                 use std::os::unix::fs::FileExt;
                 let mut buf = vec![0u8; want];
@@ -290,7 +497,7 @@ fn upload_stream(
                         std::io::ErrorKind::UnexpectedEof,
                         "the archive shrank while it was uploaded",
                     )),
-                    (len, progress),
+                    (end, progress),
                 )),
                 Ok(buf) => {
                     progress.bump();
@@ -298,11 +505,11 @@ fn upload_stream(
                     Some((Ok(buf), (next, progress)))
                 }
                 // Ends the stream after the error
-                Err(e) => Some((Err(e), (len, progress))),
+                Err(e) => Some((Err(e), (end, progress))),
             }
         }
     });
-    Ok((len, stream))
+    Ok(stream)
 }
 
 /// A bucket (and prefix) holding cache archives. `Debug` is written by hand
@@ -321,6 +528,9 @@ pub struct Bucket {
     /// Until when calls are skipped, and why; shared by clones, so one job's
     /// failure spares the others the same timeouts
     breaker: Arc<Mutex<Option<(Instant, String)>>>,
+    /// Uploads larger than this go in parts of at least `part_size` bytes
+    multipart_threshold: u64,
+    part_size: u64,
 }
 
 impl std::fmt::Debug for Bucket {
@@ -347,7 +557,17 @@ impl Bucket {
             stall_timeout: Duration::from_secs(60),
             cooldown: Duration::from_secs(60),
             breaker: Arc::default(),
+            multipart_threshold: MULTIPART_THRESHOLD,
+            part_size: MIN_PART_SIZE,
         })
+    }
+
+    /// Multipart uploads of smaller archives (tests)
+    #[cfg(test)]
+    pub fn with_multipart(mut self, threshold: u64, part_size: u64) -> Self {
+        self.multipart_threshold = threshold;
+        self.part_size = part_size;
+        self
     }
 
     /// Shorter waits between attempts (tests)
@@ -434,21 +654,33 @@ impl Bucket {
         }
     }
 
-    /// A signed request; `body` is a file for PUT
+    /// A signed request with `query` parameters and `headers` (those named
+    /// `x-amz-*` are signed too), retried on 5xx answers and dropped
+    /// connections
     async fn send(
         &self,
         method: reqwest::Method,
         key: &str,
-        payload_hash: &str,
-        extra: &[(&str, String)],
-        body: Option<&std::fs::File>,
+        query: &[(&str, &str)],
+        headers: &[(&str, &str)],
+        payload: Payload<'_>,
     ) -> Result<reqwest::Response> {
         let path = self.object_path(key);
-        let url = format!(
+        let (query, canonical_query) = encode_query(query);
+        let mut url = format!(
             "{}{}",
             self.location.endpoint.as_str().trim_end_matches('/'),
             path
         );
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query);
+        }
+        let payload_hash = match payload {
+            Payload::Empty => EMPTY_SHA256.to_string(),
+            Payload::File { sha256, .. } => sha256.to_string(),
+            Payload::Bytes(bytes) => hex(&Sha256::digest(bytes)),
+        };
         let mut last_error = None;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
@@ -459,6 +691,18 @@ impl Bucket {
             let trial = self.check_breaker(true)?;
             let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
             let host = self.host_header();
+            let mut signed: Vec<(&str, &str)> = vec![
+                ("host", host.as_str()),
+                ("x-amz-content-sha256", payload_hash.as_str()),
+                ("x-amz-date", amz_date.as_str()),
+            ];
+            signed.extend(
+                headers
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("x-amz-"))
+                    .map(|(name, value)| (*name, value.trim())),
+            );
+            signed.sort();
             let authorization = Signer {
                 access_key: &self.access_key,
                 secret_key: &self.secret_key,
@@ -467,31 +711,34 @@ impl Bucket {
             .authorization(
                 method.as_str(),
                 &path,
-                &[
-                    ("host", host.as_str()),
-                    ("x-amz-content-sha256", payload_hash),
-                    ("x-amz-date", amz_date.as_str()),
-                ],
-                payload_hash,
+                &canonical_query,
+                &signed,
+                &payload_hash,
                 &amz_date,
             );
             let mut request = self
                 .client
                 .request(method.clone(), &url)
                 .timeout(NO_TOTAL_TIMEOUT)
-                .header("x-amz-content-sha256", payload_hash)
+                .header("x-amz-content-sha256", payload_hash.as_str())
                 .header("x-amz-date", &amz_date)
                 .header("authorization", authorization);
-            for (name, value) in extra {
-                request = request.header(*name, value);
+            for (name, value) in headers {
+                request = request.header(*name, value.trim());
             }
             let progress = Progress::new();
-            if let Some(file) = body {
-                let (len, stream) = upload_stream(file, progress.clone())?;
-                // S3 needs the length up front (it rejects chunked uploads)
-                request = request
-                    .header("content-length", len)
-                    .body(reqwest::Body::wrap_stream(stream));
+            match payload {
+                Payload::Empty => {}
+                Payload::File {
+                    file, offset, len, ..
+                } => {
+                    let stream = upload_stream(file, offset, len, progress.clone())?;
+                    // S3 needs the length up front (it rejects chunked uploads)
+                    request = request
+                        .header("content-length", len)
+                        .body(reqwest::Body::wrap_stream(stream));
+                }
+                Payload::Bytes(bytes) => request = request.body(bytes.to_vec()),
             }
             // The reply must start within the stall timeout of the last
             // chunk sent (or of the request, without a body). The URL is
@@ -530,13 +777,36 @@ impl Bucket {
         Err(self.trip(last_error.unwrap_or_else(|| anyhow::anyhow!("S3 request failed"))))
     }
 
+    /// The body of a short reply (XML), read with the stall timeout between
+    /// chunks: CompleteMultipartUpload may take minutes, sending spaces to
+    /// keep the connection open
+    async fn read_reply(&self, mut response: reqwest::Response) -> Result<String> {
+        let mut body = Vec::new();
+        while let Some(chunk) = tokio::time::timeout(self.stall_timeout, response.chunk())
+            .await
+            .map_err(|_| stalled(self.stall_timeout))
+            .and_then(|chunk| {
+                chunk
+                    .map_err(reqwest::Error::without_url)
+                    .context("S3 reply interrupted")
+            })
+            .map_err(|e| self.trip(e))?
+        {
+            if body.len() + chunk.len() > MAX_REPLY {
+                anyhow::bail!("S3 reply longer than {} bytes", MAX_REPLY);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+
     /// Download `key` into a temporary file in `dir`, unless `etag` is current
     pub async fn get_to_file(&self, key: &str, etag: Option<&str>, dir: &Path) -> Result<Download> {
-        let extra: Vec<(&str, String)> = etag
-            .map(|etag| vec![("if-none-match", etag.to_string())])
+        let headers: Vec<(&str, &str)> = etag
+            .map(|etag| vec![("if-none-match", etag)])
             .unwrap_or_default();
         let mut response = self
-            .send(reqwest::Method::GET, key, EMPTY_SHA256, &extra, None)
+            .send(reqwest::Method::GET, key, &[], &headers, Payload::Empty)
             .await?;
         match response.status().as_u16() {
             304 => return Ok(Download::NotModified),
@@ -544,11 +814,7 @@ impl Bucket {
             200 => {}
             _ => return Err(status_error(response, self.stall_timeout).await),
         }
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let etag = header(&response, "etag");
         let file = tempfile::NamedTempFile::new_in(dir)
             .with_context(|| format!("Failed to create a file in {}", dir.display()))?;
         // Network chunks are small (often 16 KiB): written in larger pieces
@@ -583,28 +849,28 @@ impl Bucket {
         })
     }
 
-    /// Whether S3 still holds `key` with this `etag` (a HEAD request, no body)
-    pub async fn holds(&self, key: &str, etag: &str) -> Result<bool> {
+    /// The ETag and content hash of `key`, `None` when S3 does not hold it
+    /// (a HEAD request, no body)
+    pub async fn head(&self, key: &str) -> Result<Option<ObjectInfo>> {
         let response = self
-            .send(
-                reqwest::Method::HEAD,
-                key,
-                EMPTY_SHA256,
-                &[("if-none-match", etag.to_string())],
-                None,
-            )
+            .send(reqwest::Method::HEAD, key, &[], &[], Payload::Empty)
             .await?;
         match response.status().as_u16() {
-            304 => Ok(true),
-            200 | 404 => Ok(false),
+            200 => Ok(Some(ObjectInfo {
+                etag: header(&response, "etag"),
+                sha256: header(&response, META_SHA256),
+            })),
+            404 => Ok(None),
             _ => Err(status_error(response, self.stall_timeout).await),
         }
     }
 
-    /// Upload `file` as `key`; returns the new object's ETag. `sha256` is
-    /// the file's hash (hex), which the caller computed while writing it:
-    /// the payload is signed without reading the file twice. The file is
-    /// read at offsets, so the handle may be shared and is never moved.
+    /// Upload `file` as `key`, in parts above the multipart threshold;
+    /// returns the new object's ETag. `sha256` is the file's hash (hex),
+    /// which the caller computed while writing it: a single PUT is signed
+    /// without reading the file twice, and the hash is stored with the
+    /// object (`x-amz-meta-sha256`). The file is read at offsets, so the
+    /// handle may be shared and is never moved.
     pub async fn put_file(
         &self,
         key: &str,
@@ -613,23 +879,183 @@ impl Bucket {
     ) -> Result<Option<String>> {
         self.check_breaker(false)?;
         let len = file.metadata()?.len();
-        if len > MAX_SINGLE_PUT {
-            anyhow::bail!(
-                "the archive is {} MB, above S3's 5 GiB single-upload limit",
-                len >> 20
-            );
+        if len > self.multipart_threshold {
+            return self.put_multipart(key, file, len, sha256).await;
         }
+        let payload = Payload::File {
+            file,
+            offset: 0,
+            len,
+            sha256,
+        };
         let response = self
-            .send(reqwest::Method::PUT, key, sha256, &[], Some(file))
+            .send(
+                reqwest::Method::PUT,
+                key,
+                &[],
+                &[(META_SHA256, sha256)],
+                payload,
+            )
             .await?;
         if !response.status().is_success() {
             return Err(status_error(response, self.stall_timeout).await);
         }
-        Ok(response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string))
+        Ok(header(&response, "etag"))
+    }
+
+    /// Upload `len` bytes of `file` in parts, `PART_CONCURRENCY` at a time.
+    /// Any failure, or dropping the future, aborts the upload, so S3 keeps
+    /// no orphaned parts.
+    async fn put_multipart(
+        &self,
+        key: &str,
+        file: &std::fs::File,
+        len: u64,
+        sha256: &str,
+    ) -> Result<Option<String>> {
+        let parts = plan_parts(len, self.part_size)?;
+        let response = self
+            .send(
+                reqwest::Method::POST,
+                key,
+                &[("uploads", "")],
+                &[(META_SHA256, sha256)],
+                Payload::Empty,
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(status_error(response, self.stall_timeout).await);
+        }
+        let reply = self.read_reply(response).await?;
+        let upload_id = xml_value(&reply, "UploadId")
+            .filter(|id| !id.is_empty())
+            .context("S3 started a multipart upload without an UploadId")?;
+        let pending = PendingUpload {
+            bucket: self.clone(),
+            key: key.to_string(),
+            upload_id: Some(upload_id.clone()),
+        };
+        match self.upload_parts(key, &upload_id, file, &parts).await {
+            Ok(etag) => {
+                pending.completed();
+                Ok(etag)
+            }
+            Err(e) => {
+                pending.abort().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Send `parts` and complete the upload
+    async fn upload_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        file: &std::fs::File,
+        parts: &[Part],
+    ) -> Result<Option<String>> {
+        // Each part in a task of its own; returning (the first failure) or
+        // dropping the future drops the set, which ends the others
+        let file = Arc::new(file.try_clone().context("Failed to open the archive")?);
+        let mut queued = parts.iter().copied();
+        let mut running = tokio::task::JoinSet::new();
+        let mut etags: Vec<(u32, String)> = Vec::with_capacity(parts.len());
+        loop {
+            while running.len() < PART_CONCURRENCY {
+                let Some(part) = queued.next() else { break };
+                let (bucket, key, upload_id, file) = (
+                    self.clone(),
+                    key.to_string(),
+                    upload_id.to_string(),
+                    file.clone(),
+                );
+                running
+                    .spawn(async move { bucket.upload_part(&key, &upload_id, &file, part).await });
+            }
+            match running.join_next().await {
+                Some(joined) => etags.push(joined.context("Part upload task panicked")??),
+                None => break,
+            }
+        }
+        etags.sort();
+        let xml = complete_multipart_xml(&etags);
+        let response = self
+            .send(
+                reqwest::Method::POST,
+                key,
+                &[("uploadId", upload_id)],
+                &[("content-type", "application/xml")],
+                Payload::Bytes(xml.as_bytes()),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(status_error(response, self.stall_timeout).await);
+        }
+        let etag = header(&response, "etag");
+        // A failure after the 200 status comes as an <Error> in the body
+        let reply = self.read_reply(response).await?;
+        if reply.contains("<Error>") {
+            let code = xml_value(&reply, "Code").unwrap_or_else(|| "unknown error".to_string());
+            anyhow::bail!("S3 could not complete the multipart upload ({})", code);
+        }
+        Ok(xml_value(&reply, "ETag").or(etag))
+    }
+
+    /// Send one part, signed with its own hash; returns its number and ETag
+    async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        file: &std::fs::File,
+        part: Part,
+    ) -> Result<(u32, String)> {
+        let sha256 = hash_range(file, part.offset, part.len).await?;
+        let number = part.number.to_string();
+        let payload = Payload::File {
+            file,
+            offset: part.offset,
+            len: part.len,
+            sha256: &sha256,
+        };
+        let response = self
+            .send(
+                reqwest::Method::PUT,
+                key,
+                &[("partNumber", &number), ("uploadId", upload_id)],
+                &[],
+                payload,
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(status_error(response, self.stall_timeout).await);
+        }
+        let etag = header(&response, "etag")
+            .with_context(|| format!("S3 took part {} without an ETag", part.number))?;
+        Ok((part.number, etag))
+    }
+
+    /// Abort a multipart upload, so S3 drops its parts. Best effort: on
+    /// failure a lifecycle rule (`AbortIncompleteMultipartUpload`) has to.
+    async fn abort_multipart(&self, key: &str, upload_id: &str) {
+        let aborted = self
+            .send(
+                reqwest::Method::DELETE,
+                key,
+                &[("uploadId", upload_id)],
+                &[],
+                Payload::Empty,
+            )
+            .await;
+        match aborted {
+            // 404: S3 dropped the upload already
+            Ok(response) if response.status().is_success() || response.status() == 404 => {}
+            Ok(response) => tracing::warn!(
+                "Could not abort an incomplete S3 upload: {:#}",
+                status_error(response, self.stall_timeout).await
+            ),
+            Err(e) => tracing::warn!("Could not abort an incomplete S3 upload: {:#}", e),
+        }
     }
 
     /// Whether the bucket can be used, as a message for the runner log
@@ -637,7 +1063,7 @@ impl Bucket {
         let bucket = &self.location.bucket;
         let endpoint = self.location.endpoint.as_str();
         match self
-            .send(reqwest::Method::HEAD, "", EMPTY_SHA256, &[], None)
+            .send(reqwest::Method::HEAD, "", &[], &[], Payload::Empty)
             .await
         {
             Ok(response) => match response.status().as_u16() {
@@ -662,13 +1088,22 @@ impl Bucket {
     #[cfg(test)]
     pub async fn create_bucket(&self) -> Result<()> {
         let response = self
-            .send(reqwest::Method::PUT, "", EMPTY_SHA256, &[], None)
+            .send(reqwest::Method::PUT, "", &[], &[], Payload::Empty)
             .await?;
         if !response.status().is_success() {
             return Err(status_error(response, self.stall_timeout).await);
         }
         Ok(())
     }
+}
+
+/// A response header as text
+fn header(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 /// An error naming the status and S3's error code (`<Code>...</Code>`). The
@@ -707,6 +1142,7 @@ mod tests {
         let authorization = signer.authorization(
             "GET",
             "/test.txt",
+            "",
             &[
                 ("host", "examplebucket.s3.amazonaws.com"),
                 ("range", "bytes=0-9"),
@@ -722,6 +1158,133 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
              SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
              Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+        );
+    }
+
+    /// The "GET Bucket Lifecycle" and "Get Bucket (List Objects)" examples
+    /// of the same page: query strings, one with a parameter without value
+    #[test]
+    fn signs_the_aws_documentation_examples_with_a_query() {
+        let signer = Signer {
+            access_key: "AKIAIOSFODNN7EXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            region: "us-east-1",
+        };
+        let headers = [
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-content-sha256", EMPTY_SHA256),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        for (query, signature) in [
+            (
+                vec![("lifecycle", "")],
+                "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543",
+            ),
+            (
+                vec![("prefix", "J"), ("max-keys", "2")],
+                "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7",
+            ),
+        ] {
+            let (_, canonical) = encode_query(&query);
+            let authorization = signer.authorization(
+                "GET",
+                "/",
+                &canonical,
+                &headers,
+                EMPTY_SHA256,
+                "20130524T000000Z",
+            );
+            assert!(
+                authorization.ends_with(&format!("Signature={}", signature)),
+                "{:?}: {}",
+                query,
+                authorization
+            );
+        }
+    }
+
+    #[test]
+    fn query_strings_are_sorted_and_encoded() {
+        assert_eq!(
+            encode_query(&[("uploads", "")]),
+            ("uploads".to_string(), "uploads=".to_string())
+        );
+        assert_eq!(
+            encode_query(&[("uploadId", "a+b/c=~"), ("partNumber", "7")]),
+            (
+                "partNumber=7&uploadId=a%2Bb%2Fc%3D~".to_string(),
+                "partNumber=7&uploadId=a%2Bb%2Fc%3D~".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parts_cover_the_archive_exactly() {
+        const MIB: u64 = 1 << 20;
+        let part = |number, offset, len| Part {
+            number,
+            offset,
+            len,
+        };
+        // An exact multiple of the part size
+        assert_eq!(
+            plan_parts(64 * MIB, 16 * MIB).unwrap(),
+            vec![
+                part(1, 0, 16 * MIB),
+                part(2, 16 * MIB, 16 * MIB),
+                part(3, 32 * MIB, 16 * MIB),
+                part(4, 48 * MIB, 16 * MIB),
+            ]
+        );
+        // A remainder makes a shorter last part
+        assert_eq!(
+            plan_parts(33 * MIB + 5, 16 * MIB).unwrap(),
+            vec![
+                part(1, 0, 16 * MIB),
+                part(2, 16 * MIB, 16 * MIB),
+                part(3, 32 * MIB, MIB + 5)
+            ]
+        );
+        // Smaller than a part: one part
+        assert_eq!(plan_parts(5, 16 * MIB).unwrap(), vec![part(1, 0, 5)]);
+        // Parts below a MiB (tests) are not rounded up
+        assert_eq!(
+            plan_parts(2500, 1000).unwrap(),
+            vec![part(1, 0, 1000), part(2, 1000, 1000), part(3, 2000, 500)]
+        );
+        // Parts grow (whole MiB) to stay within 10,000
+        let huge = 1u64 << 40;
+        let parts = plan_parts(huge, 16 * MIB).unwrap();
+        assert!(parts.len() as u64 <= MAX_PARTS, "{}", parts.len());
+        assert_eq!(parts[0].len % MIB, 0);
+        assert!(parts[0].len > 16 * MIB);
+        let last = parts.last().unwrap();
+        assert_eq!(last.offset + last.len, huge);
+        assert!(parts
+            .windows(2)
+            .all(|pair| pair[0].offset + pair[0].len == pair[1].offset));
+        // The largest object S3 takes
+        let max = plan_parts(MAX_OBJECT_SIZE, MIN_PART_SIZE).unwrap();
+        assert!(max.len() as u64 <= MAX_PARTS && max[0].len <= 5 << 30);
+        assert!(plan_parts(MAX_OBJECT_SIZE + 1, MIN_PART_SIZE).is_err());
+    }
+
+    #[test]
+    fn xml_values_are_unescaped_and_etags_escaped() {
+        let reply = "<InitiateMultipartUploadResult><UploadId>a&amp;b</UploadId>\
+                     </InitiateMultipartUploadResult>";
+        assert_eq!(xml_value(reply, "UploadId").as_deref(), Some("a&b"));
+        assert_eq!(
+            xml_value("<ETag>&quot;abc-3&quot;</ETag>", "ETag").as_deref(),
+            Some("\"abc-3\"")
+        );
+        assert_eq!(xml_value("<Other/>", "ETag"), None);
+        assert_eq!(
+            complete_multipart_xml(&[(1, "\"a\"".to_string()), (2, "\"b\"".to_string())]),
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>&quot;a&quot;</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>&quot;b&quot;</ETag></Part>\
+             </CompleteMultipartUpload>"
         );
     }
 
@@ -1017,6 +1580,7 @@ mod tests {
             .and(path("/ci-cache/pre/project-3/k.zip"))
             .and(header("x-amz-content-sha256", hash.as_str()))
             .and(header("content-length", "7"))
+            .and(header(META_SHA256, hash.as_str()))
             .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"e1\""))
             .expect(1)
             .mount(&server)
@@ -1038,6 +1602,14 @@ mod tests {
         assert_eq!(etag.as_deref(), Some("\"e1\""));
         let received = &server.received_requests().await.unwrap()[0];
         assert_eq!(received.body, body);
+        // The content hash is signed with the other x-amz headers
+        let authorization = received.headers["authorization"].to_str().unwrap();
+        assert!(
+            authorization
+                .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-sha256,"),
+            "{}",
+            authorization
+        );
     }
 
     #[tokio::test]
@@ -1068,17 +1640,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn holds_tells_whether_the_object_is_unchanged() {
+    async fn head_tells_the_etag_and_content_hash() {
         let server = MockServer::start().await;
         Mock::given(method("HEAD"))
             .and(path("/ci-cache/project-1/k.zip"))
-            .and(header("if-none-match", "\"v1\""))
-            .respond_with(ResponseTemplate::new(304))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1-3\"")
+                    .insert_header(META_SHA256, "abc"),
+            )
             .mount(&server)
             .await;
         Mock::given(method("HEAD"))
-            .and(path("/ci-cache/project-1/k.zip"))
-            .respond_with(ResponseTemplate::new(200))
+            .and(path("/ci-cache/project-1/old.zip"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v0\""))
             .mount(&server)
             .await;
         Mock::given(method("HEAD"))
@@ -1088,12 +1663,252 @@ mod tests {
             .await;
         let b = bucket(&server, "");
 
-        assert!(b.holds(&b.object_key(1, "k.zip"), "\"v1\"").await.unwrap());
-        assert!(!b.holds(&b.object_key(1, "k.zip"), "\"v0\"").await.unwrap());
-        assert!(!b
-            .holds(&b.object_key(1, "gone.zip"), "\"v1\"")
+        assert_eq!(
+            b.head(&b.object_key(1, "k.zip")).await.unwrap(),
+            Some(ObjectInfo {
+                etag: Some("\"v1-3\"".to_string()),
+                sha256: Some("abc".to_string())
+            })
+        );
+        assert_eq!(
+            b.head(&b.object_key(1, "old.zip")).await.unwrap(),
+            Some(ObjectInfo {
+                etag: Some("\"v0\"".to_string()),
+                sha256: None
+            })
+        );
+        assert_eq!(b.head(&b.object_key(1, "gone.zip")).await.unwrap(), None);
+    }
+
+    /// A file of `len` bytes that are not all the same
+    fn archive_of(dir: &Path, len: usize) -> (std::fs::File, Vec<u8>) {
+        let body: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+        let file = dir.join("big.tar.zst");
+        std::fs::write(&file, &body).unwrap();
+        (std::fs::File::open(&file).unwrap(), body)
+    }
+
+    /// A server with `mount_multipart`
+    async fn multipart_server() -> MockServer {
+        let server = MockServer::start().await;
+        mount_multipart(&server).await;
+        server
+    }
+
+    /// Mounts CreateMultipartUpload (UploadId `up/1+x`), UploadPart (ETag
+    /// `"etag-<number>"`), CompleteMultipartUpload and AbortMultipartUpload
+    /// for `big.tar.zst`
+    async fn mount_multipart(server: &MockServer) {
+        use wiremock::matchers::query_param;
+        let object = "/ci-cache/project-1/big.tar.zst";
+        Mock::given(method("POST"))
+            .and(path(object))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>up/1+x</UploadId>\
+                 </InitiateMultipartUploadResult>",
+            ))
+            .mount(server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(object))
+            .and(query_param("uploadId", "up/1+x"))
+            .respond_with(|request: &wiremock::Request| {
+                let number = request
+                    .url
+                    .query_pairs()
+                    .find(|(name, _)| name == "partNumber")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default();
+                ResponseTemplate::new(200).insert_header("etag", format!("\"etag-{}\"", number))
+            })
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(object))
+            .and(query_param("uploadId", "up/1+x"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>&quot;final-3&quot;</ETag>\
+                 </CompleteMultipartUploadResult>",
+            ))
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(object))
+            .and(query_param("uploadId", "up/1+x"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+    }
+
+    async fn requests_with(server: &MockServer, verb: &str, query: &str) -> Vec<wiremock::Request> {
+        server
+            .received_requests()
             .await
-            .unwrap());
+            .unwrap()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == verb && request.url.query().unwrap_or("").contains(query)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn large_archives_are_uploaded_in_signed_parts() {
+        let server = multipart_server().await;
+        let b = bucket(&server, "").with_multipart(2000, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let (file, body) = archive_of(dir.path(), 2500);
+        let hash = hex(&Sha256::digest(&body));
+
+        let etag = b
+            .put_file(&b.object_key(1, "big.tar.zst"), &file, &hash)
+            .await
+            .unwrap();
+
+        assert_eq!(etag.as_deref(), Some("\"final-3\""));
+        let created = requests_with(&server, "POST", "uploads").await;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].headers[META_SHA256], hash.as_str());
+        let mut parts = requests_with(&server, "PUT", "partNumber").await;
+        parts.sort_by_key(|part| part.url.query().unwrap().to_string());
+        let slices = [&body[..1000], &body[1000..2000], &body[2000..]];
+        assert_eq!(parts.len(), 3);
+        for (part, slice) in parts.iter().zip(slices) {
+            assert_eq!(part.body, slice);
+            assert_eq!(
+                part.headers["x-amz-content-sha256"],
+                hex(&Sha256::digest(slice)).as_str()
+            );
+            assert_eq!(
+                part.headers["content-length"],
+                slice.len().to_string().as_str()
+            );
+        }
+        let completed = requests_with(&server, "POST", "uploadId").await;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            String::from_utf8_lossy(&completed[0].body),
+            complete_multipart_xml(&[
+                (1, "\"etag-1\"".to_string()),
+                (2, "\"etag-2\"".to_string()),
+                (3, "\"etag-3\"".to_string())
+            ])
+        );
+        assert!(requests_with(&server, "DELETE", "uploadId")
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_part_aborts_the_upload() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(query_param("partNumber", "2"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("<Error><Code>AccessDenied</Code></Error>"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_multipart(&server).await;
+        let b = bucket(&server, "").with_multipart(2000, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let (file, body) = archive_of(dir.path(), 2500);
+
+        let error = b
+            .put_file(
+                &b.object_key(1, "big.tar.zst"),
+                &file,
+                &hex(&Sha256::digest(&body)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{:#}", error).contains("AccessDenied"),
+            "{:#}",
+            error
+        );
+        assert!(requests_with(&server, "POST", "uploadId=").await.is_empty());
+        assert_eq!(requests_with(&server, "DELETE", "uploadId=").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_completion_error_in_a_200_reply_aborts_the_upload() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "up/1+x"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<Error><Code>InternalError</Code><Message>try again</Message></Error>",
+            ))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_multipart(&server).await;
+        let b = bucket(&server, "").with_multipart(2000, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let (file, body) = archive_of(dir.path(), 2500);
+
+        let error = b
+            .put_file(
+                &b.object_key(1, "big.tar.zst"),
+                &file,
+                &hex(&Sha256::digest(&body)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{:#}", error).contains("InternalError"),
+            "{:#}",
+            error
+        );
+        assert_eq!(requests_with(&server, "DELETE", "uploadId=").await.len(), 1);
+    }
+
+    /// A job canceled while its cache uploads drops the upload: S3 is told
+    /// to discard the parts
+    #[tokio::test]
+    async fn a_dropped_upload_is_aborted() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "up/1+x"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_multipart(&server).await;
+        let b = bucket(&server, "").with_multipart(2000, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let (file, body) = archive_of(dir.path(), 2500);
+        let key = b.object_key(1, "big.tar.zst");
+        let hash = hex(&Sha256::digest(&body));
+
+        let upload = b.put_file(&key, &file, &hash);
+        let parts_sent = async {
+            while requests_with(&server, "PUT", "partNumber").await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            _ = upload => panic!("the upload finished"),
+            _ = parts_sent => {}
+        }
+
+        let started = std::time::Instant::now();
+        while requests_with(&server, "DELETE", "uploadId=")
+            .await
+            .is_empty()
+        {
+            assert!(started.elapsed() < Duration::from_secs(5), "never aborted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(requests_with(&server, "POST", "uploadId=").await.is_empty());
     }
 
     #[tokio::test]

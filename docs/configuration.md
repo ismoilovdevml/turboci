@@ -180,8 +180,9 @@ secret_key = "..."
 | `access_key`, `secret_key` | – | Credentials. The runner transfers the archives, so docker jobs never see them; shell jobs run as the service user and can read the config file, as they can the runner token |
 | `region` | from `s3.<region>.amazonaws.com`, else `us-east-1` | Signing region (`auto` for R2) |
 
-The credentials need `s3:GetObject` and `s3:PutObject` on the archives, and
-`s3:ListBucket` on the bucket (it may be limited to the prefix). Without
+The credentials need `s3:GetObject`, `s3:PutObject` and
+`s3:AbortMultipartUpload` on the archives, and `s3:ListBucket` on the bucket
+(it may be limited to the prefix). Without
 `s3:ListBucket` AWS answers 403 instead of 404 for an archive that does not
 exist yet, so every cache miss logs a warning, and the start-up check reports
 access denied. A grant limited with an `s3:prefix` condition may not allow
@@ -191,12 +192,17 @@ archives work.
 `cache_dir` stays the first layer. To restore, the runner asks S3 whether the
 archive changed (`If-None-Match`): an unchanged one is taken from the local
 disk, a changed one is downloaded. Saved archives are written locally and
-uploaded. An archive is the same for the same files (entries in path order,
-fixed timestamps), so a `pull-push` cache the job did not change is not
-uploaded again: the runner keeps the SHA-256 of the object it last
-downloaded or uploaded (`<archive>.sha256`) and, when the new archive has
-that hash, only checks with a HEAD request that S3 still holds that object.
-The job log shows which happened:
+uploaded; archives above 64 MiB go as a multipart upload, in parts of 16 MiB
+(larger above 156 GiB, to stay within S3's 10,000 parts), four at a time, each signed with its own hash. A
+failed or canceled multipart upload is aborted, so S3 keeps no parts of it.
+An archive is the same for the same files (entries in path order, fixed
+timestamps), so a `pull-push` cache the job did not change is not uploaded
+again: the runner stores the archive's SHA-256 with the object
+(`x-amz-meta-sha256`) and, before uploading, asks with a HEAD request
+whether S3 holds that content already, whichever host uploaded it. For
+objects without that metadata (uploaded by older versions) it compares the
+ETag with the one it last downloaded or uploaded for that hash
+(`<archive>.sha256`). The job log shows which happened:
 
 ```
 Successfully restored cache main (S3: not modified, local copy)
@@ -218,13 +224,17 @@ access denied, unreachable).
 
 The runner never deletes objects. Expire old archives with a bucket lifecycle
 rule, e.g. `mc ilm rule add --expire-days 14 minio/turboci-cache` or an S3
-lifecycle rule with `Expiration: {Days: 14}`. Archives are stored as
+lifecycle rule with `Expiration: {Days: 14}`. Add
+`AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}` to the rule as
+well: a runner that is killed during an upload, or loses S3 in the middle,
+cannot abort it, and S3 keeps (and bills) the parts until the rule removes
+them. Archives are stored as
 `<prefix>/project-<id>/<encoded-key>.zip`, the cache key percent-encoded
 (`feature/x` is `feature%2Fx.zip`), and a key whose encoded name is longer
 than 200 characters as `h-<blake3 hash>.zip`; every runner with the
 credentials can write every project's cache, so use one bucket or prefix per
-group of runners that trust each other. Archives above 5 GiB are kept only
-locally.
+group of runners that trust each other. Archives above 5 TiB, S3's largest
+object, are kept only locally.
 
 ## Executor
 

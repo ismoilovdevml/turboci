@@ -460,16 +460,26 @@ async fn upload(
 ) -> std::result::Result<Upload, String> {
     // Archives are deterministic (sorted entries, fixed timestamps): the
     // same files give the same hash, typically a pull-push cache the job did
-    // not change. One HEAD request then replaces the upload.
-    if let Some((known, etag)) = read_hash_sidecar(path).await {
-        if known == sha256 {
-            match remote.holds(object, &etag).await {
-                Ok(true) => return Ok(Upload::Unchanged),
-                Ok(false) => {}
-                // The upload below reports S3's state
-                Err(e) => tracing::debug!("Cannot compare the cache with S3: {:#}", e),
+    // not change. One HEAD request then replaces the upload. The hash is
+    // compared, not the ETag: a multipart upload's ETag is not the MD5 of
+    // the content, and runners store the hash with the object. An object
+    // without it matches when it is the one this host last saw with this
+    // hash (`<archive>.sha256`).
+    match remote.head(object).await {
+        Ok(Some(info)) => {
+            let same = info.sha256.as_deref() == Some(sha256)
+                || read_hash_sidecar(path).await.is_some_and(|(known, etag)| {
+                    known == sha256 && info.etag.as_deref() == Some(etag.as_str())
+                });
+            if same {
+                // A restore then gets 304 for the object S3 holds
+                write_sidecars(path, info.etag.as_deref(), sha256).await;
+                return Ok(Upload::Unchanged);
             }
         }
+        Ok(None) => {}
+        // The upload below reports S3's state
+        Err(e) => tracing::debug!("Cannot compare the cache with S3: {:#}", e),
     }
     // Until the upload succeeds the sidecar keeps the ETag of the object
     // this archive replaced: while S3 still holds that object, a restore
@@ -543,7 +553,14 @@ mod tests {
         );
 
         // Host B has nothing locally: it downloads what host A uploaded
-        let uploaded = server.received_requests().await.unwrap()[0].body.clone();
+        let uploaded = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PUT")
+            .unwrap()
+            .body;
         Mock::given(method("GET"))
             .and(path("/ci/project-5/main.zip"))
             .respond_with(
@@ -1138,11 +1155,11 @@ mod tests {
             )
             .mount(&server)
             .await;
+        // An object an older runner uploaded: no content hash in metadata
         Mock::given(method("HEAD"))
             .and(path("/ci/project-5/main.zip"))
-            .and(wiremock::matchers::header("if-none-match", "\"v1\""))
-            .respond_with(ResponseTemplate::new(304))
-            .expect(1)
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v1\""))
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("PUT"))
@@ -1203,7 +1220,7 @@ mod tests {
             .await;
         Mock::given(method("HEAD"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         let root = tempdir().unwrap();
@@ -1219,6 +1236,56 @@ mod tests {
                 .unwrap();
             assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
         }
+    }
+
+    /// Another host uploaded the same content (in parts, so its ETag is no
+    /// MD5): the hash stored with the object tells, without a sidecar
+    #[tokio::test]
+    async fn the_same_content_from_another_host_is_not_uploaded() {
+        let server = MockServer::start().await;
+        let ws = workspace("dep");
+        let ws_path = ws.path().to_str().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let other = LocalCache::new(elsewhere.path());
+        other
+            .save(5, "main", ws_path, &["vendor".to_string()])
+            .await
+            .unwrap();
+        let hash = {
+            use sha2::Digest;
+            let archive = std::fs::read(other.archive_path(5, "main")).unwrap();
+            format!("{:x}", sha2::Sha256::digest(archive))
+        };
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"0123-3\"")
+                    .insert_header(crate::runner_daemon::s3::META_SHA256, hash.as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+
+        let saved = cache
+            .save(5, "main", ws_path, &["vendor".to_string()])
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(saved.upload, Some(Ok(Upload::Unchanged)));
+        // A restore asks S3 with that object's ETag
+        let local = cache.archive_path(5, "main");
+        assert_eq!(
+            std::fs::read_to_string(sidecar(&local)).unwrap(),
+            "\"0123-3\""
+        );
     }
 
     #[tokio::test]
@@ -1393,6 +1460,67 @@ mod tests {
             "{:?}",
             second
         );
+
+        // An archive above the multipart threshold goes in signed parts of
+        // 5 MiB, S3's smallest; another host restores it and, saving the
+        // same files, finds them in S3 by the stored hash
+        let big = tempdir().unwrap();
+        std::fs::create_dir(big.path().join("vendor")).unwrap();
+        let mut seed: u64 = 7;
+        let noise: Vec<u8> = (0..12 << 20)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 56) as u8
+            })
+            .collect();
+        std::fs::write(big.path().join("vendor/blob.bin"), &noise).unwrap();
+        let parts = || bucket().with_multipart(6 << 20, 5 << 20);
+        let uploader = tempdir().unwrap();
+        let saved = LocalCache::new(uploader.path())
+            .with_remote(parts())
+            .save(
+                9,
+                "big",
+                big.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(saved.size > 10 << 20, "{}", saved.size);
+        assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
+        let host_c = tempdir().unwrap();
+        let cache_c = LocalCache::new(host_c.path()).with_remote(parts());
+        let restored_big = tempdir().unwrap();
+        let big_hit = cache_c
+            .restore(
+                9,
+                &["big".to_string()],
+                restored_big.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(big_hit.hit, Some((_, Source::S3Downloaded(_)))),
+            "{:?}",
+            big_hit
+        );
+        assert!(std::fs::read(restored_big.path().join("vendor/blob.bin")).unwrap() == noise);
+        let again = LocalCache::new(tempdir().unwrap().path())
+            .with_remote(parts())
+            .save(
+                9,
+                "big",
+                big.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.upload, Some(Ok(Upload::Unchanged)));
 
         // S3 gone: the restore falls back to the local copy
         docker(&["stop", name]);
