@@ -7,7 +7,7 @@ description = "GitLab CI/CD runner: one static binary that runs GitLab jobs in D
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "fs", "io-util", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
@@ -18,15 +18,18 @@ walkdir = "2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart", "stream"], default-features = false }
 bytes = "1"
 sha2 = "0.10"
-chrono = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["now"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 glob = "0.3"
 regex = "1"
 aho-corasick = "1.1.5"
 async-trait = "0.1"
-flate2 = "1"
-zip = { version = "5", default-features = false, features = ["deflate", "zstd"] }
+# One deflate backend (zlib-rs) for flate2 and zip; zip's "deflate" would add
+# miniz_oxide and zopfli, which only serves compression levels above 9.
+# runtime_detection lets zlib-rs pick SSE/AVX2 code paths on x86_64.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+zip = { version = "5", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
 bollard = "0.19"
 futures-util = "0.3"
 hmac = "0.12"
