@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -76,8 +78,12 @@ pub struct GitLabClient {
     token: String,
     /// Identifies this runner manager to GitLab; must stay the same across requests
     system_id: String,
-    /// Executor name reported to GitLab ("docker" or "shell")
-    executor: String,
+    /// Sent with every job request: executor and features
+    info: RunnerInfo,
+    /// X-GitLab-Last-Update of the last job request, with the runner token it
+    /// was for. Sent back as `last_update`, it lets Workhorse hold the next
+    /// request until the runner's job queue changes (long polling).
+    last_update: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl GitLabClient {
@@ -103,13 +109,14 @@ impl GitLabClient {
             url,
             token,
             system_id: format!("r_{}", &Uuid::new_v4().simple().to_string()[..12]),
-            executor: "docker".to_string(),
+            info: RunnerInfo::new("docker"),
+            last_update: Arc::default(),
         })
     }
 
     /// Report the configured executor and its capabilities to GitLab
     pub fn with_executor(mut self, executor: &str) -> Self {
-        self.executor = executor.to_string();
+        self.info = RunnerInfo::new(executor);
         self
     }
 
@@ -151,24 +158,64 @@ impl GitLabClient {
     }
 
     /// Request a new job from GitLab (GitLab 17.x compatible)
+    #[cfg(test)]
     pub async fn request_job(&self, runner_token: &str) -> Result<Option<Job>> {
+        self.request_job_until(runner_token, std::future::pending())
+            .await
+    }
+
+    /// Request a new job, giving up when `stop` resolves before GitLab answers.
+    ///
+    /// With long polling, Workhorse holds the request until a job may be
+    /// available, up to its long polling duration (50s by default). `stop` ends
+    /// only that wait: once GitLab has answered, the job may be assigned to
+    /// this runner and is always read.
+    pub async fn request_job_until(
+        &self,
+        runner_token: &str,
+        stop: impl Future<Output = ()>,
+    ) -> Result<Option<Job>> {
         let url = format!("{}/api/v4/jobs/request", self.url);
 
         debug!("Requesting job from: {}", url);
 
-        let response = self
+        let last_update = self
+            .last_update
+            .lock()
+            .ok()
+            .and_then(|last| last.clone())
+            .filter(|(token, _)| token == runner_token)
+            .map(|(_, value)| value);
+        let request = self
             .client
             .post(&url)
+            .timeout(JOB_REQUEST_TIMEOUT)
             .json(&JobRequest {
-                token: runner_token.to_string(),
-                last_update: None,
-                info: RunnerInfo::new(&self.executor),
-                system_id: self.system_id.clone(),
+                token: runner_token,
+                last_update: last_update.as_deref(),
+                info: &self.info,
+                system_id: &self.system_id,
                 session: None,
             })
-            .send()
-            .await
-            .context("Failed to request job from GitLab")?;
+            .send();
+        let response = tokio::select! {
+            response = request => response.context("Failed to request job from GitLab")?,
+            _ = stop => {
+                debug!("Job request stopped before GitLab answered");
+                return Ok(None);
+            }
+        };
+        // Like gitlab-runner: kept from any answer that carries it
+        if let Some(value) = response
+            .headers()
+            .get("X-GitLab-Last-Update")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+        {
+            if let Ok(mut last) = self.last_update.lock() {
+                *last = Some((runner_token.to_string(), value.to_string()));
+            }
+        }
 
         let status = response.status();
         debug!("Job request response status: {}", status);
@@ -219,6 +266,11 @@ impl GitLabClient {
                 };
                 info!("Received job #{}", job.id);
                 Ok(Some(job))
+            }
+            StatusCode::CONFLICT => {
+                // Another request took the job meanwhile: ask again
+                debug!("Job request conflict");
+                Ok(None)
             }
             StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
                 warn!("Authentication failed - invalid runner token");
@@ -542,12 +594,12 @@ impl GitLabClient {
 }
 
 #[derive(Debug, Serialize)]
-struct JobRequest {
-    token: String,
+struct JobRequest<'a> {
+    token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_update: Option<String>,
-    info: RunnerInfo,
-    system_id: String, // GitLab 17.x requirement
+    last_update: Option<&'a str>,
+    info: &'a RunnerInfo,
+    system_id: &'a str, // GitLab 17.x requirement
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<SessionInfo>,
 }
@@ -887,6 +939,10 @@ pub struct RetryConfig {
 /// Timeout of API calls (the client default)
 const API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeout of a job request: longer than Workhorse holds it while long polling
+/// (`apiCiLongPollingDuration`, 50s by default)
+const JOB_REQUEST_TIMEOUT: Duration = Duration::from_secs(70);
+
 /// Timeout for artifact transfers (the client default of 30s is for API calls)
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
 
@@ -1188,6 +1244,53 @@ mod tests {
 
         client.request_job("runner-token").await.unwrap();
         client.request_job("runner-token").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_job_sends_back_the_last_update_gitlab_gave() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(204).insert_header("X-GitLab-Last-Update", "q-42"))
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let sent = |request: &wiremock::Request| -> serde_json::Value {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["last_update"]
+                .clone()
+        };
+
+        client.request_job("runner-token").await.unwrap();
+        client.request_job("runner-token").await.unwrap();
+        // A rotated token starts over: the value belongs to the old one
+        client.request_job("rotated-token").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(sent(&requests[0]), serde_json::Value::Null);
+        assert_eq!(sent(&requests[1]), "q-42");
+        assert_eq!(sent(&requests[2]), serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn job_request_held_by_gitlab_ends_on_stop() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let job = client(&server)
+            .request_job_until(
+                "runner-token",
+                tokio::time::sleep(Duration::from_millis(200)),
+            )
+            .await
+            .unwrap();
+
+        assert!(job.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]

@@ -217,20 +217,75 @@ async fn claim_job(
     runner_token: &str,
 ) -> Result<Option<(Job, OwnedSemaphorePermit)>> {
     let permit = semaphore.clone().acquire_owned().await?;
-    claim_with_permit(permit, gitlab, runner_token).await
+    claim_with_permit(permit, gitlab, runner_token, std::future::pending()).await
 }
 
-/// Ask GitLab for a job for an already reserved slot; the slot is released
-/// when no job is returned
+/// Ask GitLab for a job for an already reserved slot, until `stop` (see
+/// `GitLabClient::request_job_until`); the slot is released when no job is
+/// returned
 async fn claim_with_permit(
     permit: OwnedSemaphorePermit,
     gitlab: &GitLabClient,
     runner_token: &str,
+    stop: impl std::future::Future<Output = ()>,
 ) -> Result<Option<(Job, OwnedSemaphorePermit)>> {
     Ok(gitlab
-        .request_job(runner_token)
+        .request_job_until(runner_token, stop)
         .await?
         .map(|job| (job, permit)))
+}
+
+/// Longest wait between job requests that fail
+const MAX_REQUEST_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Waits between job requests: the check interval, doubled after each failed
+/// request in a row up to `MAX_REQUEST_BACKOFF`, with jitter so runners that
+/// lost GitLab at the same time do not retry in lockstep
+struct RequestBackoff {
+    check_interval: Duration,
+    failures: u32,
+}
+
+impl RequestBackoff {
+    fn new(check_interval: Duration) -> Self {
+        Self {
+            check_interval,
+            failures: 0,
+        }
+    }
+
+    /// Wait after a request GitLab answered
+    fn succeeded(&mut self) -> Duration {
+        self.failures = 0;
+        self.check_interval
+    }
+
+    /// Wait after a failed request: between half of and the full ceiling
+    fn failed(&mut self) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let ceiling = self.ceiling();
+        ceiling / 2 + ceiling.mul_f64(random_fraction() / 2.0)
+    }
+
+    fn ceiling(&self) -> Duration {
+        if self.failures == 0 {
+            return self.check_interval;
+        }
+        let doublings = (self.failures - 1).min(16);
+        self.check_interval
+            .saturating_mul(1 << doublings)
+            .min(MAX_REQUEST_BACKOFF.max(self.check_interval))
+    }
+}
+
+/// A random number in [0, 1)
+fn random_fraction() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    // Every RandomState is seeded differently
+    let bits = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    (bits >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// How the runner is stopping
@@ -372,14 +427,22 @@ impl RunnerDaemon {
         let rotation = AbortOnDrop(tokio::spawn(self.clone().rotate_token()));
 
         let mut connected = false;
+        let mut backoff = RequestBackoff::new(Duration::from_secs(self.config.check_interval));
         loop {
-            // Wait for a free slot; a shutdown interrupts only this wait and the
-            // sleeps, never a job request GitLab may already have answered
+            // Wait for a free slot; a shutdown interrupts this wait, the sleeps
+            // and a job request GitLab holds (long polling), never one it has
+            // already answered
             let permit = tokio::select! {
                 permit = self.semaphore.clone().acquire_owned() => permit?,
                 _ = self.shutdown_requested() => break,
             };
-            let claimed = claim_with_permit(permit, &self.gitlab, &self.current_token()).await;
+            let claimed = claim_with_permit(
+                permit,
+                &self.gitlab,
+                &self.current_token(),
+                self.shutdown_requested(),
+            )
+            .await;
             if claimed.is_ok() && !connected {
                 connected = true;
                 info!(
@@ -387,7 +450,7 @@ impl RunnerDaemon {
                     self.config.gitlab_url
                 );
             }
-            let idle = match claimed {
+            let wait = match claimed {
                 Ok(Some((job, permit))) => {
                     let job_name = job
                         .job_info
@@ -403,17 +466,23 @@ impl RunnerDaemon {
                             error!("Job execution failed: {}", e);
                         }
                     });
-                    false
+                    backoff.succeeded();
+                    None
                 }
-                Ok(None) => true,
+                Ok(None) => Some(backoff.succeeded()),
                 Err(e) => {
-                    warn!("Failed to request job: {:#}", e);
-                    true
+                    let wait = backoff.failed();
+                    warn!(
+                        "Failed to request job: {:#} (retrying in {:.1}s)",
+                        e,
+                        wait.as_secs_f64()
+                    );
+                    Some(wait)
                 }
             };
-            if idle {
+            if let Some(wait) = wait {
                 tokio::select! {
-                    _ = sleep(Duration::from_secs(self.config.check_interval)) => {}
+                    _ = sleep(wait) => {}
                     _ = self.shutdown_requested() => break,
                 }
             }
@@ -2192,6 +2261,54 @@ mod tests {
             .await
             .expect("daemon stopped")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_a_job_request_gitlab_holds() {
+        let server = MockServer::start().await;
+        // Long polling: GitLab answers only after a while
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let handle = daemon.shutdown_handle();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(300)).await;
+            handle.request(Shutdown::Abort);
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), daemon.start())
+            .await
+            .expect("daemon stopped while the job request was held")
+            .unwrap();
+    }
+
+    #[test]
+    fn request_backoff_grows_to_a_cap_and_resets_on_success() {
+        let mut backoff = RequestBackoff::new(Duration::from_secs(3));
+        assert_eq!(backoff.succeeded(), Duration::from_secs(3));
+
+        let mut ceilings = Vec::new();
+        for _ in 0..8 {
+            let wait = backoff.failed();
+            let ceiling = backoff.ceiling();
+            assert!(wait >= ceiling / 2 && wait <= ceiling, "{:?}", wait);
+            ceilings.push(ceiling.as_secs());
+        }
+        assert_eq!(ceilings, [3, 6, 12, 24, 48, 60, 60, 60]);
+
+        assert_eq!(backoff.succeeded(), Duration::from_secs(3));
+        backoff.failed();
+        assert_eq!(backoff.ceiling(), Duration::from_secs(3));
+
+        // A check interval above the cap is never shortened
+        let mut slow = RequestBackoff::new(Duration::from_secs(120));
+        slow.failed();
+        slow.failed();
+        assert_eq!(slow.ceiling(), Duration::from_secs(120));
     }
 
     #[tokio::test]
