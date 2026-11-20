@@ -146,14 +146,19 @@ impl ExecutorType {
     ) -> JobOutcome {
         use futures_util::FutureExt;
 
+        // The job timeout covers everything from here on, image pulls and
+        // service startup included, like gitlab-runner
+        let deadline = Instant::now() + job_timeout(job);
         let run = async {
             match self {
                 ExecutorType::Docker(executor) => {
                     executor
-                        .execute(job, &self.job_dir(job), trace, restore)
+                        .execute(job, &self.job_dir(job), deadline, trace, restore)
                         .await
                 }
-                ExecutorType::Shell(executor) => executor.execute(job, trace, restore).await,
+                ExecutorType::Shell(executor) => {
+                    executor.execute(job, deadline, trace, restore).await
+                }
             }
         };
         // A bug must fail the job, not skip its cleanup and final report
@@ -319,6 +324,45 @@ struct Limits<'a> {
     stop_at: RemoteState,
 }
 
+impl Limits<'_> {
+    /// Why work has to stop now, if it has to
+    fn stopped(&self) -> Option<RunError> {
+        if self.cancel.state() >= self.stop_at {
+            Some(RunError::Canceled)
+        } else if Instant::now() >= self.deadline {
+            Some(RunError::TimedOut)
+        } else {
+            None
+        }
+    }
+
+    /// The job's failure when it has to stop now
+    fn check(&self, job: &Job) -> JobOutcome {
+        self.stopped().map_or(Ok(()), |stop| Err(stop.failure(job)))
+    }
+
+    /// `work`'s output, or why it was dropped before it finished: the
+    /// deadline passed or cancellation reached `stop_at` first
+    async fn bound<T>(
+        &self,
+        work: impl std::future::Future<Output = T>,
+    ) -> std::result::Result<T, RunError> {
+        tokio::select! {
+            biased;
+            output = work => Ok(output),
+            _ = self.cancel.reached(self.stop_at) => Err(RunError::Canceled),
+            _ = tokio::time::sleep_until(self.deadline) => Err(RunError::TimedOut),
+        }
+    }
+}
+
+/// Job timeout GitLab sent, or DEFAULT_JOB_TIMEOUT
+fn job_timeout(job: &Job) -> Duration {
+    job.timeout_secs()
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_JOB_TIMEOUT)
+}
+
 /// How an executor runs a shell script in a directory, streaming output to the trace
 #[async_trait]
 trait ScriptRunner: Send + Sync {
@@ -338,32 +382,20 @@ struct JobDirs {
 }
 
 /// Get sources, then run the steps GitLab sent, honouring `when`, `allow_failure`
-/// and timeouts. The job timeout covers sources and script steps; `after_script`
-/// has its own timeout and never changes the job result.
+/// and timeouts. The job timeout (`deadline`) covers sources and script steps;
+/// `after_script` has its own timeout and never changes the job result.
 async fn run_job_steps(
     job: &Job,
+    deadline: Instant,
     sources: &dyn ScriptRunner,
     runner: &dyn ScriptRunner,
     trace: &mut TraceWriter<'_>,
     dirs: &JobDirs,
     restore: &dyn Restore,
 ) -> JobOutcome {
-    let timeout = job
-        .timeout_secs()
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_JOB_TIMEOUT);
-    let deadline = Instant::now() + timeout;
     let cancel = trace.cancel();
-    let canceled = || JobFailure {
-        reason: FailureReason::JobCanceled,
-        exit_code: None,
-        message: "canceled".to_string(),
-    };
-    let timed_out = || JobFailure {
-        reason: FailureReason::JobExecutionTimeout,
-        exit_code: None,
-        message: format!("execution took longer than {}s", timeout.as_secs()),
-    };
+    let canceled = || RunError::Canceled.failure(job);
+    let timed_out = || RunError::TimedOut.failure(job);
 
     let script_limits = Limits {
         deadline,
@@ -375,12 +407,7 @@ async fn run_job_steps(
         .await;
     let fetched = get_sources(job, sources, trace, dirs, &script_limits).await;
     trace.section_end("get_sources").await;
-    let mut failure = match fetched {
-        Ok(()) => None,
-        Err(RunError::TimedOut) => Some(timed_out()),
-        Err(RunError::Canceled) => Some(canceled()),
-        Err(RunError::Failed(f)) => Some(f),
-    };
+    let mut failure = fetched.err().map(|e| e.failure(job));
     if failure.is_none() {
         // Bound like the scripts: a slow S3 transfer must not outlive the job
         // timeout or a cancel. The restore is then stopped and awaited, so no
@@ -558,6 +585,24 @@ enum RunError {
     TimedOut,
     Canceled,
     Failed(JobFailure),
+}
+
+impl RunError {
+    fn failure(self, job: &Job) -> JobFailure {
+        match self {
+            RunError::TimedOut => JobFailure {
+                reason: FailureReason::JobExecutionTimeout,
+                exit_code: None,
+                message: format!("execution took longer than {}s", job_timeout(job).as_secs()),
+            },
+            RunError::Canceled => JobFailure {
+                reason: FailureReason::JobCanceled,
+                exit_code: None,
+                message: "canceled".to_string(),
+            },
+            RunError::Failed(failure) => failure,
+        }
+    }
 }
 
 async fn get_sources(
@@ -790,7 +835,9 @@ mod tests {
     }
 
     async fn run_shell(job: &Job, work_dir: &Path) -> (JobOutcome, String) {
-        let executor = ShellExecutor::new(Some(work_dir.to_string_lossy().into_owned()));
+        let executor = ExecutorType::Shell(ShellExecutor::new(Some(
+            work_dir.to_string_lossy().into_owned(),
+        )));
         let scrubber = SecretScrubber::new(vec![]).with_job_secrets(job);
         let mut trace = TraceWriter::new(None, job.id, &job.token, &scrubber);
         let outcome = executor.execute(job, &mut trace, &NoRestore).await;
@@ -884,7 +931,9 @@ mod tests {
         state: RemoteState,
         restore: &dyn Restore,
     ) -> (JobOutcome, String) {
-        let executor = ShellExecutor::new(Some(work_dir.to_string_lossy().into_owned()));
+        let executor = ExecutorType::Shell(ShellExecutor::new(Some(
+            work_dir.to_string_lossy().into_owned(),
+        )));
         let scrubber = SecretScrubber::new(vec![]);
         let cancel = CancelSignal::default();
         let mut trace =
@@ -952,7 +1001,9 @@ mod tests {
     #[tokio::test]
     async fn the_job_timeout_stops_a_restore() {
         let dir = tempfile::tempdir().unwrap();
-        let executor = ShellExecutor::new(Some(dir.path().to_string_lossy().into_owned()));
+        let executor = ExecutorType::Shell(ShellExecutor::new(Some(
+            dir.path().to_string_lossy().into_owned(),
+        )));
         let j = job(serde_json::json!({
             "id": 9, "token": "t",
             "runner_info": {"timeout": 1},
@@ -1050,7 +1101,9 @@ mod tests {
             archive,
             into: into.clone(),
         };
-        let executor = ShellExecutor::new(Some(dir.path().to_string_lossy().into_owned()));
+        let executor = ExecutorType::Shell(ShellExecutor::new(Some(
+            dir.path().to_string_lossy().into_owned(),
+        )));
         let j = job(serde_json::json!({
             "id": 11, "token": "t",
             "steps": steps(&["echo script-ran"], &["echo cleanup-ran"])
@@ -1136,7 +1189,9 @@ mod tests {
         let sha = git(&["rev-parse", "HEAD"]);
 
         let work = dir.path().join("work");
-        let executor = ShellExecutor::new(Some(work.to_string_lossy().into_owned()));
+        let executor = ExecutorType::Shell(ShellExecutor::new(Some(
+            work.to_string_lossy().into_owned(),
+        )));
         let j = job(serde_json::json!({
             "id": 8, "token": "t",
             "git_info": {
@@ -1321,6 +1376,47 @@ mod tests {
         let (outcome, _) = run_shell(&j, dir.path()).await;
 
         assert!(outcome.is_ok());
+    }
+
+    #[tokio::test]
+    async fn limits_stop_preparation_work_on_cancel_and_deadline() {
+        let j = job(serde_json::json!({"id": 18, "token": "t", "runner_info": {"timeout": 7}}));
+        let cancel = CancelSignal::default();
+        let limits = |deadline| Limits {
+            deadline,
+            cancel: &cancel,
+            stop_at: RemoteState::Canceling,
+        };
+        let later = Instant::now() + Duration::from_secs(60);
+        let endless = std::future::pending::<()>;
+
+        assert!(matches!(limits(later).bound(async { 5 }).await, Ok(5)));
+        assert!(limits(later).check(&j).is_ok());
+
+        let past = limits(Instant::now());
+        assert!(matches!(
+            past.bound(endless()).await,
+            Err(RunError::TimedOut)
+        ));
+        let failure = past.check(&j).unwrap_err();
+        assert_eq!(failure.reason, FailureReason::JobExecutionTimeout);
+        assert_eq!(failure.message, "execution took longer than 7s");
+
+        let waiting = limits(later);
+        let trigger = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.update(RemoteState::Canceling);
+        };
+        let (stopped, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(waiting.bound(endless()), trigger)
+        })
+        .await
+        .expect("a cancel did not stop the work");
+        assert!(matches!(stopped, Err(RunError::Canceled)));
+        assert_eq!(
+            waiting.check(&j).unwrap_err().reason,
+            FailureReason::JobCanceled
+        );
     }
 
     #[test]

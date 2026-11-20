@@ -67,6 +67,20 @@ fn workspace_owner(dir: &Path) -> Option<String> {
     }
 }
 
+/// `work`, dropped with an error once `limits` (when given) are reached
+async fn within<T>(
+    limits: Option<&Limits<'_>>,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match limits {
+        Some(limits) => limits
+            .bound(work)
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the job timed out or was canceled"))),
+        None => work.await,
+    }
+}
+
 /// Settings of the host dockerd that the runner's config needs but that only
 /// dockerd's own configuration can provide; each entry says how to fix it.
 /// `resolve` returns a host name's addresses, none when it does not resolve.
@@ -232,6 +246,7 @@ impl DockerExecutor {
             true,
             // Not root: the workspace belongs to the runner again
             workspace_owner(job_dir),
+            None,
         )
         .await
     }
@@ -300,6 +315,7 @@ impl DockerExecutor {
         &self,
         job: &Job,
         job_dir: &Path,
+        deadline: Instant,
         trace: &mut TraceWriter<'_>,
         restore: &dyn Restore,
     ) -> JobOutcome {
@@ -309,6 +325,7 @@ impl DockerExecutor {
         let outcome = std::panic::AssertUnwindSafe(self.start_and_run(
             job,
             job_dir,
+            deadline,
             trace,
             &mut containers,
             restore,
@@ -325,10 +342,19 @@ impl DockerExecutor {
         &self,
         job: &Job,
         job_dir: &Path,
+        deadline: Instant,
         trace: &mut TraceWriter<'_>,
         containers: &mut JobContainers,
         restore: &dyn Restore,
     ) -> JobOutcome {
+        // Like the scripts, pulls and service startup stop at the job timeout
+        // and once the job is being canceled
+        let cancel = trace.cancel();
+        let limits = Limits {
+            deadline,
+            cancel: &cancel,
+            stop_at: RemoteState::Canceling,
+        };
         let env = script::job_env(
             job,
             "/builds",
@@ -350,7 +376,7 @@ impl DockerExecutor {
             .write(&format!("Using Docker executor with image {} ...\n", image))
             .await;
         info!("🐳 Using Docker image: {}", image);
-        self.ensure_image(&image, Some(&policies), job, trace)
+        self.ensure_image(&image, Some(&policies), job, trace, &limits)
             .await?;
 
         write_variable_files(&env)
@@ -365,7 +391,11 @@ impl DockerExecutor {
             && git::strategy(&job.variables, job.allow_git_fetch) != GitStrategy::None
         {
             let helper = self.config.helper_image.clone();
-            self.ensure_image(&helper, None, job, trace).await?;
+            self.ensure_image(&helper, None, job, trace, &limits)
+                .await?;
+            // Container API calls are not interrupted (a dropped create could
+            // leave a container nobody removes), so a cancel is seen between them
+            limits.check(job)?;
             let id = self
                 .start_helper(job, job_dir, &env)
                 .await
@@ -395,6 +425,7 @@ impl DockerExecutor {
 
         // Services need a network of their own to be reachable by alias
         if !services.is_empty() {
+            limits.check(job)?;
             let network = format!("turboci-job-{}", job.id);
             self.create_network(&network)
                 .await
@@ -406,8 +437,15 @@ impl DockerExecutor {
             trace
                 .write(&format!("Starting service {} ...\n", service_image))
                 .await;
-            self.ensure_image(&service_image, Some(&service.pull_policy), job, trace)
-                .await?;
+            self.ensure_image(
+                &service_image,
+                Some(&service.pull_policy),
+                job,
+                trace,
+                &limits,
+            )
+            .await?;
+            limits.check(job)?;
             let mut host_config = self.host_config(volumes.clone(), containers.network.as_deref());
             let mut service = service.clone();
             if image::is_dind(&service_image) {
@@ -439,10 +477,11 @@ impl DockerExecutor {
                 .map_err(|e| JobFailure::system(format!("service {}: {}", service_image, e)))?;
         }
         if let Some(network) = containers.network.clone() {
-            self.wait_for_services(job.id, &network, &containers.services, trace)
+            self.wait_for_services(job.id, &network, &containers.services, trace, &limits)
                 .await;
         }
 
+        limits.check(job)?;
         let name = format!("turboci-job-{}", job.id);
         let config = ContainerCreateBody {
             image: Some(image.clone()),
@@ -494,7 +533,7 @@ impl DockerExecutor {
             builds: "/builds".to_string(),
             project: format!("/builds/{}", subdir),
         };
-        run_job_steps(job, &sources, &runner, trace, &dirs, restore).await
+        run_job_steps(job, deadline, &sources, &runner, trace, &dirs, restore).await
     }
 
     /// Start the container that checks out sources, with the workspace mounted
@@ -611,6 +650,7 @@ impl DockerExecutor {
         job_policies: Option<&[String]>,
         job: &Job,
         trace: &mut TraceWriter<'_>,
+        limits: &Limits<'_>,
     ) -> JobOutcome {
         let pull_failure = |message: String| JobFailure {
             reason: FailureReason::ImagePullFailure,
@@ -659,32 +699,23 @@ impl DockerExecutor {
             from_image: reference.as_str(),
             ..Default::default()
         });
-        let mut stream = self.docker.create_image(options, None, credentials);
-        let cancel = trace.cancel();
-        loop {
-            let progress = tokio::select! {
-                progress = stream.next() => progress,
-                _ = cancel.reached(RemoteState::Aborted) => {
-                    return Err(JobFailure {
-                        reason: FailureReason::JobCanceled,
-                        exit_code: None,
-                        message: "canceled".to_string(),
-                    });
+        let pull = async {
+            let mut stream = self.docker.create_image(options, None, credentials);
+            while let Some(progress) = stream.next().await {
+                if let Err(e) = progress {
+                    let error = e.to_string();
+                    let hint = image::registry_pull_hint(&error, image::registry(image))
+                        .map(|hint| format!("\n{}", hint))
+                        .unwrap_or_default();
+                    return Err(pull_failure(format!(
+                        "failed to pull image {}: {}{}",
+                        image, error, hint
+                    )));
                 }
-            };
-            let Some(progress) = progress else { break };
-            if let Err(e) = progress {
-                let error = e.to_string();
-                let hint = image::registry_pull_hint(&error, image::registry(image))
-                    .map(|hint| format!("\n{}", hint))
-                    .unwrap_or_default();
-                return Err(pull_failure(format!(
-                    "failed to pull image {}: {}{}",
-                    image, error, hint
-                )));
             }
-        }
-        Ok(())
+            Ok(())
+        };
+        limits.bound(pull).await.map_err(|stop| stop.failure(job))?
     }
 
     /// Create a bridge network for the job (replacing a leftover one)
@@ -749,6 +780,7 @@ impl DockerExecutor {
         network: &str,
         services: &[String],
         trace: &mut TraceWriter<'_>,
+        limits: &Limits<'_>,
     ) {
         let mut checks = Vec::new();
         for id in services {
@@ -805,6 +837,7 @@ impl DockerExecutor {
                 },
                 false,
                 None,
+                Some(limits),
             )
             .await
         {
@@ -814,7 +847,8 @@ impl DockerExecutor {
     }
 
     /// Run a shell script in a short-lived container of the helper image and
-    /// return its output (only stdout when `stdout_only`)
+    /// return its output (only stdout when `stdout_only`). With `limits`, it
+    /// is given up on (and its container removed) like a script.
     async fn run_helper(
         &self,
         name: &str,
@@ -822,10 +856,11 @@ impl DockerExecutor {
         host_config: HostConfig,
         stdout_only: bool,
         user: Option<String>,
+        limits: Option<&Limits<'_>>,
     ) -> Result<String> {
         use bollard::container::{LogsOptions, StartContainerOptions, WaitContainerOptions};
 
-        self.pull_if_missing(&self.config.helper_image).await?;
+        within(limits, self.pull_if_missing(&self.config.helper_image)).await?;
         let config = ContainerCreateBody {
             image: Some(self.config.helper_image.clone()),
             entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
@@ -835,7 +870,8 @@ impl DockerExecutor {
             ..Default::default()
         };
         let id = self.create_named(name, config).await?;
-        let result = async {
+        // The container is removed below however this ends
+        let result = within(limits, async {
             self.docker
                 .start_container(&id, None::<StartContainerOptions<String>>)
                 .await?;
@@ -863,7 +899,7 @@ impl DockerExecutor {
                 output.push_str(&chunk?.to_string());
             }
             anyhow::Ok(output)
-        }
+        })
         .await;
         let _ = self.force_remove(&id).await;
         result

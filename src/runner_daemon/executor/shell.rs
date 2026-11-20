@@ -47,6 +47,7 @@ impl ShellExecutor {
     pub(super) async fn execute(
         &self,
         job: &Job,
+        deadline: Instant,
         trace: &mut TraceWriter<'_>,
         restore: &dyn Restore,
     ) -> JobOutcome {
@@ -78,7 +79,7 @@ impl ShellExecutor {
             .map_err(JobFailure::system)?;
 
         let runner = ShellRunner { env: env.vars };
-        run_job_steps(job, &runner, &runner, trace, &dirs, restore).await
+        run_job_steps(job, deadline, &runner, &runner, trace, &dirs, restore).await
     }
 }
 
