@@ -79,6 +79,10 @@ pub struct Metrics {
     cache_uploads: [AtomicU64; 3],
     cache_s3_errors: AtomicU64,
     config_reloads: [AtomicU64; 2],
+    /// Size of the kept workspaces at the last sweep; `u64::MAX` before the
+    /// first one, or without `workspace_max_size` (they are not measured)
+    workspaces_size: AtomicU64,
+    workspaces_evicted: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -95,6 +99,8 @@ impl Default for Metrics {
             cache_uploads: Default::default(),
             cache_s3_errors: AtomicU64::new(0),
             config_reloads: Default::default(),
+            workspaces_size: AtomicU64::new(u64::MAX),
+            workspaces_evicted: AtomicU64::new(0),
         }
     }
 }
@@ -150,6 +156,12 @@ impl Metrics {
 
     pub fn config_reload(&self, result: ConfigReload) {
         self.config_reloads[result as usize].fetch_add(1, Relaxed);
+    }
+
+    /// A sweep measured the workspaces and evicted `evicted` of them
+    pub fn workspaces_swept(&self, size: u64, evicted: u64) {
+        self.workspaces_size.store(size, Relaxed);
+        self.workspaces_evicted.fetch_add(evicted, Relaxed);
     }
 
     /// The metrics in Prometheus text format (version 0.0.4)
@@ -260,6 +272,26 @@ impl Metrics {
             "Config reloads (SIGHUP), by result; a failed one keeps the running config",
             labeled("result", &CONFIG_RELOADS, &self.config_reloads),
         );
+        family(
+            &mut out,
+            "turboci_workspaces_evicted_total",
+            "counter",
+            "Workspaces deleted to stay within workspace_max_size",
+            [(
+                String::new(),
+                self.workspaces_evicted.load(Relaxed).to_string(),
+            )],
+        );
+        let size = self.workspaces_size.load(Relaxed);
+        if size != u64::MAX {
+            family(
+                &mut out,
+                "turboci_workspaces_size_bytes",
+                "gauge",
+                "Size of the kept workspaces at the last hourly sweep",
+                [(String::new(), size.to_string())],
+            );
+        }
         family(
             &mut out,
             "process_start_time_seconds",
@@ -440,6 +472,10 @@ mod tests {
         metrics.cache_upload(CacheUpload::Unchanged);
         metrics.cache_s3_errors(3);
         metrics.config_reload(ConfigReload::Failure);
+        assert!(!metrics
+            .render(&gauges())
+            .contains("turboci_workspaces_size_bytes"));
+        metrics.workspaces_swept(4096, 2);
 
         let text = metrics.render(&gauges());
         for line in [
@@ -461,6 +497,8 @@ mod tests {
             "turboci_cache_s3_errors_total 3",
             "turboci_config_reloads_total{result=\"success\"} 0",
             "turboci_config_reloads_total{result=\"failure\"} 1",
+            "turboci_workspaces_evicted_total 2",
+            "turboci_workspaces_size_bytes 4096",
         ] {
             assert!(
                 text.lines().any(|l| l == line),

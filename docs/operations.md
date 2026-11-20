@@ -70,7 +70,8 @@ does not stop or restart it.
 
 Every job's containers and network are removed when it ends, also when it
 fails, times out or is canceled. Its workspace is kept for the project's next
-job and deleted after `workspace_max_age_days` without a job (see
+job and deleted after `workspace_max_age_days` without a job, or earlier when
+the workspaces exceed `workspace_max_size` (see
 [workspaces](configuration.md#workspaces)); file variables are always removed. Containers and networks carry the
 label `turboci.runner=<system id>`; on start the runner removes any it left
 behind (for example after a power loss). Containers of other runners on the
@@ -78,7 +79,10 @@ same Docker daemon are never touched.
 
 The local cache removes archives not used for `cache_max_age_days` (default
 14), and with `cache_max_size` the least recently used archives of any
-project once all of them together exceed that size. To see or clear it:
+project once all of them together exceed that size. Both are checked after
+each save or download and, like the workspace limits, at start and every
+hour for all projects, so the archives of a project without new jobs age out
+too. To see or clear it:
 
 ```bash
 turboci runner-stats -c /etc/turboci-runner.toml
@@ -117,6 +121,9 @@ scrape_configs:
 | `turboci_cache_restores_total{result}` | counter | Cache entries restored: `hit`, `miss`, `error` |
 | `turboci_cache_uploads_total{result}` | counter | Saved archives in S3: `sent`, `unchanged` (S3 had the same content), `failed` |
 | `turboci_cache_s3_errors_total` | counter | S3 calls for the cache that failed; the jobs used the local cache |
+| `turboci_config_reloads_total{result}` | counter | [Config reloads](#reloading-the-config): `success`, `failure` |
+| `turboci_workspaces_evicted_total` | counter | Workspaces deleted to stay within `workspace_max_size` |
+| `turboci_workspaces_size_bytes` | gauge | Size of the kept workspaces at the last hourly sweep (only with `workspace_max_size`) |
 | `process_start_time_seconds` | gauge | Start of the runner process (Unix time) |
 | `process_resident_memory_bytes` | gauge | Resident memory of the runner (Linux) |
 

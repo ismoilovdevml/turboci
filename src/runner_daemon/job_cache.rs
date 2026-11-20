@@ -276,6 +276,31 @@ impl LocalCache {
         .await;
     }
 
+    /// Apply the age limit to every project's archives and the size limit
+    /// to the whole cache, off the async runtime: the runner's periodic sweep,
+    /// so projects without new jobs age out too
+    pub async fn evict_all(&self) {
+        let (max_age, max_size) = (self.max_age, self.max_size);
+        if max_age.is_none() && max_size.is_none() {
+            return;
+        }
+        let root = self.root.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let (Some(max_age), Ok(projects)) = (max_age, std::fs::read_dir(&root)) {
+                for project in projects.flatten() {
+                    if project.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        evict_old(&project.path(), max_age);
+                    }
+                }
+            }
+            if let Some(max_size) = max_size {
+                // Nothing was just written: no archive needs keeping
+                evict_over_size(&root, max_size, Path::new(""));
+            }
+        })
+        .await;
+    }
+
     fn archive_path(&self, project_id: u64, key: &str) -> PathBuf {
         self.root
             .join(format!("project-{}", project_id))

@@ -108,6 +108,10 @@ pub struct ExecutorConfig {
     /// instead of cloned); workspaces no job used for this many days are
     /// deleted. 0 deletes every workspace when its job ends.
     pub workspace_max_age_days: u64,
+    /// Total size of the kept workspaces, such as "50g": the least recently
+    /// used are deleted beyond it, never one in use (unset or "0" = no limit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_max_size: Option<String>,
     #[serde(default)]
     pub docker: DockerConfig,
     #[serde(default)]
@@ -473,6 +477,7 @@ impl Default for ExecutorConfig {
             // scripts directly as the runner's user and must be chosen explicitly.
             executor_type: "docker".to_string(),
             workspace_max_age_days: 7,
+            workspace_max_size: None,
             docker: DockerConfig::default(),
             shell: ShellConfig::default(),
         }
@@ -663,8 +668,16 @@ fn optional_size(field: &str, value: Option<&str>) -> Result<Option<u64>> {
     Ok((bytes > 0).then_some(bytes))
 }
 
-/// Daemon options: admission control and metrics
+/// Daemon options: admission control, metrics and the workspace quota
 impl RunnerConfig {
+    /// `executor.workspace_max_size` in bytes; `None` when off
+    pub fn workspace_max_size_bytes(&self) -> Result<Option<u64>> {
+        optional_size(
+            "executor.workspace_max_size",
+            self.executor.workspace_max_size.as_deref(),
+        )
+    }
+
     /// Address of the metrics endpoint; `None` when off
     pub fn metrics_addr(&self) -> Result<Option<std::net::SocketAddr>> {
         self.metrics_listen
@@ -694,6 +707,7 @@ impl RunnerConfig {
         self.min_free_memory_bytes()?;
         self.min_free_disk_bytes()?;
         self.metrics_addr()?;
+        self.workspace_max_size_bytes()?;
         if self
             .max_load_avg
             .is_some_and(|load| !load.is_finite() || load <= 0.0)
@@ -1144,6 +1158,24 @@ mod tests {
             "max_load_avg = inf",
         ] {
             assert!(daemon_config(bad).validate().is_err(), "accepted {}", bad);
+        }
+    }
+
+    #[test]
+    fn parses_the_workspace_quota() {
+        assert_eq!(daemon_config("").workspace_max_size_bytes().unwrap(), None);
+        let content = "[executor]\nworkspace_max_size = \"50g\"";
+        let config = daemon_config(content);
+        config.validate().unwrap();
+        assert!(unknown_keys(content, &config).is_empty());
+        assert_eq!(config.workspace_max_size_bytes().unwrap(), Some(50 << 30));
+        let off = daemon_config("[executor]\nworkspace_max_size = \"0\"");
+        off.validate().unwrap();
+        assert_eq!(off.workspace_max_size_bytes().unwrap(), None);
+
+        for bad in ["\"-1\"", "\"big\"", "\"5t\""] {
+            let config = daemon_config(&format!("[executor]\nworkspace_max_size = {}", bad));
+            assert!(config.validate().is_err(), "accepted {}", bad);
         }
     }
 

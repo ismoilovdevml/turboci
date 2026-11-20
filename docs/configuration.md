@@ -382,6 +382,14 @@ and ignored files (`GIT_CLEAN_FLAGS`, default `-ffdx`).
 | Key | Default | Description |
 |---|---|---|
 | `[executor] workspace_max_age_days` | `7` | Workspaces no job used for this many days are deleted. `0` deletes every workspace when its job ends, so every job clones |
+| `[executor] workspace_max_size` | unset | Total size of the kept workspaces of all projects (`"512m"`, `"50g"`, bytes). Beyond it the least recently used workspaces are deleted, never one a job is using. Unset or `"0"`: no limit |
+
+Both limits are applied when the runner starts and then every hour, for every
+project, whether or not it still has jobs. A workspace that a job is using is
+never deleted, even when the workspaces in use alone exceed
+`workspace_max_size` (the runner then logs a warning). Workspaces are
+measured without blocking jobs; a deleted workspace is first renamed, so a
+job that starts meanwhile gets a fresh one and clones.
 
 - Each project has one workspace per job running at the same time
   (`CI_CONCURRENT_PROJECT_ID`), and protected branches and tags never share

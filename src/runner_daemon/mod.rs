@@ -20,6 +20,7 @@ pub mod capacity;
 pub mod config;
 pub mod executor;
 pub mod git;
+pub mod housekeeping;
 pub mod image;
 pub mod job_cache;
 pub mod metrics;
@@ -386,15 +387,13 @@ pub struct RunnerDaemon {
     /// job claims its workspace: an eviction only removes workspaces that were
     /// not in use when it started, so no job may claim one until it ends
     evicting: Arc<tokio::sync::RwLock<()>>,
-    /// When unused workspaces were last looked for
-    last_eviction: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Reads the host's free memory, disk space and load for admission control
     probe: Arc<dyn admission::Probe>,
     /// Counters served on `metrics_listen`
     metrics: Arc<metrics::Metrics>,
 }
 
-/// How often unused workspaces are looked for
+/// How often workspaces and cache archives past their limits are looked for
 const EVICTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 impl RunnerDaemon {
@@ -447,7 +446,6 @@ impl RunnerDaemon {
             rotating: Arc::default(),
             workspaces_in_use: Arc::default(),
             evicting: Arc::default(),
-            last_eviction: Arc::default(),
             probe: Arc::new(admission::HostProbe),
             metrics: Arc::default(),
         }
@@ -526,6 +524,7 @@ impl RunnerDaemon {
 
         self.executor.sweep_orphans().await;
         let rotation = AbortOnDrop(tokio::spawn(self.clone().rotate_token()));
+        let housekeeping = AbortOnDrop(tokio::spawn(self.clone().housekeeping()));
 
         let mut connected = false;
         let mut backoff = RequestBackoff::new(self.check_interval());
@@ -610,6 +609,7 @@ impl RunnerDaemon {
         // Let a token reset in flight be saved, or the new token would be lost
         let _rotating = self.rotating.lock().await;
         drop(rotation);
+        drop(housekeeping);
         info!("✅ Runner stopped");
         Ok(())
     }
@@ -812,7 +812,6 @@ impl RunnerDaemon {
         let project_dir = self.project_dir(&job);
         let workspace = self.executor.job_dir(&job);
         self.claim_workspace(&workspace).await;
-        self.evict_workspaces();
         let prepared = match self.executor.prepare(&job).await {
             Ok(()) => tokio::fs::create_dir_all(&project_dir)
                 .await
@@ -941,33 +940,85 @@ impl RunnerDaemon {
         }
     }
 
-    /// Remove workspaces no job used for `workspace_max_age_days`, in the
-    /// background and at most once per `EVICTION_INTERVAL`
-    fn evict_workspaces(&self) {
-        let days = self.config.executor.workspace_max_age_days;
-        let due = self.last_eviction.lock().is_ok_and(|mut last| {
-            let due = days > 0 && last.is_none_or(|at| at.elapsed() >= EVICTION_INTERVAL);
-            if due {
-                *last = Some(std::time::Instant::now());
-            }
-            due
-        });
-        if !due {
-            return;
+    /// Sweep at start and every `EVICTION_INTERVAL` (see `sweep`)
+    async fn housekeeping(self) {
+        loop {
+            self.sweep().await;
+            sleep(EVICTION_INTERVAL).await;
         }
-        let daemon = self.clone();
-        tokio::spawn(async move {
-            let _evicting = daemon.evicting.write().await;
-            let in_use = daemon
+    }
+
+    /// Remove workspaces no job used for `workspace_max_age_days`, the least
+    /// recently used beyond `workspace_max_size`, and the cache archives of
+    /// every project past `cache_max_age_days` or `cache_max_size`.
+    /// Workspaces in use are never touched.
+    async fn sweep(&self) {
+        let root = self.executor.builds_root();
+        let max_size = self.config.workspace_max_size_bytes().unwrap_or(None);
+        // Measured before taking the lock: walking a large builds directory
+        // takes a while, and jobs cannot claim workspaces during the lock
+        let scanned = match max_size {
+            Some(_) => {
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || housekeeping::scan(&root))
+                    .await
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        {
+            let _evicting = self.evicting.write().await;
+            let in_use = self
                 .workspaces_in_use
                 .lock()
                 .map(|in_use| in_use.clone())
                 .unwrap_or_default();
-            daemon
-                .executor
-                .evict_workspaces(Duration::from_secs(days * 24 * 60 * 60), &in_use)
+            let days = self.config.executor.workspace_max_age_days;
+            if days > 0 {
+                self.executor
+                    .evict_workspaces(Duration::from_secs(days * 24 * 60 * 60), &in_use)
+                    .await;
+            }
+            if let Some(max_size) = max_size {
+                // Only renames happen under the lock; deleting comes after it
+                let evicted = tokio::task::spawn_blocking(move || {
+                    // The age limit may have removed some already
+                    let present: Vec<_> = scanned.into_iter().filter(|w| w.path.exists()).collect();
+                    let total: u64 = present.iter().map(|w| w.size).sum();
+                    let evicted: Vec<housekeeping::Workspace> =
+                        housekeeping::over_quota(&present, max_size, &in_use)
+                            .into_iter()
+                            .filter(|w| housekeeping::detach(&w.path))
+                            .cloned()
+                            .collect();
+                    (total, evicted)
+                })
                 .await;
-        });
+                if let Ok((total, evicted)) = evicted {
+                    let freed: u64 = evicted.iter().map(|w| w.size).sum();
+                    if !evicted.is_empty() {
+                        info!(
+                            "💾 Workspaces take {}, above workspace_max_size {}: removing the {} least recently used ({})",
+                            admission::human(total),
+                            admission::human(max_size),
+                            evicted.len(),
+                            admission::human(freed)
+                        );
+                    }
+                    if total - freed > max_size {
+                        warn!(
+                            "Workspaces in use take {}, above workspace_max_size {}",
+                            admission::human(total - freed),
+                            admission::human(max_size)
+                        );
+                    }
+                    self.metrics
+                        .workspaces_swept(total - freed, evicted.len() as u64);
+                }
+            }
+        }
+        let _ = tokio::task::spawn_blocking(move || housekeeping::remove_detached(&root)).await;
+        self.cache.evict_all().await;
     }
 
     /// Keep-alive for the job: learns about remote cancellation even when the job
@@ -2849,6 +2900,104 @@ mod tests {
         assert!(daemon
             .render_metrics()
             .contains("turboci_config_reloads_total{result=\"failure\"} 5\n"));
+    }
+
+    /// A workspace of `bytes` that a job last used `hours` ago
+    fn old_workspace(builds: &std::path::Path, name: &str, bytes: usize, hours: u64) {
+        let dir = builds.join(name);
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        std::fs::write(dir.join("project/data"), vec![b'x'; bytes]).unwrap();
+        let marker = dir.join(".turboci-last-used");
+        std::fs::write(&marker, b"").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(marker)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(hours * 3600))
+            .unwrap();
+    }
+
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn the_sweep_keeps_workspaces_within_the_quota_but_never_one_in_use() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon_with(&server, dir.path(), |config| {
+            config.executor.workspace_max_size = Some("24k".to_string());
+            config.cache_max_age_days = 1;
+        })
+        .await;
+        let builds = dir.path().join("builds");
+        // 32 KiB in all, oldest first; the oldest one is in use by a job
+        old_workspace(&builds, "project-1-0", 8192, 40);
+        old_workspace(&builds, "project-2-0", 8192, 30);
+        old_workspace(&builds, "project-3-0", 8192, 20);
+        old_workspace(&builds, "project-4-0", 8192, 10);
+        daemon.claim_workspace(&builds.join("project-1-0")).await;
+        // A cache archive of a project without jobs for two days
+        let archive = dir.path().join("cache/project-9/old.zip");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"zip").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86400))
+            .unwrap();
+
+        daemon.sweep().await;
+
+        // 32 KiB > 24 KiB: the least recently used one not in use goes, and 24 KiB fit
+        assert_eq!(
+            entries(&builds),
+            ["project-1-0", "project-3-0", "project-4-0"]
+        );
+        assert!(
+            !archive.exists(),
+            "cache archive past cache_max_age_days kept"
+        );
+        let metrics = daemon.render_metrics();
+        assert!(
+            metrics.contains("turboci_workspaces_evicted_total 1\n"),
+            "{}",
+            metrics
+        );
+        assert!(metrics.contains(&format!("turboci_workspaces_size_bytes {}\n", 3 * 8192)));
+
+        // A quota the job's own workspace exceeds: everything else goes, it stays
+        let daemon = daemon_with(&server, dir.path(), |config| {
+            config.executor.workspace_max_size = Some("1k".to_string());
+        })
+        .await;
+        daemon.claim_workspace(&builds.join("project-1-0")).await;
+        daemon.sweep().await;
+        assert_eq!(entries(&builds), ["project-1-0"]);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_without_a_quota_keeps_recent_workspaces() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let builds = dir.path().join("builds");
+        old_workspace(&builds, "project-1-0", 8192, 40);
+        // Unused for longer than workspace_max_age_days (7)
+        old_workspace(&builds, "project-2-0", 10, 8 * 24);
+
+        daemon.sweep().await;
+
+        assert_eq!(entries(&builds), ["project-1-0"]);
+        assert!(!daemon
+            .render_metrics()
+            .contains("turboci_workspaces_size_bytes"));
     }
 
     #[test]

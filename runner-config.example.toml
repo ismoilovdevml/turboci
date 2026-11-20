@@ -76,6 +76,10 @@ executor_type = "docker"
 # `git fetch` instead of cloned again (GIT_STRATEGY=fetch). Workspaces no job
 # used for this many days are deleted; 0 deletes each workspace when its job ends.
 workspace_max_age_days = 7
+# Total size of the kept workspaces of all projects ("512m", "50g", bytes);
+# beyond it the least recently used are deleted, never one a job is using.
+# Checked at start and every hour. Unset or "0": no limit
+# workspace_max_size = "100g"
 
 # Shell executor configuration (used when executor_type = "shell")
 [executor.shell]
