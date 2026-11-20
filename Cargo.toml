@@ -39,6 +39,10 @@ dns-lookup = "2"
 tempfile = "3"
 rustix = { version = "1.1", features = ["fs", "process"] }
 
+# musl's malloc is slow under multi-threaded load; macOS and glibc keep the system allocator
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
+
 [dev-dependencies]
 wiremock = "0.6"
 

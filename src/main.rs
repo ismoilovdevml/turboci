@@ -7,6 +7,11 @@ mod net;
 mod runner_daemon;
 mod security;
 
+// The static musl release binaries would otherwise use musl's slow malloc
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "turboci")]
 #[command(about = "⚡ GitLab CI/CD runner: runs GitLab jobs in Docker containers or on the host", long_about = None)]
