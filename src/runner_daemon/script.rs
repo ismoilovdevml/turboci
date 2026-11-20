@@ -60,13 +60,33 @@ pub struct JobEnv {
     pub files: Vec<(PathBuf, String)>,
 }
 
-impl JobEnv {
-    /// Set a variable, replacing an earlier value of the same name
+/// Variables in the order they were last set: setting a name again replaces
+/// its value and moves it to the end. The replaced entry is left empty and
+/// skipped, so a set costs O(1) however many variables a job has.
+#[derive(Default)]
+struct Vars {
+    entries: Vec<Option<(String, String)>>,
+    index: HashMap<String, usize>,
+}
+
+impl Vars {
     fn set(&mut self, key: &str, value: String) {
-        self.vars.retain(|(k, _)| k != key);
-        self.vars.push((key.to_string(), value));
+        if let Some(earlier) = self.index.insert(key.to_string(), self.entries.len()) {
+            self.entries[earlier] = None;
+        }
+        self.entries.push(Some((key.to_string(), value)));
     }
 
+    fn iter(&self) -> impl Iterator<Item = &(String, String)> {
+        self.entries.iter().flatten()
+    }
+
+    fn into_vec(self) -> Vec<(String, String)> {
+        self.entries.into_iter().flatten().collect()
+    }
+}
+
+impl JobEnv {
     /// `KEY=value` list, as Docker expects it
     pub fn to_docker(&self) -> Vec<String> {
         self.vars
@@ -185,22 +205,23 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
     let tmp_dir = format!("{}/{}.tmp", builds_dir, subdir);
 
     let mut env = JobEnv::default();
-    env.set("CI_BUILDS_DIR", builds_dir.to_string());
-    env.set("CI_PROJECT_DIR", project_dir);
+    let mut vars = Vars::default();
+    vars.set("CI_BUILDS_DIR", builds_dir.to_string());
+    vars.set("CI_PROJECT_DIR", project_dir);
     // Variables gitlab-runner defines itself (common/build.go GetDefaultVariables)
-    env.set("CI_SERVER", "yes".to_string());
-    env.set("CI_JOB_STATUS", "running".to_string());
-    env.set(
+    vars.set("CI_SERVER", "yes".to_string());
+    vars.set("CI_JOB_STATUS", "running".to_string());
+    vars.set(
         "CI_JOB_TIMEOUT",
         job.timeout_secs().unwrap_or(3600).to_string(),
     );
     if runner.disposable {
-        env.set("CI_DISPOSABLE_ENVIRONMENT", "true".to_string());
+        vars.set("CI_DISPOSABLE_ENVIRONMENT", "true".to_string());
         if let Some(image) = &job.image {
-            env.set("CI_JOB_IMAGE", image.name.clone());
+            vars.set("CI_JOB_IMAGE", image.name.clone());
         }
     } else {
-        env.set("CI_SHARED_ENVIRONMENT", "true".to_string());
+        vars.set("CI_SHARED_ENVIRONMENT", "true".to_string());
     }
     if let Some(pem) = &runner.ca_pem {
         let key = "CI_SERVER_TLS_CA_FILE";
@@ -210,8 +231,8 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
         ));
         let path = format!("{}/{}", tmp_dir, key);
         // git (sources, submodules, LFS) trusts the same CA
-        env.set("GIT_SSL_CAINFO", path.clone());
-        env.set(key, path);
+        vars.set("GIT_SSL_CAINFO", path.clone());
+        vars.set(key, path);
     }
 
     // Every variable is visible to expansion, whatever its position
@@ -226,7 +247,7 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
             ok
         })
         .collect();
-    let mut values: HashMap<String, String> = env.vars.iter().cloned().collect();
+    let mut values: HashMap<String, String> = vars.iter().cloned().collect();
     for var in &valid {
         values.insert(var.key.clone(), var.value.clone().unwrap_or_default());
     }
@@ -244,11 +265,12 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
                 host_job_dir.join(format!("{}.tmp", subdir)).join(&var.key),
                 value,
             ));
-            env.set(&var.key, format!("{}/{}", tmp_dir, var.key));
+            vars.set(&var.key, format!("{}/{}", tmp_dir, var.key));
         } else {
-            env.set(&var.key, value);
+            vars.set(&var.key, value);
         }
     }
+    env.vars = vars.into_vec();
     env
 }
 
@@ -260,7 +282,7 @@ pub fn service_env(
     service_variables: &[crate::gitlab::Variable],
     values: &HashMap<String, String>,
 ) -> Vec<String> {
-    let mut env = JobEnv::default();
+    let mut vars = Vars::default();
     let visible = job
         .variables
         .iter()
@@ -275,9 +297,13 @@ pub fn service_env(
         } else {
             expand(&value, values)
         };
-        env.set(&var.key, value);
+        vars.set(&var.key, value);
     }
-    env.to_docker()
+    JobEnv {
+        vars: vars.into_vec(),
+        files: Vec::new(),
+    }
+    .to_docker()
 }
 
 /// Expand `$VAR` and `${VAR}` from `values` (unknown names expand to empty);
@@ -522,5 +548,50 @@ mod tests {
 
         assert_eq!(get(&env, "MODE"), Some("job"));
         assert_eq!(env.vars.iter().filter(|(k, _)| k == "MODE").count(), 1);
+    }
+
+    #[test]
+    fn a_variable_set_again_moves_to_the_end() {
+        let j = job(serde_json::json!([
+            {"key": "A", "value": "1"},
+            {"key": "B", "value": "2"},
+            {"key": "CI_SERVER", "value": "job"},
+            {"key": "A", "value": "3"},
+            {"key": "C", "value": "$A"}
+        ]));
+
+        let env = job_env(&j, "/b", Path::new("/h"), &RunnerVars::default());
+
+        let expected = [
+            ("CI_BUILDS_DIR", "/b"),
+            ("CI_PROJECT_DIR", "/b/project"),
+            ("CI_JOB_STATUS", "running"),
+            ("CI_JOB_TIMEOUT", "3600"),
+            ("CI_SHARED_ENVIRONMENT", "true"),
+            ("B", "2"),
+            ("CI_SERVER", "job"),
+            ("A", "3"),
+            ("C", "3"),
+        ];
+        let expected: Vec<(String, String)> = expected
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(env.vars, expected);
+    }
+
+    #[test]
+    fn service_variables_override_job_variables_in_place_of_last_set() {
+        let j = job(serde_json::json!([
+            {"key": "A", "value": "job", "public": true},
+            {"key": "B", "value": "job", "public": true},
+            {"key": "SECRET", "value": "x", "masked": true}
+        ]));
+        let service: Vec<crate::gitlab::Variable> =
+            serde_json::from_value(serde_json::json!([{"key": "A", "value": "service"}])).unwrap();
+
+        let env = service_env(&j, &service, &HashMap::new());
+
+        assert_eq!(env, ["B=job", "A=service"]);
     }
 }

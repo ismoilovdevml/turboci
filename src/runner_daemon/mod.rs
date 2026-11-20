@@ -5,7 +5,9 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::gitlab::{ArtifactUpload, FailureReason, GitLabClient, Job, JobState, RemoteState};
+use crate::gitlab::{
+    ArtifactUpload, FailureReason, GitLabClient, Job, JobState, RemoteState, Variable,
+};
 use crate::security::secret_scrubber::SecretScrubber;
 use cancel::{CancelSignal, Stop};
 use executor::{JobFailure, JobOutcome};
@@ -58,34 +60,28 @@ fn apply_runner_config(job: &mut Job, config: &config::RunnerConfig) {
             })
             .collect();
         let no_proxy = crate::net::effective_no_proxy(config.no_proxy.as_deref(), &aliases);
-        // Inserted first, so the job's own variables and `environment` win
-        for (key, value) in [
-            ("HTTP_PROXY", proxy.as_str()),
-            ("HTTPS_PROXY", proxy.as_str()),
-            ("http_proxy", proxy.as_str()),
-            ("https_proxy", proxy.as_str()),
-            ("NO_PROXY", no_proxy.as_str()),
+        // First, so the job's own variables and `environment` win
+        let proxy_variables = [
             ("no_proxy", no_proxy.as_str()),
-        ] {
-            job.variables.insert(
-                0,
-                serde_json::from_value(serde_json::json!({
-                    "key": key, "value": value, "public": true, "internal": true, "raw": true
-                }))
-                .expect("valid variable"),
-            );
-        }
+            ("NO_PROXY", no_proxy.as_str()),
+            ("https_proxy", proxy.as_str()),
+            ("http_proxy", proxy.as_str()),
+            ("HTTPS_PROXY", proxy.as_str()),
+            ("HTTP_PROXY", proxy.as_str()),
+        ]
+        .map(|(key, value)| Variable {
+            raw: true,
+            ..runner_variable(key, value.to_string())
+        });
+        prepend_variables(job, proxy_variables);
     }
-    for entry in &config.environment {
-        if let Some((key, value)) = entry.split_once('=') {
-            job.variables.push(
-                serde_json::from_value(serde_json::json!({
-                    "key": key.trim(), "value": value, "public": true, "internal": true
-                }))
-                .expect("valid variable"),
-            );
-        }
-    }
+    job.variables.extend(
+        config
+            .environment
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| runner_variable(key.trim(), value.to_string())),
+    );
     // Runner hooks run before the job's own hooks of the same name
     for (name, script) in [
         ("post_get_sources_script", &config.post_get_sources_script),
@@ -104,6 +100,26 @@ fn apply_runner_config(job: &mut Job, config: &config::RunnerConfig) {
             step.script.push(script.clone());
         }
     }
+}
+
+/// A public variable the runner adds to a job
+fn runner_variable(key: &str, value: String) -> Variable {
+    Variable {
+        key: key.to_string(),
+        value: Some(value),
+        public: true,
+        masked: false,
+        raw: false,
+        file: false,
+        internal: true,
+        variable_type: None,
+    }
+}
+
+/// Put `variables` before the job's own, which then override them
+fn prepend_variables(job: &mut Job, variables: impl IntoIterator<Item = Variable>) {
+    let own = std::mem::take(&mut job.variables);
+    job.variables = variables.into_iter().chain(own).collect();
 }
 
 /// Commit the binary was built from (set by CI builds), or the version
@@ -180,17 +196,25 @@ impl Drop for AbortOnDrop {
 }
 
 /// Restores into the workspace once the executor has checked out sources
-struct WorkspaceRestore<'a>(&'a RunnerDaemon);
+struct WorkspaceRestore<'a> {
+    daemon: &'a RunnerDaemon,
+    variables: &'a Variables,
+}
 
 #[async_trait::async_trait]
 impl executor::Restore for WorkspaceRestore<'_> {
     async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>, stop: &Stop) -> JobOutcome {
-        self.0.restore_workspace(job, trace, stop).await
+        self.daemon
+            .restore_workspace(job, self.variables, trace, stop)
+            .await
     }
 }
 
-/// Values of the job's variables, for expanding cache keys
-fn job_variables(job: &Job) -> std::collections::HashMap<String, String> {
+/// Values of a job's variables by name
+type Variables = std::collections::HashMap<String, String>;
+
+/// Values of the job's variables, for expanding cache keys and artifact paths
+fn job_variables(job: &Job) -> Variables {
     script::job_env(
         job,
         "",
@@ -601,33 +625,26 @@ impl RunnerDaemon {
             .unwrap_or_default();
         // Variables the runner adds, as gitlab-runner does; the job's own come later
         // and win
-        for (key, value) in [
-            ("CI_CONCURRENT_ID", slot.0.to_string()),
-            ("CI_CONCURRENT_PROJECT_ID", slot.1.to_string()),
-            ("CI_RUNNER_VERSION", env!("CARGO_PKG_VERSION").to_string()),
-            ("CI_RUNNER_REVISION", revision()),
-            ("CI_RUNNER_EXECUTABLE_ARCH", executable_arch()),
+        let runner_variables = [
             ("CI_RUNNER_SHORT_TOKEN", short_token(&self.current_token())),
-        ] {
-            job.variables.insert(
-                0,
-                serde_json::from_value(serde_json::json!({
-                    "key": key, "value": value, "public": true, "internal": true
-                }))
-                .expect("valid variable"),
-            );
-        }
+            ("CI_RUNNER_EXECUTABLE_ARCH", executable_arch()),
+            ("CI_RUNNER_REVISION", revision()),
+            ("CI_RUNNER_VERSION", env!("CARGO_PKG_VERSION").to_string()),
+            ("CI_CONCURRENT_PROJECT_ID", slot.1.to_string()),
+            ("CI_CONCURRENT_ID", slot.0.to_string()),
+        ]
+        .map(|(key, value)| runner_variable(key, value));
+        prepend_variables(&mut job, runner_variables);
         job.project_slot = slot.1;
         apply_runner_config(&mut job, &self.config);
-        let result = self.run_job(&job).await;
+        let result = self.run_job(job).await;
         if let Ok(mut slots) = self.slots.lock() {
             slots.release(project, slot);
         }
         result
     }
 
-    async fn run_job(&self, job: &Job) -> Result<()> {
-        let job = job.clone();
+    async fn run_job(&self, job: Job) -> Result<()> {
         let job_name = job
             .job_info
             .as_ref()
@@ -653,6 +670,8 @@ impl RunnerDaemon {
             ))
             .await;
 
+        // The job's variables are final now: expanded once for the whole job
+        let variables = job_variables(&job);
         let project_dir = self.project_dir(&job);
         let workspace = self.executor.job_dir(&job);
         self.claim_workspace(&workspace).await;
@@ -668,7 +687,14 @@ impl RunnerDaemon {
         if outcome.is_ok() {
             outcome = self
                 .executor
-                .execute(&job, &mut trace, &WorkspaceRestore(self))
+                .execute(
+                    &job,
+                    &mut trace,
+                    &WorkspaceRestore {
+                        daemon: self,
+                        variables: &variables,
+                    },
+                )
                 .await;
         }
         // Aborted jobs (runner shutdown, or gone from GitLab) upload nothing
@@ -691,7 +717,7 @@ impl RunnerDaemon {
                     .await;
             }
             let uploaded = self
-                .upload_artifacts(&job, &mut trace, outcome.is_ok())
+                .upload_artifacts(&job, &variables, &mut trace, outcome.is_ok())
                 .await;
             if job.artifacts.as_ref().is_some_and(|a| !a.is_empty()) {
                 trace.section_end(section).await;
@@ -714,7 +740,8 @@ impl RunnerDaemon {
                     .section_start("archive_cache", &format!("Saving cache for {} job", result))
                     .await;
             }
-            self.upload_cache(&job, &mut trace, outcome.is_ok()).await;
+            self.upload_cache(&job, &variables, &mut trace, outcome.is_ok())
+                .await;
             if saves_cache {
                 trace.section_end("archive_cache").await;
             }
@@ -830,6 +857,7 @@ impl RunnerDaemon {
     async fn restore_workspace(
         &self,
         job: &Job,
+        variables: &Variables,
         trace: &mut TraceWriter<'_>,
         stop: &Stop,
     ) -> JobOutcome {
@@ -844,7 +872,6 @@ impl RunnerDaemon {
             trace
                 .section_start("restore_cache", "Restoring cache")
                 .await;
-            let variables = job_variables(job);
             for cache_entry in &job.cache {
                 if cache_entry.policy != "pull" && cache_entry.policy != "pull-push" {
                     continue;
@@ -854,7 +881,7 @@ impl RunnerDaemon {
                 // branch's cache, or any branch could read it.
                 let mut fallback = variables.get("CACHE_FALLBACK_KEY").cloned();
                 if fallback.as_deref().is_some_and(|key| {
-                    job_cache::resolve_key(key, &variables).ends_with("-protected")
+                    job_cache::resolve_key(key, variables).ends_with("-protected")
                 }) {
                     trace
                         .write("WARNING: CACHE_FALLBACK_KEY ending in -protected is not allowed, ignoring it\n")
@@ -864,7 +891,7 @@ impl RunnerDaemon {
                 let keys: Vec<String> = std::iter::once(&cache_entry.key)
                     .chain(&cache_entry.fallback_keys)
                     .chain(fallback.as_ref())
-                    .map(|key| job_cache::resolve_key(key, &variables))
+                    .map(|key| job_cache::resolve_key(key, variables))
                     .collect();
                 trace
                     .write(&format!("Restoring cache {}...\n", keys[0]))
@@ -984,6 +1011,7 @@ impl RunnerDaemon {
     async fn upload_artifacts(
         &self,
         job: &Job,
+        variables: &Variables,
         trace: &mut TraceWriter<'_>,
         succeeded: bool,
     ) -> JobOutcome {
@@ -992,15 +1020,14 @@ impl RunnerDaemon {
         };
         let mut failure = None;
         let cancel = trace.cancel();
-        // Paths, exclude patterns and names may use variables
-        let variables = job_variables(job);
+        // Paths, exclude patterns and names may use `variables`
         let untracked = self
             .untracked_if_needed(job, job_artifacts.iter().any(|a| a.untracked), trace)
             .await;
         let expand_all = |items: &[String]| -> Vec<String> {
             items
                 .iter()
-                .map(|item| script::expand(item, &variables))
+                .map(|item| script::expand(item, variables))
                 .collect()
         };
         let workspace = self.project_dir(job);
@@ -1021,7 +1048,7 @@ impl RunnerDaemon {
             let name = artifact
                 .name
                 .as_deref()
-                .map(|name| script::expand(name, &variables))
+                .map(|name| script::expand(name, variables))
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| "artifacts".to_string());
             let name = name.as_str();
@@ -1133,12 +1160,17 @@ impl RunnerDaemon {
     }
 
     /// Save cache entries whose policy pushes and whose `when` matches the result
-    async fn upload_cache(&self, job: &Job, trace: &mut TraceWriter<'_>, succeeded: bool) {
+    async fn upload_cache(
+        &self,
+        job: &Job,
+        variables: &Variables,
+        trace: &mut TraceWriter<'_>,
+        succeeded: bool,
+    ) {
         if !self.config.cache_enabled {
             return;
         }
         let workspace = self.project_dir(job).to_string_lossy().into_owned();
-        let variables = job_variables(job);
         let cancel = trace.cancel();
         let wants_untracked = job
             .cache
@@ -1155,7 +1187,7 @@ impl RunnerDaemon {
             let mut paths: Vec<String> = cache_entry
                 .paths
                 .iter()
-                .map(|path| script::expand(path, &variables))
+                .map(|path| script::expand(path, variables))
                 .collect();
             if cache_entry.untracked.unwrap_or(false) {
                 paths.extend(untracked.iter().cloned());
@@ -1166,7 +1198,7 @@ impl RunnerDaemon {
             {
                 continue;
             }
-            let key = job_cache::resolve_key(&cache_entry.key, &variables);
+            let key = job_cache::resolve_key(&cache_entry.key, variables);
             trace.write(&format!("Saving cache {}...\n", key)).await;
             // An aborted job saves nothing more; checked first, so no later
             // entry starts. A dropped save only reads the workspace: a zip
@@ -1929,6 +1961,40 @@ mod tests {
         let trace = trace_of(&server, 133).await;
         assert!(!trace.contains("s3cr3t-pass"), "{}", trace);
         assert!(trace.contains("p=[MASKED]"), "{}", trace);
+    }
+
+    #[test]
+    fn runner_proxy_comes_before_job_variables_and_environment_after() {
+        let mut job: Job = serde_json::from_value(serde_json::json!({
+            "id": 1, "token": "t",
+            "variables": [{"key": "JOB", "value": "x"}]
+        }))
+        .unwrap();
+        let config = config::RunnerConfig {
+            proxy: Some("http://proxy:3128".to_string()),
+            environment: vec!["ENV = y".to_string()],
+            ..config::RunnerConfig::default()
+        };
+
+        apply_runner_config(&mut job, &config);
+
+        let keys: Vec<&str> = job.variables.iter().map(|v| v.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "no_proxy",
+                "NO_PROXY",
+                "https_proxy",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "JOB",
+                "ENV"
+            ]
+        );
+        assert!(job.variables[..6].iter().all(|v| v.raw && v.internal));
+        assert_eq!(job.variables[7].value.as_deref(), Some(" y"));
+        assert!(!job.variables[7].raw);
     }
 
     #[test]
