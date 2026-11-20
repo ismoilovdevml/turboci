@@ -936,6 +936,24 @@ impl DockerExecutor {
             .labels
             .get_or_insert_with(Default::default)
             .extend(self.labels());
+        let create = |config| {
+            self.docker.create_container(
+                Some(CreateContainerOptions {
+                    name: name.to_string(),
+                    ..Default::default()
+                }),
+                config,
+            )
+        };
+
+        // Usually the name is free; 409 Conflict when a container has it
+        match create(config.clone()).await {
+            Ok(response) => return Ok(response.id),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
+            }) => {}
+            Err(e) => return Err(e).context("Failed to create container"),
+        }
 
         // A container with this name from another runner on the same Docker host
         // (same job id, different GitLab) must not be killed
@@ -967,17 +985,7 @@ impl DockerExecutor {
                 }),
             )
             .await;
-        let response = self
-            .docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: name.to_string(),
-                    ..Default::default()
-                }),
-                config,
-            )
-            .await
-            .context("Failed to create container")?;
+        let response = create(config).await.context("Failed to create container")?;
         Ok(response.id)
     }
 
@@ -985,18 +993,20 @@ impl DockerExecutor {
     /// the runner's user (files created in containers belong to root)
     async fn release(&self, job_id: u64, containers: &JobContainers, job_dir: &Path) {
         // Removing the containers first stops everything the job started, so
-        // nothing the job controls runs during cleanup
-        for id in containers
+        // nothing the job controls runs during cleanup. They are independent,
+        // so they are removed at the same time.
+        let removals = containers
             .job
             .iter()
             .chain(&containers.helper)
             .chain(&containers.services)
-        {
-            match self.force_remove(id).await {
-                Ok(()) => info!("🗑️  Removed container: {}", id),
-                Err(e) => warn!("Failed to remove container {}: {}", id, e),
-            }
-        }
+            .map(|id| async move {
+                match self.force_remove(id).await {
+                    Ok(()) => info!("🗑️  Removed container: {}", id),
+                    Err(e) => warn!("Failed to remove container {}: {}", id, e),
+                }
+            });
+        futures_util::future::join_all(removals).await;
         if let Some(network) = &containers.network {
             if let Err(e) = self.docker.remove_network(network).await {
                 warn!("Failed to remove network {}: {}", network, e);
