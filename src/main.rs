@@ -12,6 +12,16 @@ mod security;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// mimalloc commits each arena up front on Linux, which nearly doubles the idle
+/// RSS of a daemon this small; commit pages on demand instead
+#[cfg(target_env = "musl")]
+fn tune_allocator() {
+    // mi_option_arena_eager_commit in mimalloc.h (not exported by libmimalloc-sys)
+    const ARENA_EAGER_COMMIT: libmimalloc_sys::mi_option_t = 4;
+    // SAFETY: setting an option only stores an integer; it is safe at any time
+    unsafe { libmimalloc_sys::mi_option_set(ARENA_EAGER_COMMIT, 0) }
+}
+
 #[derive(Parser)]
 #[command(name = "turboci")]
 #[command(about = "⚡ GitLab CI/CD runner: runs GitLab jobs in Docker containers or on the host", long_about = None)]
@@ -52,6 +62,8 @@ const DEFAULT_LOG_FILTER: &str = "warn,turboci=info";
 const MAX_BLOCKING_THREADS: usize = 64;
 
 fn main() -> Result<()> {
+    #[cfg(target_env = "musl")]
+    tune_allocator();
     // Jobs mostly wait on GitLab, Docker and child processes, and archive
     // building, extraction and hashing run on the blocking pool, so a few
     // async workers are enough
