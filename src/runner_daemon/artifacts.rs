@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tracing::warn;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use super::cancel::Stop;
@@ -11,7 +12,29 @@ use crate::gitlab::GitLabClient;
 pub struct Archive {
     pub file: tempfile::NamedTempFile,
     pub len: u64,
+    /// SHA-256 of the archive (hex), computed while it was written; set for
+    /// cache archives
+    pub sha256: Option<String>,
 }
+
+/// Buffer size for reading and writing archives
+const IO_BUF: usize = 256 * 1024;
+
+/// zstd level of cache entries: the fastest. On a node_modules-like tree
+/// (15,000 files, 57.6 MB) the archive was 20.56 MB, against 20.54 MB with
+/// the default level 3.
+const CACHE_ZSTD_LEVEL: i64 = 1;
+
+/// Cache entries smaller than this are stored: compressing them gains
+/// nothing and costs a compressor per entry
+const STORE_BELOW: u64 = 128;
+
+/// Extensions of files that are compressed already: cache entries with them
+/// are stored rather than compressed again
+const COMPRESSED_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "gz", "tgz", "zst", "zip", "whl", "jar", "woff2", "mp4",
+    "xz", "bz2", "7z",
+];
 
 /// Download a dependency's artifacts archive to a file in `staging_dir` and
 /// extract it into the workspace, until `stop`. Returns the archive size.
@@ -42,10 +65,78 @@ pub async fn extract_archive_file(path: &Path, workspace_path: &str, stop: &Stop
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)
             .with_context(|| format!("Failed to open {}", path.display()))?;
-        extract_zip_reader(file, &workspace, ExtractLimits::default(), &stop)
+        extract_zip_reader(
+            SeekBufReader::new(file)?,
+            &workspace,
+            ExtractLimits::default(),
+            &stop,
+        )
     })
     .await
     .context("Extraction task panicked")?
+}
+
+/// A buffered reader that keeps its buffer across seeks that land inside it.
+/// `std::io::BufReader` empties its buffer on every seek, and the ZIP reader
+/// seeks for every central directory record and every entry (mostly to
+/// where it already is): small entries would cost a full refill each.
+struct SeekBufReader<R> {
+    inner: std::io::BufReader<R>,
+    /// Position of the next byte `read` returns
+    pos: u64,
+}
+
+impl<R: Read + Seek> SeekBufReader<R> {
+    fn new(mut inner: R) -> std::io::Result<Self> {
+        let pos = inner.stream_position()?;
+        Ok(Self {
+            inner: std::io::BufReader::with_capacity(IO_BUF, inner),
+            pos,
+        })
+    }
+}
+
+impl<R: Read> Read for SeekBufReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for SeekBufReader<R> {
+    fn seek(&mut self, target: SeekFrom) -> std::io::Result<u64> {
+        let offset = match target {
+            SeekFrom::Start(to) => i64::try_from(i128::from(to) - i128::from(self.pos)).ok(),
+            SeekFrom::Current(offset) => Some(offset),
+            SeekFrom::End(_) => None,
+        };
+        match offset.and_then(|offset| Some((offset, self.pos.checked_add_signed(offset)?))) {
+            // Moves within the buffer when it can, seeks the file otherwise
+            Some((offset, pos)) => {
+                self.inner.seek_relative(offset)?;
+                self.pos = pos;
+            }
+            None => self.pos = self.inner.seek(target)?,
+        }
+        Ok(self.pos)
+    }
+}
+
+/// Copy `reader` to `writer` through `buf`, one buffer reused for every
+/// file of an archive
+fn copy_with(buf: &mut [u8], reader: &mut impl Read, writer: &mut impl Write) -> Result<u64> {
+    let mut copied = 0u64;
+    loop {
+        let n = match reader.read(buf) {
+            Ok(0) => return Ok(copied),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        writer.write_all(&buf[..n])?;
+        copied += n as u64;
+    }
 }
 
 /// Reads from `inner` until `stop` is set
@@ -124,6 +215,10 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
     // job container is running), so a path checked once could be swapped
     // for a symlink before it is used; a handle cannot.
     let root_dir = safe_fs::open_root(root)?;
+    // Entries come grouped by directory: the handles of the last one are
+    // kept, so a file next to the previous one opens no directory at all
+    let mut dirs = safe_fs::DirCache::default();
+    let mut buf = vec![0u8; IO_BUF];
     let mut total_bytes: u64 = 0;
 
     for i in 0..archive.len() {
@@ -134,12 +229,12 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
             .with_context(|| format!("Unsafe path in archive: {:?}", file.name()))?;
 
         if file.is_dir() {
-            safe_fs::open_dirs(&root_dir, &rel_path)?;
+            dirs.open(&root_dir, &rel_path)?;
             continue;
         }
 
         let (parent, name) = safe_fs::split_leaf(&rel_path)?;
-        let dir = safe_fs::open_dirs(&root_dir, parent)?;
+        let dir = dirs.open(&root_dir, parent)?;
 
         if file.is_symlink() {
             let mut target = String::new();
@@ -158,7 +253,8 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
         // Bound the copy by the remaining budget; `size()` comes from the archive and can lie
         let remaining = limits.max_total_bytes.saturating_sub(total_bytes);
         let mut out_file = safe_fs::create_file(&dir, name)?;
-        let written = std::io::copy(
+        let written = copy_with(
+            &mut buf,
             &mut StopReader {
                 inner: std::io::Read::take(&mut file, remaining.saturating_add(1)),
                 stop,
@@ -188,8 +284,8 @@ mod safe_fs {
     use anyhow::{Context, Result};
     use rustix::fs::{self as rfs, Mode, OFlags};
     use rustix::io::Errno;
-    use std::ffi::OsStr;
-    use std::os::fd::OwnedFd;
+    use std::ffi::{OsStr, OsString};
+    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
     use std::path::{Component, Path};
 
     const DIR_FLAGS: OFlags = OFlags::DIRECTORY
@@ -203,19 +299,93 @@ mod safe_fs {
     }
 
     /// Open (creating when missing) each directory of `rel` below `root`
+    #[cfg(test)]
     pub fn open_dirs(root: &OwnedFd, rel: &Path) -> Result<OwnedFd> {
         let mut dir = rfs::openat(root, ".", DIR_FLAGS, Mode::empty())?;
-        for component in rel.components() {
-            let Component::Normal(name) = component else {
-                anyhow::bail!("Unsafe path component in {:?}", rel);
-            };
-            dir = open_or_create_dir(&dir, name)
+        for name in normal_components(rel)? {
+            dir = open_or_create_dir(dir.as_fd(), name)
                 .with_context(|| format!("Refusing to extract through {:?}", rel))?;
         }
         Ok(dir)
     }
 
-    fn open_or_create_dir(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd> {
+    fn normal_components(rel: &Path) -> Result<Vec<&OsStr>> {
+        rel.components()
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name),
+                _ => anyhow::bail!("Unsafe path component in {:?}", rel),
+            })
+            .collect()
+    }
+
+    /// Deeper directories are opened for each entry instead of being kept:
+    /// a crafted archive must not run the runner out of file descriptors
+    const MAX_CACHED_DEPTH: usize = 64;
+
+    /// The directory handles of the last path opened, each opened from the
+    /// one before it (the first from the root) with `open_or_create_dir`,
+    /// exactly as an uncached walk would. Reusing them gives the same
+    /// guarantee as one walk does between opening a directory and writing
+    /// into it: a handle stays bound to the directory it opened, so swapping
+    /// a path component for a symlink later cannot redirect writes. Entries
+    /// of the archive cannot replace a cached directory either: files and
+    /// symlinks are created after `unlinkat` without `AT_REMOVEDIR`, which
+    /// fails on a directory, and nothing here removes directories.
+    #[derive(Default)]
+    pub struct DirCache {
+        open: Vec<(OsString, OwnedFd)>,
+    }
+
+    /// A directory handle, kept by the cache or opened for one entry
+    pub enum Dir<'a> {
+        Cached(BorrowedFd<'a>),
+        Opened(OwnedFd),
+    }
+
+    impl AsFd for Dir<'_> {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            match self {
+                Dir::Cached(fd) => fd.as_fd(),
+                Dir::Opened(fd) => fd.as_fd(),
+            }
+        }
+    }
+
+    impl DirCache {
+        /// Open (creating when missing) each directory of `rel` below
+        /// `root`, starting from the deepest directory it shares with the
+        /// last path
+        pub fn open<'a>(&'a mut self, root: &'a OwnedFd, rel: &Path) -> Result<Dir<'a>> {
+            let names = normal_components(rel)?;
+            let shared = self
+                .open
+                .iter()
+                .zip(&names)
+                .take_while(|((open, _), name)| open.as_os_str() == **name)
+                .count();
+            self.open.truncate(shared);
+            let cached = names.len().min(MAX_CACHED_DEPTH);
+            for name in &names[shared.min(cached)..cached] {
+                let parent = self.open.last().map_or(root.as_fd(), |(_, fd)| fd.as_fd());
+                let dir = open_or_create_dir(parent, name)
+                    .with_context(|| format!("Refusing to extract through {:?}", rel))?;
+                self.open.push((name.to_os_string(), dir));
+            }
+            let deepest = self.open.last().map_or(root.as_fd(), |(_, fd)| fd.as_fd());
+            if names.len() <= cached {
+                return Ok(Dir::Cached(deepest));
+            }
+            let mut dir = open_or_create_dir(deepest, names[cached])
+                .with_context(|| format!("Refusing to extract through {:?}", rel))?;
+            for name in &names[cached + 1..] {
+                dir = open_or_create_dir(dir.as_fd(), name)
+                    .with_context(|| format!("Refusing to extract through {:?}", rel))?;
+            }
+            Ok(Dir::Opened(dir))
+        }
+    }
+
+    fn open_or_create_dir(dir: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd> {
         match rfs::openat(dir, name, DIR_FLAGS, Mode::empty()) {
             Ok(fd) => Ok(fd),
             Err(Errno::NOENT) => {
@@ -239,14 +409,15 @@ mod safe_fs {
 
     /// Remove whatever non-directory is at `name` (a leftover file or a
     /// symlink someone planted); the new entry is then created exclusively
-    fn clear_leaf(dir: &OwnedFd, name: &OsStr) -> Result<()> {
+    fn clear_leaf(dir: BorrowedFd<'_>, name: &OsStr) -> Result<()> {
         match rfs::unlinkat(dir, name, rfs::AtFlags::empty()) {
             Ok(()) | Err(Errno::NOENT) => Ok(()),
             Err(e) => Err(e).with_context(|| format!("Cannot replace {:?}", name)),
         }
     }
 
-    pub fn create_file(dir: &OwnedFd, name: &OsStr) -> Result<std::fs::File> {
+    pub fn create_file(dir: impl AsFd, name: &OsStr) -> Result<std::fs::File> {
+        let dir = dir.as_fd();
         clear_leaf(dir, name)?;
         // O_EXCL|O_NOFOLLOW: fails instead of following anything created in between
         let fd = rfs::openat(
@@ -259,7 +430,8 @@ mod safe_fs {
         Ok(std::fs::File::from(fd))
     }
 
-    pub fn create_symlink(dir: &OwnedFd, name: &OsStr, target: &str) -> Result<()> {
+    pub fn create_symlink(dir: impl AsFd, name: &OsStr, target: &str) -> Result<()> {
+        let dir = dir.as_fd();
         clear_leaf(dir, name)?;
         rfs::symlinkat(target, dir, name)
             .with_context(|| format!("Failed to create symlink {:?}", name))
@@ -292,10 +464,15 @@ fn symlink_stays_inside(link: &Path, target: &Path) -> bool {
     true
 }
 
-/// Create ZIP archive from paths (used for artifacts and cache upload)
-/// A cache archive: a ZIP whose entries are zstd-compressed. Caches never
-/// leave the runners, so they need not be readable by GitLab; zstd saves a
-/// cache about 2.5x faster than deflate at the same size.
+/// A cache archive: a ZIP whose entries are zstd-compressed (or stored, when
+/// compressing gains nothing). Caches never leave the runners, so they need
+/// not be readable by GitLab; zstd saves a cache about 2.5x faster than
+/// deflate at the same size.
+///
+/// It is written as a stream (sizes in data descriptors after each entry,
+/// no seeking back), so its SHA-256 is computed on the way. Entries are in
+/// path order with a fixed timestamp: the same files give the same archive,
+/// and the same hash.
 pub async fn create_cache_archive(
     workspace_path: &str,
     paths: &[String],
@@ -328,32 +505,78 @@ pub async fn create_archive(
         }
         let mut file = tempfile::NamedTempFile::new_in(&staging_dir)
             .with_context(|| format!("Failed to create a file in {}", staging_dir.display()))?;
-        match format.as_str() {
-            "zip" => build_zip(
-                Path::new(&workspace),
-                &files,
-                CompressionMethod::Deflated,
-                file.as_file_mut(),
-            )?,
-            "zip-zstd" => build_zip(
-                Path::new(&workspace),
-                &files,
-                CompressionMethod::Zstd,
-                file.as_file_mut(),
-            )?,
-            "gzip" => build_gzip(&files, file.as_file_mut())?,
+        let root = Path::new(&workspace);
+        let sha256 = match format.as_str() {
+            "zip" => {
+                let mut out = std::io::BufWriter::with_capacity(IO_BUF, file.as_file_mut());
+                build_zip(ZipWriter::new(&mut out), root, &files, false)?;
+                out.flush()?;
+                None
+            }
+            "zip-zstd" => {
+                let mut out = HashingWriter::new(std::io::BufWriter::with_capacity(
+                    IO_BUF,
+                    file.as_file_mut(),
+                ));
+                build_zip(ZipWriter::new_stream(&mut out), root, &files, true)?;
+                out.flush()?;
+                Some(out.hex())
+            }
+            "gzip" => {
+                let mut out = std::io::BufWriter::with_capacity(IO_BUF, file.as_file_mut());
+                build_gzip(&files, &mut out)?;
+                out.flush()?;
+                None
+            }
             "raw" => match files.as_slice() {
-                [path] => copy_regular_file(path, MAX_RAW_ARTIFACT_BYTES, file.as_file_mut())?,
+                [path] => {
+                    copy_regular_file(path, MAX_RAW_ARTIFACT_BYTES, file.as_file_mut())?;
+                    None
+                }
                 _ => anyhow::bail!("raw artifacts need exactly one file, got {}", files.len()),
             },
             other => anyhow::bail!("Unsupported artifact format {:?}", other),
         };
-        file.as_file_mut().flush()?;
         let len = file.as_file().metadata()?.len();
-        Ok(Some(Archive { file, len }))
+        Ok(Some(Archive { file, len, sha256 }))
     })
     .await
     .context("Archive task panicked")?
+}
+
+/// Passes writes on to `inner` and hashes them
+struct HashingWriter<W> {
+    inner: W,
+    hasher: sha2::Sha256,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        use sha2::Digest;
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+        }
+    }
+
+    /// SHA-256 of everything written, in hex
+    fn hex(self) -> String {
+        use sha2::Digest;
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Largest `raw` report artifact
@@ -361,8 +584,6 @@ const MAX_RAW_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Copy a regular file (never a symlink, FIFO or device) of at most `max` bytes
 fn copy_regular_file(path: &Path, max: u64, out: &mut impl Write) -> Result<()> {
-    use std::io::Read;
-
     let before = std::fs::symlink_metadata(path)?;
     if !before.is_file() {
         anyhow::bail!("{} is not a regular file", path.display());
@@ -384,6 +605,19 @@ fn copy_regular_file(path: &Path, max: u64, out: &mut impl Write) -> Result<()> 
     Ok(())
 }
 
+/// Open a file found to be a regular file for reading, failing instead of
+/// following a symlink swapped in since (and not waiting on a FIFO)
+fn open_found_file(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("Failed to open {}", path.display()))?;
+    Ok(std::fs::File::from(fd))
+}
+
 /// Files matching `patterns` inside the workspace.
 ///
 /// Patterns that are absolute or contain `..` are skipped, matches reached through a
@@ -393,13 +627,17 @@ fn collect_paths(
     patterns: &[String],
     exclude: &[String],
 ) -> Result<Vec<PathBuf>> {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::path::Component;
 
     let root = Path::new(workspace_path);
     let root_canon = root
         .canonicalize()
         .with_context(|| format!("Workspace {} not found", workspace_path))?;
+    // Whether each parent directory of a match resolves inside the
+    // workspace: matches share parents, and resolving one costs a system
+    // call per path component
+    let mut inside: HashMap<PathBuf, bool> = HashMap::new();
 
     let mut entries: BTreeSet<PathBuf> = BTreeSet::new();
     for pattern in patterns {
@@ -416,7 +654,7 @@ fn collect_paths(
         let full_pattern = root.join(pattern_path);
         for entry in glob::glob(&full_pattern.to_string_lossy())? {
             let path = entry?;
-            if !is_inside_workspace(&path, &root_canon) {
+            if !is_inside_workspace(&path, &root_canon, &mut inside) {
                 warn!("Skipping {:?}: resolves outside of workspace", path);
                 continue;
             }
@@ -460,18 +698,19 @@ fn collect_paths(
         .collect())
 }
 
-fn build_zip<W: Write + std::io::Seek>(
+/// Add `files` to `zip` and finish it; `cache` picks the cache's entry
+/// compression (zstd or stored) over deflate. Returns the writer.
+fn build_zip<W: Write + Seek>(
+    mut zip: ZipWriter<W>,
     root: &Path,
     files: &[PathBuf],
-    method: CompressionMethod,
-    out: W,
-) -> Result<()> {
-    let mut zip = ZipWriter::new(out);
+    cache: bool,
+) -> Result<W> {
+    let mut buf = vec![0u8; IO_BUF];
     for path in files {
-        add_path_to_zip(&mut zip, path, root, method)?;
+        add_path_to_zip(&mut zip, path, root, cache, &mut buf)?;
     }
-    zip.finish()?;
-    Ok(())
+    Ok(zip.finish()?)
 }
 
 /// Concatenated gzip members, one per regular file (symlinks are skipped)
@@ -483,29 +722,65 @@ fn build_gzip(files: &[PathBuf], out: &mut impl Write) -> Result<()> {
             continue;
         }
         let mut encoder = GzEncoder::new(&mut *out, flate2::Compression::default());
-        std::io::copy(&mut std::fs::File::open(path)?, &mut encoder)?;
+        std::io::copy(&mut open_found_file(path)?, &mut encoder)?;
         encoder.finish()?;
     }
     Ok(())
 }
 
 /// A glob match is inside the workspace if its parent directory canonicalizes under the root
-/// (the match itself may be a symlink, which is archived as a link and not followed)
-fn is_inside_workspace(path: &Path, root_canon: &Path) -> bool {
-    path.parent()
-        .and_then(|parent| parent.canonicalize().ok())
-        .is_some_and(|parent| parent.starts_with(root_canon))
+/// (the match itself may be a symlink, which is archived as a link and not followed).
+/// `known` remembers the answer for each parent.
+fn is_inside_workspace(
+    path: &Path,
+    root_canon: &Path,
+    known: &mut std::collections::HashMap<PathBuf, bool>,
+) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if let Some(&inside) = known.get(parent) {
+        return inside;
+    }
+    let inside = parent
+        .canonicalize()
+        .is_ok_and(|parent| parent.starts_with(root_canon));
+    known.insert(parent.to_path_buf(), inside);
+    inside
+}
+
+/// Options of an entry of `size` bytes named `name`: deflate for artifacts;
+/// for caches, zstd unless the entry is tiny or compressed already
+fn entry_options(cache: bool, name: &Path, size: u64) -> SimpleFileOptions {
+    let options = SimpleFileOptions::default();
+    if !cache {
+        return options.compression_method(CompressionMethod::Deflated);
+    }
+    let compressed = name
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            COMPRESSED_EXTENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(ext))
+        });
+    if compressed || size < STORE_BELOW {
+        options.compression_method(CompressionMethod::Stored)
+    } else {
+        options
+            .compression_method(CompressionMethod::Zstd)
+            .compression_level(Some(CACHE_ZSTD_LEVEL))
+    }
 }
 
 /// Add a regular file or symlink to the ZIP archive under its workspace-relative name
-fn add_path_to_zip<W: Write + std::io::Seek>(
+fn add_path_to_zip<W: Write + Seek>(
     zip: &mut ZipWriter<W>,
     path: &Path,
     workspace_root: &Path,
-    method: CompressionMethod,
+    cache: bool,
+    buf: &mut [u8],
 ) -> Result<()> {
-    use zip::write::FileOptions;
-
     let relative_path = path
         .strip_prefix(workspace_root)
         .with_context(|| format!("{:?} is not inside the workspace", path))?
@@ -513,26 +788,31 @@ fn add_path_to_zip<W: Write + std::io::Seek>(
         .to_string();
 
     let meta = std::fs::symlink_metadata(path)?;
-    let options: FileOptions<'_, ()> = FileOptions::default().compression_method(method);
 
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(path)?;
-        zip.add_symlink(relative_path, target.to_string_lossy(), options)?;
+        // The zip crate stores link targets uncompressed
+        zip.add_symlink(
+            relative_path,
+            target.to_string_lossy(),
+            SimpleFileOptions::default(),
+        )?;
         return Ok(());
     }
     if !meta.is_file() {
         return Ok(());
     }
 
+    let options = entry_options(cache, path, meta.len());
     #[cfg(unix)]
     let options = {
         use std::os::unix::fs::PermissionsExt;
         options.unix_permissions(meta.permissions().mode())
     };
 
+    let mut file = open_found_file(path)?;
     zip.start_file(relative_path, options)?;
-    let mut file = std::fs::File::open(path)?;
-    std::io::copy(&mut file, zip)?;
+    copy_with(buf, &mut file, zip)?;
 
     Ok(())
 }
@@ -775,6 +1055,114 @@ mod tests {
         assert!(!ws.path().join("next.txt").exists());
     }
 
+    #[test]
+    fn extraction_reuses_directories_for_nested_and_sibling_entries() {
+        let deep = "deep/".repeat(70);
+        let deep_file = format!("{}f", deep);
+        let mut data = Vec::new();
+        {
+            let mut zip = ZipWriter::new(std::io::Cursor::new(&mut data));
+            let options = SimpleFileOptions::default();
+            for (name, content) in [
+                ("a/b/c/1", "1"),
+                ("a/b/c/2", "2"),
+                ("a/b/d/3", "3"),
+                ("a/e/4", "4"),
+                ("f/5", "5"),
+                ("a/b/c/6", "6"),
+                ("7", "7"),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.add_directory("g", options).unwrap();
+            zip.start_file("g/h/8", options).unwrap();
+            zip.write_all(b"8").unwrap();
+            // Deeper than the cache keeps
+            zip.start_file(deep_file.as_str(), options).unwrap();
+            zip.write_all(b"deep").unwrap();
+            zip.start_file("a/b/c/9", options).unwrap();
+            zip.write_all(b"9").unwrap();
+            zip.finish().unwrap();
+        }
+        let ws = tempdir().unwrap();
+
+        extract_zip_to_workspace(&data, ws.path().to_str().unwrap()).unwrap();
+
+        for (name, content) in [
+            ("a/b/c/1", "1"),
+            ("a/b/c/2", "2"),
+            ("a/b/d/3", "3"),
+            ("a/e/4", "4"),
+            ("f/5", "5"),
+            ("a/b/c/6", "6"),
+            ("7", "7"),
+            ("g/h/8", "8"),
+            (deep_file.as_str(), "deep"),
+            ("a/b/c/9", "9"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(ws.path().join(name)).unwrap(),
+                content,
+                "{}",
+                name
+            );
+        }
+    }
+
+    /// A later entry cannot turn a directory the cache holds into a symlink
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_entry_cannot_replace_a_cached_directory() {
+        let ws = tempdir().unwrap();
+        let mut data = Vec::new();
+        {
+            let mut zip = ZipWriter::new(std::io::Cursor::new(&mut data));
+            let options = SimpleFileOptions::default();
+            zip.start_file("d/x", options).unwrap();
+            zip.write_all(b"x").unwrap();
+            zip.add_symlink("d", "e", options).unwrap();
+            zip.start_file("d/y", options).unwrap();
+            zip.write_all(b"y").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let result = extract_zip_to_workspace(&data, ws.path().to_str().unwrap());
+
+        assert!(result.is_err());
+        assert!(std::fs::symlink_metadata(ws.path().join("d"))
+            .unwrap()
+            .is_dir());
+        assert!(!ws.path().join("e").exists());
+    }
+
+    /// Cached handles keep the guarantee of a single walk: a directory
+    /// swapped for a symlink after it was opened does not redirect writes
+    #[cfg(unix)]
+    #[test]
+    fn cached_directories_stay_bound_after_a_swap() {
+        use std::ffi::OsStr;
+
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = safe_fs::open_root(ws.path()).unwrap();
+        let mut dirs = safe_fs::DirCache::default();
+        let _ = dirs.open(&root, Path::new("d")).unwrap();
+
+        std::fs::rename(ws.path().join("d"), ws.path().join("d.moved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("d")).unwrap();
+
+        let sub = dirs.open(&root, Path::new("d/sub")).unwrap();
+        let mut file = safe_fs::create_file(&sub, OsStr::new("f")).unwrap();
+        std::io::Write::write_all(&mut file, b"x").unwrap();
+
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(ws.path().join("d.moved/sub/f").is_file());
+        // A walk that does not start from the cached handle refuses the symlink
+        let mut fresh = safe_fs::DirCache::default();
+        assert!(fresh.open(&root, Path::new("d/sub")).is_err());
+    }
+
     // --- collection (#2) ---
 
     #[tokio::test]
@@ -882,6 +1270,66 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(out.path().join("a.txt")).unwrap(),
             "x".repeat(4096)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_stores_tiny_and_compressed_files_and_extracts_both() {
+        use sha2::Digest;
+
+        let ws = tempdir().unwrap();
+        let text = "x".repeat(4096);
+        let image: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(ws.path().join("big.txt"), &text).unwrap();
+        std::fs::write(ws.path().join("tiny.txt"), b"tiny").unwrap();
+        std::fs::write(ws.path().join("img.PNG"), &image).unwrap();
+        std::os::unix::fs::symlink("big.txt", ws.path().join("link")).unwrap();
+        let root = ws.path().to_str().unwrap();
+        let paths = ["*".to_string()];
+
+        let stage = staging();
+        let first = create_cache_archive(root, &paths, stage.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = create_cache_archive(root, &paths, stage.path())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Same files, same archive: its hash is the file's
+        let hash = first.sha256.clone().unwrap();
+        assert_eq!(second.sha256.as_deref(), Some(hash.as_str()));
+        let data = bytes(first);
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&data)), hash);
+        assert_eq!(data, bytes(second));
+
+        let mut archive = ZipArchive::new(std::io::Cursor::new(&data)).unwrap();
+        for (name, method) in [
+            ("big.txt", CompressionMethod::Zstd),
+            ("tiny.txt", CompressionMethod::Stored),
+            ("img.PNG", CompressionMethod::Stored),
+            ("link", CompressionMethod::Stored),
+        ] {
+            assert_eq!(
+                archive.by_name(name).unwrap().compression(),
+                method,
+                "{}",
+                name
+            );
+        }
+        let out = tempdir().unwrap();
+        extract_zip_to_workspace(&data, out.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("big.txt")).unwrap(),
+            text
+        );
+        assert_eq!(std::fs::read(out.path().join("tiny.txt")).unwrap(), b"tiny");
+        assert_eq!(std::fs::read(out.path().join("img.PNG")).unwrap(), image);
+        assert_eq!(
+            std::fs::read_link(out.path().join("link")).unwrap(),
+            Path::new("big.txt")
         );
     }
 
@@ -1024,5 +1472,83 @@ mod tests {
         .unwrap();
 
         assert!(data.is_none());
+    }
+
+    /// Synthetic node_modules-like tree: ~15k small files in nested
+    /// directories, a few incompressible images. Timing only, not a check.
+    #[tokio::test]
+    #[ignore = "benchmark: cargo test --release -- --ignored bench_cache_archive --nocapture"]
+    async fn bench_cache_archive() {
+        let ws = tempdir().unwrap();
+        let mut seed: u64 = 42;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let mut files = 0;
+        let mut bytes = 0u64;
+        for pkg in 0..600 {
+            for sub in 0..5 {
+                let dir = ws
+                    .path()
+                    .join(format!("node_modules/pkg-{pkg}/lib/sub-{sub}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                for f in 0..5 {
+                    let (name, content) = if next() % 20 == 0 {
+                        let n = 2000 + (next() % 30000) as usize;
+                        (
+                            format!("img-{f}.png"),
+                            (0..n).map(|_| next() as u8).collect::<Vec<u8>>(),
+                        )
+                    } else {
+                        let lines = 1 + next() % 120;
+                        let mut s = String::new();
+                        for l in 0..lines {
+                            s.push_str(&format!(
+                                "export function fn_{}_{l}(a, b) {{ return a * {} + b; }}\n",
+                                next() % 1000,
+                                next() % 97
+                            ));
+                        }
+                        (format!("file-{f}.js"), s.into_bytes())
+                    };
+                    bytes += content.len() as u64;
+                    std::fs::write(dir.join(name), content).unwrap();
+                    files += 1;
+                }
+            }
+        }
+        let root = ws.path().to_str().unwrap();
+        let stage = staging();
+        let mut best = (f64::MAX, f64::MAX, 0u64);
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            let archive = create_cache_archive(root, &["node_modules".to_string()], stage.path())
+                .await
+                .unwrap()
+                .unwrap();
+            let create = started.elapsed().as_secs_f64();
+            let out = tempdir().unwrap();
+            let started = std::time::Instant::now();
+            extract_archive_file(
+                archive.file.path(),
+                out.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+            let extract = started.elapsed().as_secs_f64();
+            best = (best.0.min(create), best.1.min(extract), archive.len);
+        }
+        println!(
+            "BENCH files={} input={:.1}MB archive={:.2}MB create={:.3}s extract={:.3}s",
+            files,
+            bytes as f64 / 1048576.0,
+            best.2 as f64 / 1048576.0,
+            best.0,
+            best.1
+        );
     }
 }
