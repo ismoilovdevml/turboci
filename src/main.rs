@@ -37,8 +37,29 @@ enum Commands {
     Upgrade,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Blocking pool cap: archive building and extraction, file I/O and DNS
+/// lookups run there; tokio's default of 512 threads is far more than a
+/// runner needs and each thread reserves its own stack
+const MAX_BLOCKING_THREADS: usize = 64;
+
+fn main() -> Result<()> {
+    // Jobs mostly wait on GitLab, Docker and child processes, and archive
+    // building, extraction and hashing run on the blocking pool, so a few
+    // async workers are enough
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 4);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .thread_keep_alive(std::time::Duration::from_secs(10))
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
