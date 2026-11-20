@@ -18,6 +18,8 @@ const MAX_UPDATE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Output sent sooner than the interval once this much is pending
 const FLUSH_BYTES: usize = 256 * 1024;
 const FINISH_ATTEMPTS: u32 = 5;
+/// Room for the notice appended when the limit is reached
+const NOTICE_ROOM: usize = 256;
 
 pub struct TraceWriter<'a> {
     client: Option<&'a GitLabClient>,
@@ -74,8 +76,19 @@ impl<'a> TraceWriter<'a> {
         self
     }
 
+    /// Whether the log reached its limit: further output is dropped, so callers
+    /// can stop producing (or decoding) it
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
     /// Append output; it is scrubbed and sent in batches
     pub async fn write(&mut self, text: &str) {
+        if self.is_truncated() {
+            // Dropped anyway: do not scrub it, but keep sending what is pending
+            self.flush_if_due().await;
+            return;
+        }
         let safe = self.scrubber.push(text);
         self.append(&safe);
         if self.trace.len() - self.sent >= FLUSH_BYTES {
@@ -148,8 +161,10 @@ impl<'a> TraceWriter<'a> {
 
     /// Flush held-back output and make sure GitLab has the whole trace
     pub async fn finish(&mut self) {
-        let rest = self.scrubber.finish();
-        self.append(&rest);
+        if !self.truncated {
+            let rest = self.scrubber.finish();
+            self.append(&rest);
+        }
         for attempt in 0..FINISH_ATTEMPTS {
             if self.flush().await {
                 return;
@@ -176,6 +191,7 @@ impl<'a> TraceWriter<'a> {
         }
         let room = self.limit.saturating_sub(self.trace.len());
         if text.len() <= room {
+            self.reserve(text.len());
             self.trace.extend_from_slice(text.as_bytes());
             return;
         }
@@ -183,15 +199,26 @@ impl<'a> TraceWriter<'a> {
         while !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        self.trace.extend_from_slice(&text.as_bytes()[..cut]);
-        self.trace.extend_from_slice(
-            format!(
-                "\nJob's log exceeded limit of {} bytes.\nJob execution will continue but no more output will be collected.\n",
-                self.limit
-            )
-            .as_bytes(),
+        let notice = format!(
+            "\nJob's log exceeded limit of {} bytes.\nJob execution will continue but no more output will be collected.\n",
+            self.limit
         );
+        self.reserve(cut + notice.len());
+        self.trace.extend_from_slice(&text.as_bytes()[..cut]);
+        self.trace.extend_from_slice(notice.as_bytes());
         self.truncated = true;
+    }
+
+    /// Grow like `Vec` does, but never past the limit plus the notice, so a full
+    /// trace does not double the buffer
+    fn reserve(&mut self, additional: usize) {
+        let needed = self.trace.len() + additional;
+        if needed > self.trace.capacity() {
+            let target = (self.trace.capacity() * 2)
+                .min(self.limit + NOTICE_ROOM)
+                .max(needed);
+            self.trace.reserve_exact(target - self.trace.len());
+        }
     }
 }
 
@@ -355,5 +382,84 @@ mod tests {
         assert_eq!(kept, "x".repeat(100));
         assert!(notice.starts_with("\nJob's log exceeded limit of 100 bytes."));
         assert!(!text.contains("tail"));
+    }
+
+    #[tokio::test]
+    async fn stops_scrubbing_once_truncated() {
+        let scrubber = SecretScrubber::new(vec!["some-masked-value".to_string()]);
+        let mut trace = TraceWriter::new(None, 7, "job-token", &scrubber).with_limit(100);
+
+        trace.write(&format!("{}\n", "x".repeat(150))).await;
+        assert!(trace.is_truncated());
+        let kept = trace.text();
+
+        // Not scrubbed (a token at the end would be held back) and not kept
+        trace.write("more output some-masked").await;
+        assert_eq!(trace.scrubber.held_back(), "");
+        trace.finish().await;
+        assert_eq!(trace.text(), kept);
+    }
+
+    #[tokio::test]
+    async fn sends_the_rest_after_truncation() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber).with_limit(10);
+
+        trace.write("0123456789abc\n").await;
+        assert!(trace.is_truncated());
+        trace.last_flush -= DEFAULT_UPDATE_INTERVAL;
+        trace.write("dropped\n").await;
+
+        let body: String = patches(&server).await.into_iter().map(|(_, b)| b).collect();
+        assert!(body.starts_with("0123456789\nJob's log exceeded limit of 10 bytes."));
+        assert!(!body.contains("dropped"));
+    }
+
+    #[tokio::test]
+    async fn buffer_does_not_grow_past_the_limit() {
+        let scrubber = SecretScrubber::new(vec![]);
+        let limit = 64 * 1024;
+        let mut trace = TraceWriter::new(None, 7, "job-token", &scrubber).with_limit(limit);
+        let line = "a line of build output\n";
+
+        while !trace.is_truncated() {
+            trace.write(line).await;
+        }
+        trace.finish().await;
+
+        assert!(trace.trace.len() > limit);
+        assert!(trace.trace.capacity() <= limit + NOTICE_ROOM);
+    }
+
+    /// cargo test --release bench_trace_past_limit -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn bench_trace_past_limit() {
+        let line = "2026-11-20T10:15:42Z password=notreallysecret0 api_key=0123456789abcdef0123456789abcdef ok\n";
+        let chunk = line.repeat(8192 / line.len());
+        let scrubber = SecretScrubber::new(vec!["some-masked-value".to_string()]);
+        let mut trace = TraceWriter::new(None, 7, "job-token", &scrubber);
+        let total = 50 * 1024 * 1024;
+        let started = Instant::now();
+        let mut written = 0;
+        while written < total {
+            trace.write(&chunk).await;
+            written += chunk.len();
+        }
+        trace.finish().await;
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "trace: {:.1} MB/s for {} bytes, kept {} (capacity {})",
+            written as f64 / secs / 1e6,
+            written,
+            trace.trace.len(),
+            trace.trace.capacity()
+        );
     }
 }

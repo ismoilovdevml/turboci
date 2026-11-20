@@ -341,6 +341,12 @@ impl<'a> StreamScrubber<'a> {
         self.scrubber.scrub_owned(ready)
     }
 
+    /// Output held back until the next chunk
+    #[cfg(test)]
+    pub fn held_back(&self) -> &str {
+        &self.pending
+    }
+
     /// Flush everything still held back
     pub fn finish(&mut self) -> String {
         self.swallowing = false;
