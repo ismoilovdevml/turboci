@@ -5,7 +5,10 @@ the installer. Every key is optional except `runner_token`. Unknown keys are
 logged as warnings at startup; invalid values stop the runner with an error
 instead of being silently ignored.
 
-Apply changes with `sudo systemctl restart turboci`.
+Apply changes with `sudo systemctl restart turboci`. Changes to `concurrent`,
+`check_interval` and the [admission limits](#admission-control) also apply
+with `sudo systemctl reload turboci`, without stopping running jobs (see
+[reloading the config](operations.md#reloading-the-config)).
 
 ## Example
 

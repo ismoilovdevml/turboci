@@ -181,7 +181,7 @@ async fn run() -> Result<()> {
                 });
                 daemon = daemon.with_s3_cache(bucket);
             }
-            spawn_signal_handler(daemon.shutdown_handle())?;
+            spawn_signal_handler(daemon.shutdown_handle(), daemon.reloader(&config))?;
             daemon.start().await?;
         }
         Commands::InitRunner { output } => {
@@ -212,17 +212,30 @@ async fn run() -> Result<()> {
 }
 
 /// SIGQUIT: finish running jobs, then exit. SIGTERM/SIGINT: stop running jobs,
-/// report them failed and exit (the same signals gitlab-runner uses)
-fn spawn_signal_handler(shutdown: runner_daemon::ShutdownHandle) -> Result<()> {
+/// report them failed and exit (the same signals gitlab-runner uses). SIGHUP:
+/// re-read the config and apply `concurrent`, `check_interval` and the
+/// admission limits; an invalid config is logged and changes nothing.
+fn spawn_signal_handler(
+    shutdown: runner_daemon::ShutdownHandle,
+    reloader: runner_daemon::reload::Reloader,
+) -> Result<()> {
     use runner_daemon::Shutdown;
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut quit = signal(SignalKind::quit())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut hangup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
         loop {
             let mode = tokio::select! {
+                _ = hangup.recv() => {
+                    info!("🔄 SIGHUP: reloading the config");
+                    // Reads and checks files: off the async workers
+                    let reloader = reloader.clone();
+                    let _ = tokio::task::spawn_blocking(move || reloader.reload()).await;
+                    continue;
+                }
                 _ = quit.recv() => {
                     info!("⚠️  SIGQUIT: taking no new jobs, waiting for running jobs to finish");
                     Shutdown::Graceful

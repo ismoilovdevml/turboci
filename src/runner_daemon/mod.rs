@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -16,12 +16,14 @@ use trace::TraceWriter;
 pub mod admission;
 pub mod artifacts;
 pub mod cancel;
+pub mod capacity;
 pub mod config;
 pub mod executor;
 pub mod git;
 pub mod image;
 pub mod job_cache;
 pub mod metrics;
+pub mod reload;
 pub mod s3;
 pub mod script;
 pub mod system_id;
@@ -233,31 +235,31 @@ fn project_id(job: &Job) -> u64 {
 
 /// Wait for a free job slot, then ask GitLab for a job.
 ///
-/// The permit is taken before the request, so the runner never accepts more jobs
+/// The slot is taken before the request, so the runner never accepts more jobs
 /// than `concurrent`; it is returned with the job and released when the job ends.
 #[cfg(test)]
 async fn claim_job(
-    semaphore: &Arc<Semaphore>,
+    capacity: &Arc<capacity::Capacity>,
     gitlab: &GitLabClient,
     runner_token: &str,
-) -> Result<Option<(Job, OwnedSemaphorePermit)>> {
-    let permit = semaphore.clone().acquire_owned().await?;
-    claim_with_permit(permit, gitlab, runner_token, std::future::pending()).await
+) -> Result<Option<(Job, capacity::Slot)>> {
+    let slot = capacity.acquire().await;
+    claim_with_slot(slot, gitlab, runner_token, std::future::pending()).await
 }
 
 /// Ask GitLab for a job for an already reserved slot, until `stop` (see
 /// `GitLabClient::request_job_until`); the slot is released when no job is
 /// returned
-async fn claim_with_permit(
-    permit: OwnedSemaphorePermit,
+async fn claim_with_slot<S>(
+    slot: S,
     gitlab: &GitLabClient,
     runner_token: &str,
     stop: impl std::future::Future<Output = ()>,
-) -> Result<Option<(Job, OwnedSemaphorePermit)>> {
+) -> Result<Option<(Job, S)>> {
     Ok(gitlab
         .request_job_until(runner_token, stop)
         .await?
-        .map(|job| (job, permit)))
+        .map(|job| (job, slot)))
 }
 
 /// Longest wait between job requests that fail
@@ -277,6 +279,11 @@ impl RequestBackoff {
             check_interval,
             failures: 0,
         }
+    }
+
+    /// Use a new check interval (a config reload changed it)
+    fn set_check_interval(&mut self, check_interval: Duration) {
+        self.check_interval = check_interval;
     }
 
     /// Wait after a request GitLab answered
@@ -358,7 +365,12 @@ pub struct RunnerDaemon {
     config: Arc<config::RunnerConfig>,
     gitlab: Arc<GitLabClient>,
     executor: Arc<executor::ExecutorType>,
-    semaphore: Arc<Semaphore>,
+    /// Job slots: `concurrent`, changed by a config reload
+    capacity: Arc<capacity::Capacity>,
+    /// Seconds between job requests, changed by a config reload
+    check_interval: Arc<std::sync::atomic::AtomicU64>,
+    /// Admission limits, changed by a config reload
+    limits: Arc<std::sync::RwLock<admission::Limits>>,
     scrubber: Arc<std::sync::RwLock<SecretScrubber>>,
     shutdown: Arc<watch::Sender<Shutdown>>,
     heartbeat_interval: Duration,
@@ -391,8 +403,6 @@ impl RunnerDaemon {
         gitlab: GitLabClient,
         executor: executor::ExecutorType,
     ) -> Self {
-        let concurrent = config.concurrent as usize;
-
         let tokens = token::TokenStore::new(&config.state_dir, &config.runner_token);
         let runner_token = match tokens.load() {
             Some(stored) => {
@@ -415,7 +425,12 @@ impl RunnerDaemon {
             scrubber.add_secret(proxy.clone());
         }
 
+        // Checked by `RunnerConfig::validate` when the config was loaded
+        let limits = admission::Limits::from_config(&config).unwrap_or_default();
         Self {
+            capacity: capacity::Capacity::new(config.concurrent),
+            check_interval: Arc::new(config.check_interval.into()),
+            limits: Arc::new(std::sync::RwLock::new(limits)),
             cache: job_cache::LocalCache::new(&config.cache_dir)
                 .with_max_age_days(config.cache_max_age_days)
                 // Checked by `RunnerConfig::validate` when it was loaded
@@ -423,7 +438,6 @@ impl RunnerDaemon {
             config: Arc::new(config),
             gitlab: Arc::new(gitlab),
             executor: Arc::new(executor),
-            semaphore: Arc::new(Semaphore::new(concurrent)),
             scrubber: Arc::new(std::sync::RwLock::new(scrubber)),
             shutdown: Arc::new(watch::Sender::new(Shutdown::Running)),
             heartbeat_interval: HEARTBEAT_INTERVAL,
@@ -456,6 +470,22 @@ impl RunnerDaemon {
         ShutdownHandle(self.shutdown.clone())
     }
 
+    /// Wait between job requests now (the config's, or a reloaded one)
+    fn check_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.check_interval
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Admission limits now (the config's, or reloaded ones)
+    fn current_limits(&self) -> admission::Limits {
+        match self.limits.read() {
+            Ok(limits) => limits.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     async fn shutdown_requested(&self) {
         let mut rx = self.shutdown.subscribe();
         let _ = rx.wait_for(|mode| *mode != Shutdown::Running).await;
@@ -467,7 +497,7 @@ impl RunnerDaemon {
         info!("   Concurrent jobs: {}", self.config.concurrent);
         info!("   Check interval: {}s", self.config.check_interval);
         info!("   Cache enabled: {}", self.config.cache_enabled);
-        let limits = admission::Limits::from_config(&self.config)?;
+        let limits = self.current_limits();
         if !limits.is_off() {
             info!("   Admission limits: {}", limits.describe());
         }
@@ -498,27 +528,28 @@ impl RunnerDaemon {
         let rotation = AbortOnDrop(tokio::spawn(self.clone().rotate_token()));
 
         let mut connected = false;
-        let mut backoff = RequestBackoff::new(Duration::from_secs(self.config.check_interval));
+        let mut backoff = RequestBackoff::new(self.check_interval());
         loop {
             // Wait for a free slot; a shutdown interrupts this wait, the sleeps
             // and a job request GitLab holds (long polling), never one it has
             // already answered
-            let permit = tokio::select! {
-                permit = self.semaphore.clone().acquire_owned() => permit?,
+            let slot = tokio::select! {
+                slot = self.capacity.acquire() => slot,
                 _ = self.shutdown_requested() => break,
             };
+            backoff.set_check_interval(self.check_interval());
             // Short of memory, disk space or CPU: ask again after the check
             // interval, without a request to GitLab
-            if !self.admit(&limits, &mut gate).await {
-                drop(permit);
+            if !self.admit(&self.current_limits(), &mut gate).await {
+                drop(slot);
                 tokio::select! {
-                    _ = sleep(Duration::from_secs(self.config.check_interval)) => {}
+                    _ = sleep(self.check_interval()) => {}
                     _ = self.shutdown_requested() => break,
                 }
                 continue;
             }
-            let claimed = claim_with_permit(
-                permit,
+            let claimed = claim_with_slot(
+                slot,
                 &self.gitlab,
                 &self.current_token(),
                 self.shutdown_requested(),
@@ -532,7 +563,7 @@ impl RunnerDaemon {
                 );
             }
             let wait = match claimed {
-                Ok(Some((job, permit))) => {
+                Ok(Some((job, slot))) => {
                     let job_name = job
                         .job_info
                         .as_ref()
@@ -543,7 +574,7 @@ impl RunnerDaemon {
                     self.metrics.request(metrics::Request::Job);
                     let daemon = self.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
+                        let _slot = slot;
                         if let Err(e) = daemon.execute_job(job).await {
                             error!("Job execution failed: {}", e);
                         }
@@ -575,7 +606,7 @@ impl RunnerDaemon {
         }
 
         info!("⏳ Waiting for running jobs to finish...");
-        let _ = self.semaphore.acquire_many(self.config.concurrent).await;
+        self.capacity.idle().await;
         // Let a token reset in flight be saved, or the new token would be lost
         let _rotating = self.rotating.lock().await;
         drop(rotation);
@@ -585,10 +616,9 @@ impl RunnerDaemon {
 
     /// The metrics as served on `metrics_listen`
     fn render_metrics(&self) -> String {
-        let concurrent = self.config.concurrent as usize;
         self.metrics.render(&metrics::Gauges {
-            running: concurrent.saturating_sub(self.semaphore.available_permits()) as u64,
-            concurrent: concurrent as u64,
+            running: self.capacity.running().into(),
+            concurrent: self.capacity.limit().into(),
             executor: match self.executor.as_ref() {
                 executor::ExecutorType::Docker(_) => "docker",
                 executor::ExecutorType::Shell(_) => "shell",
@@ -1420,9 +1450,9 @@ mod tests {
             .mount(&server)
             .await;
         let gitlab = GitLabClient::new(server.uri(), "runner-token".to_string());
-        let semaphore = Arc::new(Semaphore::new(1));
+        let capacity = capacity::Capacity::new(1);
 
-        let (_job, permit) = claim_job(&semaphore, &gitlab, "runner-token")
+        let (_job, slot) = claim_job(&capacity, &gitlab, "runner-token")
             .await
             .unwrap()
             .expect("job expected");
@@ -1430,13 +1460,13 @@ mod tests {
         // The only slot is taken by the running job: no second request may be sent
         let second = tokio::time::timeout(
             Duration::from_millis(200),
-            claim_job(&semaphore, &gitlab, "runner-token"),
+            claim_job(&capacity, &gitlab, "runner-token"),
         )
         .await;
         assert!(second.is_err(), "requested a job with no free slot");
 
-        drop(permit);
-        assert_eq!(semaphore.available_permits(), 1);
+        drop(slot);
+        assert_eq!(capacity.running(), 0);
     }
 
     /// A daemon with the shell executor talking to a mock GitLab
@@ -2713,6 +2743,114 @@ mod tests {
         );
     }
 
+    /// A daemon with the shell executor, started from the config file `file`
+    fn daemon_from_file(
+        server: &MockServer,
+        dir: &std::path::Path,
+        file: &std::path::Path,
+    ) -> RunnerDaemon {
+        let config = config::RunnerConfig::load(file).unwrap();
+        let executor = executor::ExecutorType::Shell(executor::ShellExecutor::new(Some(
+            dir.join("builds").to_string_lossy().into_owned(),
+        )));
+        RunnerDaemon::new(
+            config,
+            GitLabClient::new(server.uri(), "glrt-test".to_string()),
+            executor,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_reload_applies_live_settings_and_reports_the_rest() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("runner.toml");
+        let write = |settings: &str| {
+            std::fs::write(
+                &file,
+                format!(
+                    "runner_token = \"glrt-test\"\ngitlab_url = \"{}\"\nstate_dir = \"{}\"\ncache_dir = \"{}/cache\"\n{}\n",
+                    server.uri(),
+                    dir.path().display(),
+                    dir.path().display(),
+                    settings
+                ),
+            )
+            .unwrap()
+        };
+        write("concurrent = 4\ncheck_interval = 3");
+        let daemon = daemon_from_file(&server, dir.path(), &file);
+        let running = [
+            daemon.capacity.acquire().await,
+            daemon.capacity.acquire().await,
+        ];
+
+        write("concurrent = 1\ncheck_interval = 7\nmin_free_disk = \"1g\"\ncache_max_age_days = 3");
+        let reloaded = daemon.reload(&file).unwrap();
+        assert_eq!(
+            reloaded.applied,
+            [
+                "concurrent 4 → 1",
+                "check_interval 3s → 7s",
+                "admission limits off → min_free_disk 1.0 GB"
+            ]
+        );
+        assert_eq!(reloaded.restart_needed, ["cache_max_age_days"]);
+        assert_eq!(daemon.capacity.limit(), 1);
+        assert_eq!(daemon.check_interval(), Duration::from_secs(7));
+        assert_eq!(daemon.current_limits().min_free_disk, Some(1 << 30));
+        // Jobs running above the new limit keep their slots
+        assert_eq!(daemon.capacity.running(), 2);
+        drop(running);
+
+        // The same file again changes nothing
+        let again = daemon.reload(&file).unwrap();
+        assert!(again.applied.is_empty(), "{:?}", again.applied);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_config_on_reload_keeps_the_running_one() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("runner.toml");
+        let write = |settings: &str| {
+            std::fs::write(
+                &file,
+                format!(
+                    "runner_token = \"glrt-test\"\ngitlab_url = \"{}\"\nstate_dir = \"{}\"\n{}\n",
+                    server.uri(),
+                    dir.path().display(),
+                    settings
+                ),
+            )
+            .unwrap()
+        };
+        write("concurrent = 2\ncheck_interval = 5\nmax_load_avg = 4.0");
+        let daemon = daemon_from_file(&server, dir.path(), &file);
+        let reloader = daemon.reloader(&file);
+
+        // Each file also changes valid live settings: none may be applied
+        for bad in [
+            "concurrent = 0\ncheck_interval = 30",
+            "concurrent = 3\ncheck_interval = \"soon\"",
+            "concurrent = 3\ncheck_interval = 30\nmin_free_memory = \"lots\"",
+            "concurrent = 3\ncheck_interval = 30\nmax_load_avg = -1.0",
+            "concurrent = 3\ncheck_interval = 30\n[[[",
+        ] {
+            write(bad);
+            assert!(daemon.reload(&file).is_err(), "accepted {}", bad);
+            reloader.reload();
+            assert_eq!(daemon.capacity.limit(), 2, "{}", bad);
+            assert_eq!(daemon.check_interval(), Duration::from_secs(5), "{}", bad);
+            assert_eq!(daemon.current_limits().max_load_avg, Some(4.0), "{}", bad);
+        }
+        std::fs::remove_file(&file).unwrap();
+        assert!(daemon.reload(&file).is_err());
+        assert!(daemon
+            .render_metrics()
+            .contains("turboci_config_reloads_total{result=\"failure\"} 5\n"));
+    }
+
     #[test]
     fn request_backoff_grows_to_a_cap_and_resets_on_success() {
         let mut backoff = RequestBackoff::new(Duration::from_secs(3));
@@ -2747,12 +2885,12 @@ mod tests {
             .mount(&server)
             .await;
         let gitlab = GitLabClient::new(server.uri(), "runner-token".to_string());
-        let semaphore = Arc::new(Semaphore::new(1));
+        let capacity = capacity::Capacity::new(1);
 
-        assert!(claim_job(&semaphore, &gitlab, "runner-token")
+        assert!(claim_job(&capacity, &gitlab, "runner-token")
             .await
             .unwrap()
             .is_none());
-        assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(capacity.running(), 0);
     }
 }

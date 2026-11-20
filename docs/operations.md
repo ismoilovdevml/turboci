@@ -5,7 +5,8 @@
 ```bash
 sudo systemctl status turboci
 sudo journalctl -u turboci -f       # runner and job events
-sudo systemctl restart turboci      # after a config change
+sudo systemctl reload turboci       # apply concurrent, check_interval, admission limits
+sudo systemctl restart turboci      # after any other config change
 ```
 
 A healthy start ends with:
@@ -20,6 +21,7 @@ A healthy start ends with:
 |---|---|
 | `SIGQUIT` | Take no new jobs, let running jobs finish, then exit |
 | `SIGTERM`, `SIGINT` | Take no new jobs, stop running jobs, clean them up and report them as failed (*runner system failure*), then exit |
+| `SIGHUP` | [Reload the config](#reloading-the-config); the runner keeps running |
 
 `systemctl stop` and `restart` send `SIGTERM`; the unit allows 180 seconds for
 the cleanup. To drain the runner before maintenance:
@@ -27,6 +29,42 @@ the cleanup. To drain the runner before maintenance:
 ```bash
 sudo systemctl kill -s SIGQUIT turboci
 ```
+
+## Reloading the config
+
+`SIGHUP` makes the runner read its config file again, without stopping jobs:
+
+```bash
+sudo systemctl reload turboci                                     # Linux (sends SIGHUP)
+sudo launchctl kill SIGHUP gui/$(id -u ci)/io.github.ismoilovdevml.turboci  # macOS, runner user "ci"
+```
+
+These settings take effect at once:
+
+| Key | Effect |
+|---|---|
+| `concurrent` | More slots: new jobs are requested right away. Fewer: running jobs keep running, and new jobs are taken once fewer than the new number run |
+| `check_interval` | From the next job request on |
+| `min_free_memory`, `min_free_disk`, `max_load_avg` | From the next job request on |
+
+```text
+🔄 SIGHUP: reloading the config
+🔄 Config reloaded: concurrent 4 → 8, check_interval 3s → 5s
+Config changes to cache_dir, executor.docker.memory take effect after a restart
+```
+
+Any other change is listed as needing a restart (values are never logged,
+only key names), and the runner keeps using the old value until then. A file
+that does not parse or validate changes nothing, not even its valid
+settings:
+
+```text
+❌ Config reload failed, the runner keeps its config: Invalid config file: "/etc/turboci-runner.toml": ...
+```
+
+`turboci_config_reloads_total{result="failure"}` in the [metrics](#metrics)
+counts failed reloads. A reload during a shutdown (`SIGQUIT`, `SIGTERM`)
+does not stop or restart it.
 
 ## Cleanup
 

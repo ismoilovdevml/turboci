@@ -57,6 +57,14 @@ pub enum CacheUpload {
 }
 const CACHE_UPLOADS: [&str; 3] = ["sent", "unchanged", "failed"];
 
+/// Outcome of a config reload (SIGHUP)
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigReload {
+    Success,
+    Failure,
+}
+const CONFIG_RELOADS: [&str; 2] = ["success", "failure"];
+
 /// Counters and states of the runner. Updates are single atomic operations:
 /// nothing on a job's path waits for a lock.
 #[derive(Debug)]
@@ -70,6 +78,7 @@ pub struct Metrics {
     cache_restores: [AtomicU64; 3],
     cache_uploads: [AtomicU64; 3],
     cache_s3_errors: AtomicU64,
+    config_reloads: [AtomicU64; 2],
 }
 
 impl Default for Metrics {
@@ -85,6 +94,7 @@ impl Default for Metrics {
             cache_restores: Default::default(),
             cache_uploads: Default::default(),
             cache_s3_errors: AtomicU64::new(0),
+            config_reloads: Default::default(),
         }
     }
 }
@@ -136,6 +146,10 @@ impl Metrics {
     /// Calls to S3 that failed while a job restored or saved its cache
     pub fn cache_s3_errors(&self, count: u64) {
         self.cache_s3_errors.fetch_add(count, Relaxed);
+    }
+
+    pub fn config_reload(&self, result: ConfigReload) {
+        self.config_reloads[result as usize].fetch_add(1, Relaxed);
     }
 
     /// The metrics in Prometheus text format (version 0.0.4)
@@ -238,6 +252,13 @@ impl Metrics {
                 String::new(),
                 self.cache_s3_errors.load(Relaxed).to_string(),
             )],
+        );
+        family(
+            &mut out,
+            "turboci_config_reloads_total",
+            "counter",
+            "Config reloads (SIGHUP), by result; a failed one keeps the running config",
+            labeled("result", &CONFIG_RELOADS, &self.config_reloads),
         );
         family(
             &mut out,
@@ -418,6 +439,7 @@ mod tests {
         metrics.cache_restore(CacheRestore::Miss);
         metrics.cache_upload(CacheUpload::Unchanged);
         metrics.cache_s3_errors(3);
+        metrics.config_reload(ConfigReload::Failure);
 
         let text = metrics.render(&gauges());
         for line in [
@@ -437,6 +459,8 @@ mod tests {
             "turboci_cache_restores_total{result=\"miss\"} 1",
             "turboci_cache_uploads_total{result=\"unchanged\"} 1",
             "turboci_cache_s3_errors_total 3",
+            "turboci_config_reloads_total{result=\"success\"} 0",
+            "turboci_config_reloads_total{result=\"failure\"} 1",
         ] {
             assert!(
                 text.lines().any(|l| l == line),

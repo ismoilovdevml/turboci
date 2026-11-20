@@ -655,6 +655,8 @@ User=$SERVICE_USER
 Group=$SERVICE_GROUP
 WorkingDirectory=$STATE_DIR
 ExecStart=$INSTALL_DIR/$BIN_NAME runner-start -c $CONFIG_FILE
+# systemctl reload: re-read concurrent, check_interval and admission limits
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=10
 # SIGTERM stops running jobs and reports them; give that time before SIGKILL
@@ -946,6 +948,7 @@ print_next_steps() {
 
     echo -e "\n${BLUE}🔧 Management Commands:${NC}"
     echo -e "   ${BLUE}systemctl status $SERVICE_NAME${NC}   # Check status"
+    echo -e "   ${BLUE}systemctl reload $SERVICE_NAME${NC}   # Apply concurrent/check_interval"
     echo -e "   ${BLUE}systemctl restart $SERVICE_NAME${NC}  # Restart"
     echo -e "   ${BLUE}systemctl stop $SERVICE_NAME${NC}     # Stop"
     echo -e "   ${BLUE}journalctl -u $SERVICE_NAME -f${NC}   # View logs"
