@@ -991,6 +991,7 @@ impl RunnerDaemon {
             return Ok(());
         };
         let mut failure = None;
+        let cancel = trace.cancel();
         // Paths, exclude patterns and names may use variables
         let variables = job_variables(job);
         let untracked = self
@@ -1034,46 +1035,62 @@ impl RunnerDaemon {
                 .await;
 
             // Staged next to the workspace (same disk, not a possibly RAM-backed /tmp)
-            let result = match artifacts::create_archive(
-                &workspace.to_string_lossy(),
-                &paths,
-                &expand_all(&artifact.exclude),
-                format,
-                &self.executor.job_dir(job),
-            )
-            .await
-            {
-                Ok(None) => {
+            let archive_and_upload = async {
+                let Some(archive) = artifacts::create_archive(
+                    &workspace.to_string_lossy(),
+                    &paths,
+                    &expand_all(&artifact.exclude),
+                    format,
+                    &self.executor.job_dir(job),
+                )
+                .await?
+                else {
+                    return Ok(false);
+                };
+                let extension = match format {
+                    "gzip" => ".gz",
+                    "zip" => ".zip",
+                    _ => "",
+                };
+                self.gitlab
+                    .upload_artifacts(
+                        job.id,
+                        &job.token,
+                        ArtifactUpload {
+                            path: archive.file.path().to_path_buf(),
+                            len: archive.len,
+                            file_name: format!("{}{}", name, extension),
+                            format: format.to_string(),
+                            artifact_type: artifact_type.to_string(),
+                            expire_in: artifact.expire_in.clone(),
+                        },
+                    )
+                    .await
+                    .map(|()| true)
+            };
+            // An aborted job uploads nothing more: an upload may take up to an
+            // hour, longer than the service manager waits for the runner to
+            // stop. A dropped archive still being written runs to its end in
+            // the background, into a staging file that is then removed.
+            let result = tokio::select! {
+                biased;
+                _ = cancel.reached(RemoteState::Aborted) => {
+                    trace.write("Artifacts not uploaded: job canceled\n").await;
+                    return Err(JobFailure {
+                        reason: FailureReason::JobCanceled,
+                        exit_code: None,
+                        message: "canceled".to_string(),
+                    });
+                }
+                result = archive_and_upload => result,
+            };
+            match result {
+                Ok(false) => {
                     trace
                         .write("WARNING: No files matched the artifact paths, nothing uploaded\n")
                         .await;
-                    continue;
                 }
-                Ok(Some(archive)) => {
-                    let extension = match format {
-                        "gzip" => ".gz",
-                        "zip" => ".zip",
-                        _ => "",
-                    };
-                    self.gitlab
-                        .upload_artifacts(
-                            job.id,
-                            &job.token,
-                            ArtifactUpload {
-                                path: archive.file.path().to_path_buf(),
-                                len: archive.len,
-                                file_name: format!("{}{}", name, extension),
-                                format: format.to_string(),
-                                artifact_type: artifact_type.to_string(),
-                                expire_in: artifact.expire_in.clone(),
-                            },
-                        )
-                        .await
-                }
-                Err(e) => Err(e),
-            };
-            match result {
-                Ok(()) => info!("✅ Uploaded artifact: {}", name),
+                Ok(true) => info!("✅ Uploaded artifact: {}", name),
                 Err(e) => {
                     warn!("Failed to upload artifact {}: {:#}", name, e);
                     trace
@@ -2251,6 +2268,53 @@ mod tests {
         let trace = trace_of(&server, 52).await;
         assert!(trace.contains("Cache not saved: job canceled"), "{}", trace);
         assert!(!trace.contains("Uploaded cache"), "{}", trace);
+    }
+
+    #[tokio::test]
+    async fn an_abort_stops_uploading_artifacts() {
+        let server = MockServer::start().await;
+        // GitLab takes the upload but answers only after 10 s
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex(
+                r"^/api/v4/jobs/\d+/artifacts$",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_secs(10)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let handle = daemon.shutdown_handle();
+        let job = lifecycle_job(53, &["mkdir -p out", "echo x > out/a.txt"], "on_success");
+        // Abort once the upload has reached GitLab
+        let abort = async {
+            while requests(&server, "POST", 53).await.is_empty() {
+                sleep(Duration::from_millis(20)).await;
+            }
+            handle.request(Shutdown::Abort);
+        };
+
+        let started = std::time::Instant::now();
+        let (executed, _) = tokio::join!(
+            daemon.execute_job(job),
+            tokio::time::timeout(Duration::from_secs(10), abort)
+        );
+        executed.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let trace = trace_of(&server, 53).await;
+        assert!(
+            trace.contains("Artifacts not uploaded: job canceled"),
+            "{}",
+            trace
+        );
+        let update = final_update(&server, 53).await;
+        assert_eq!(update["state"], "failed");
+        assert_eq!(update["failure_reason"], "runner_system_failure");
     }
 
     #[tokio::test]
