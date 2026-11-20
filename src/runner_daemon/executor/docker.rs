@@ -491,11 +491,46 @@ pub fn dind_ca_mounts(
 /// Containers and network created for one job, removed when it ends
 #[derive(Default)]
 struct JobContainers {
-    network: Option<String>,
     /// Checks out sources, so job images do not need git (like gitlab-runner's helper)
     helper: Option<String>,
+    run: RunContainers,
+}
+
+/// What the job's scripts run with: the job container next to its services
+#[derive(Default)]
+struct RunContainers {
+    network: Option<String>,
     services: Vec<String>,
     job: Option<String>,
+}
+
+/// What starting the containers of a job needs
+struct JobSetup<'a> {
+    job: &'a Job,
+    job_dir: &'a Path,
+    image: &'a str,
+    services: &'a [crate::gitlab::Service],
+    service_images: &'a [String],
+    /// The job's variables, for service variables that refer to them
+    values: &'a std::collections::HashMap<String, String>,
+    env: &'a JobEnv,
+}
+
+/// Where starting the job's containers reports progress: straight to the
+/// job log, or into a buffer while the log shows the checkout that runs at
+/// the same time (the buffer is written to the log once both are done)
+enum SetupLog<'t, 'a> {
+    Trace(&'t mut TraceWriter<'a>),
+    Buffer(String),
+}
+
+impl SetupLog<'_, '_> {
+    async fn write(&mut self, text: &str) {
+        match self {
+            SetupLog::Trace(trace) => trace.write(text).await,
+            SetupLog::Buffer(buffer) => buffer.push_str(text),
+        }
+    }
 }
 
 impl DockerExecutor {
@@ -660,14 +695,6 @@ impl DockerExecutor {
         containers: &mut JobContainers,
         restore: &impl Restore,
     ) -> JobOutcome {
-        // Like the scripts, pulls and service startup stop at the job timeout
-        // and once the job is being canceled
-        let cancel = trace.cancel();
-        let limits = Limits {
-            deadline,
-            cancel: &cancel,
-            stop_at: RemoteState::Canceling,
-        };
         let env = script::job_env(
             job,
             "/builds",
@@ -708,8 +735,8 @@ impl DockerExecutor {
         let checkout = job.git_info.is_some()
             && git::strategy(&job.variables, job.allow_git_fetch) != GitStrategy::None;
 
-        // The job image, the helper (only to check out sources) and the
-        // service images are pulled at the same time
+        // Every image is checked against its pull policy first, so a job
+        // fails before anything starts when one is not allowed
         let mut images = vec![(image.as_str(), Some(policies.as_slice()))];
         if checkout {
             images.push((self.config.helper_image.as_str(), None));
@@ -720,7 +747,23 @@ impl DockerExecutor {
                 .zip(&services)
                 .map(|(name, service)| (name.as_str(), Some(service.pull_policy.as_slice()))),
         );
-        self.ensure_images(&images, job, trace, &limits).await?;
+        let pulls = self.plan_pulls(&images, trace).await?;
+        // Pulled by the branch that needs them; an image both need is pulled
+        // once (see `pull_shared`)
+        let needed_by = |wanted: &[&str]| -> Vec<&str> {
+            let wanted: Vec<String> = wanted.iter().map(|i| image::with_default_tag(i)).collect();
+            pulls
+                .iter()
+                .copied()
+                .filter(|pull| wanted.contains(&image::with_default_tag(pull)))
+                .collect()
+        };
+        let job_pulls = needed_by(
+            &std::iter::once(image.as_str())
+                .chain(service_images.iter().map(String::as_str))
+                .collect::<Vec<_>>(),
+        );
+        let helper_pulls = needed_by(&[self.config.helper_image.as_str()]);
 
         write_variable_files(&env)
             .await
@@ -729,41 +772,181 @@ impl DockerExecutor {
         tokio::fs::create_dir_all(job_dir.join(&subdir))
             .await
             .map_err(|e| JobFailure::system(format!("Failed to create host workspace: {}", e)))?;
+        let dirs = JobDirs {
+            builds: "/builds".to_string(),
+            project: format!("/builds/{}", subdir),
+        };
+        let setup = JobSetup {
+            job,
+            job_dir,
+            image: &image,
+            services: &services,
+            service_images: &service_images,
+            values: &values,
+            env: &env,
+        };
+        let JobContainers { helper, run } = containers;
 
-        if checkout {
-            // Container API calls are not interrupted (a dropped create could
-            // leave a container nobody removes), so a cancel is seen between them
-            limits.check(job)?;
-            let user = sources_user(job, job_dir).await;
+        // Like the scripts, pulls and service startup stop at the job timeout
+        // and once the job is being canceled
+        let cancel = trace.cancel();
+        if !checkout {
+            // Hooks of get_sources run in the job container, which has to come first
+            let limits = Limits {
+                deadline,
+                cancel: &cancel,
+                stop_at: RemoteState::Canceling,
+            };
             let id = self
-                .start_helper(job, job_dir, &env, user)
-                .await
-                .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-            containers.helper = Some(id);
+                .start_job_container(
+                    &setup,
+                    &job_pulls,
+                    &limits,
+                    &mut SetupLog::Trace(trace),
+                    run,
+                )
+                .await?;
+            let runner = self.runner(&id, &env, false);
+            return run_job_steps(job, deadline, &runner, &runner, trace, &dirs, restore).await;
         }
 
+        // Getting sources needs neither the job image nor the services nor the
+        // job container: the checkout runs while they are pulled and started.
+        // Both branches stop on `setup_stop`, which a cancel of the job sets,
+        // and which a branch that fails sets to stop the other one; the first
+        // failure is the job's. A failing checkout does not stop the job
+        // container: after_script still runs in it, as it would without
+        // services. Container API calls are never interrupted (a dropped
+        // create could leave a container nobody removes): every container is
+        // recorded as soon as it exists, and removed by `release`.
+        let setup_stop = CancelSignal::default();
+        let limits = Limits {
+            deadline,
+            cancel: &setup_stop,
+            stop_at: RemoteState::Canceling,
+        };
+        let failed = std::sync::OnceLock::<JobFailure>::new();
+        let fail = |failure: JobFailure| {
+            let _ = failed.set(failure);
+            setup_stop.update(RemoteState::Canceling);
+        };
+        let sources = async {
+            let started = async {
+                let (pulled, user) = tokio::join!(
+                    self.pull_all(&helper_pulls, job, &limits),
+                    sources_user(job, job_dir)
+                );
+                pulled?;
+                limits.check(job)?;
+                let id = self
+                    .start_helper(job, job_dir, &env, user)
+                    .await
+                    .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+                *helper = Some(id.clone());
+                Ok::<_, JobFailure>(id)
+            }
+            .await;
+            match started {
+                Ok(id) => {
+                    let runner = self.runner(&id, &env, true);
+                    Ok(get_sources_section(job, &runner, trace, &dirs, &limits).await)
+                }
+                Err(failure) => {
+                    fail(failure.clone());
+                    Err(failure)
+                }
+            }
+        };
+        let containers = async {
+            let mut log = SetupLog::Buffer(String::new());
+            let started = self
+                .start_job_container(&setup, &job_pulls, &limits, &mut log, run)
+                .await;
+            if let Err(failure) = &started {
+                fail(failure.clone());
+            }
+            (started, log)
+        };
+        let forward_cancel = async {
+            cancel.reached(RemoteState::Canceling).await;
+            setup_stop.update(RemoteState::Canceling);
+            std::future::pending::<()>().await
+        };
+        let (sourced, (started, log)) = tokio::select! {
+            both = async { tokio::join!(sources, containers) } => both,
+            () = forward_cancel => unreachable!("waits forever once forwarded"),
+        };
+        if let SetupLog::Buffer(text) = log {
+            if !text.is_empty() {
+                trace.write(&text).await;
+            }
+        }
+        if let Some(failure) = failed.into_inner() {
+            return Err(failure);
+        }
+        let id = started?;
+        let sources_failure = sourced?;
+        let runner = self.runner(&id, &env, false);
+        run_steps(
+            job,
+            deadline,
+            sources_failure,
+            &runner,
+            trace,
+            &dirs,
+            restore,
+        )
+        .await
+    }
+
+    /// Runs scripts in container `id`; a sources-only one is removed once
+    /// getting sources is done
+    fn runner<'r>(&'r self, id: &'r str, env: &JobEnv, sources_only: bool) -> DockerRunner<'r> {
+        DockerRunner {
+            docker: &self.docker,
+            container_id: id,
+            env: env.to_docker(),
+            sources_only,
+        }
+    }
+
+    /// Pull the job image and the service images in `pulls`, start the
+    /// services on a network of the job's own, wait for them and start the
+    /// job container; returns its id. Everything is recorded in `run` as
+    /// soon as it exists, so a failure leaves nothing `release` misses.
+    async fn start_job_container(
+        &self,
+        setup: &JobSetup<'_>,
+        pulls: &[&str],
+        limits: &Limits<'_>,
+        log: &mut SetupLog<'_, '_>,
+        run: &mut RunContainers,
+    ) -> std::result::Result<String, JobFailure> {
+        let job = setup.job;
+        self.pull_all(pulls, job, limits).await?;
         let volumes = self
             .job_volumes(job)
             .await
             .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
 
         // Services need a network of their own to be reachable by alias
-        if !services.is_empty() {
+        if !setup.services.is_empty() {
             limits.check(job)?;
             let network = format!("turboci-job-{}", job.id);
             self.create_network(&network)
                 .await
                 .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-            containers.network = Some(network);
+            run.network = Some(network);
         }
-        for (index, (service, service_image)) in services.iter().zip(service_images).enumerate() {
-            trace
-                .write(&format!("Starting service {} ...\n", service_image))
+        for (index, (service, service_image)) in
+            setup.services.iter().zip(setup.service_images).enumerate()
+        {
+            log.write(&format!("Starting service {} ...\n", service_image))
                 .await;
             limits.check(job)?;
-            let mut host_config = self.host_config(volumes.clone(), containers.network.as_deref());
+            let mut host_config = self.host_config(volumes.clone(), run.network.as_deref());
             let mut service = service.clone();
-            if image::is_dind(&service_image) {
+            if image::is_dind(service_image) {
                 service.command = image::dind_command(
                     service.command.as_deref(),
                     &self.config.insecure_registries,
@@ -775,33 +958,33 @@ impl DockerExecutor {
                 .create_service(
                     job,
                     &format!("turboci-job-{}-svc-{}", job.id, index),
-                    &service_image,
+                    service_image,
                     &service,
-                    &values,
+                    setup.values,
                     // Configured volumes too, e.g. /certs/client for docker:dind with TLS
                     host_config,
                 )
                 .await
                 .map_err(|e| JobFailure::system(format!("service {}: {:#}", service.name, e)))?;
             // Recorded before starting, so a service that fails to start is removed too
-            containers.services.push(id.clone());
+            run.services.push(id.clone());
             use bollard::container::StartContainerOptions;
             self.docker
                 .start_container(&id, None::<StartContainerOptions<String>>)
                 .await
                 .map_err(|e| JobFailure::system(format!("service {}: {}", service_image, e)))?;
         }
-        if let Some(network) = containers.network.clone() {
-            self.wait_for_services(job.id, &network, &containers.services, trace, &limits)
+        if let Some(network) = run.network.clone() {
+            self.wait_for_services(job.id, &network, &run.services, log, limits)
                 .await;
         }
 
         limits.check(job)?;
         let name = format!("turboci-job-{}", job.id);
         let config = ContainerCreateBody {
-            image: Some(image.clone()),
+            image: Some(setup.image.to_string()),
             working_dir: Some("/builds".to_string()),
-            env: Some(env.to_docker()),
+            env: Some(setup.env.to_docker()),
             // `image: {entrypoint: [""]}` clears an entrypoint that is not a shell
             entrypoint: job.image.as_ref().and_then(|img| img.entrypoint.clone()),
             // Keep the container alive for the whole job; steps run as execs
@@ -812,10 +995,10 @@ impl DockerExecutor {
             ]),
             host_config: Some(
                 self.job_host_config(
-                    std::iter::once(format!("{}:/builds", job_dir.display()))
+                    std::iter::once(format!("{}:/builds", setup.job_dir.display()))
                         .chain(volumes.iter().cloned())
                         .collect(),
-                    containers.network.as_deref(),
+                    run.network.as_deref(),
                 ),
             ),
             ..Default::default()
@@ -824,7 +1007,7 @@ impl DockerExecutor {
             .create_named(&name, config)
             .await
             .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-        containers.job = Some(id.clone());
+        run.job = Some(id.clone());
         info!("📦 Created container: {}", id);
 
         use bollard::container::StartContainerOptions;
@@ -832,25 +1015,7 @@ impl DockerExecutor {
             .start_container(&id, None::<StartContainerOptions<String>>)
             .await
             .map_err(|e| JobFailure::system(format!("Failed to start container: {}", e)))?;
-
-        let runner = DockerRunner {
-            docker: &self.docker,
-            container_id: &id,
-            env: env.to_docker(),
-            sources_only: false,
-        };
-        // Still recorded in `containers`: removing it again at the end is a no-op
-        let sources = DockerRunner {
-            docker: &self.docker,
-            container_id: containers.helper.as_deref().unwrap_or(&id),
-            env: env.to_docker(),
-            sources_only: containers.helper.is_some(),
-        };
-        let dirs = JobDirs {
-            builds: "/builds".to_string(),
-            project: format!("/builds/{}", subdir),
-        };
-        run_job_steps(job, deadline, &sources, &runner, trace, &dirs, restore).await
+        Ok(id)
     }
 
     /// Start the container that checks out sources as `user` (root when
@@ -980,17 +1145,15 @@ impl DockerExecutor {
             .map(|c| (c.username.clone(), c.password.clone()))
     }
 
-    /// Make `images` available according to their pull policies, pulling the
-    /// ones that need it at the same time (each image once), with the registry
-    /// credentials of `registry_login`. A `None` policy is for the runner's
-    /// own helper image, which is pulled only when missing.
-    async fn ensure_images(
+    /// Which of `images` need a pull according to their pull policies (each
+    /// image once); fails when an image may not be pulled and is missing. A
+    /// `None` policy is for the runner's own helper image, which is pulled
+    /// only when missing.
+    async fn plan_pulls<'i>(
         &self,
-        images: &[(&str, Option<&[String]>)],
-        job: &Job,
+        images: &[(&'i str, Option<&[String]>)],
         trace: &mut TraceWriter<'_>,
-        limits: &Limits<'_>,
-    ) -> JobOutcome {
+    ) -> std::result::Result<Vec<&'i str>, JobFailure> {
         let mut pulls: Vec<&str> = Vec::new();
         for &(image, job_policies) in images {
             let policy = match job_policies {
@@ -1028,8 +1191,14 @@ impl DockerExecutor {
                 }
             }
         }
+        Ok(pulls)
+    }
+
+    /// Pull `images` at the same time, with the registry credentials of
+    /// `registry_login`, until `limits` stop it
+    async fn pull_all(&self, images: &[&str], job: &Job, limits: &Limits<'_>) -> JobOutcome {
         let pulling =
-            futures_util::future::try_join_all(pulls.iter().map(|image| self.pull(image, job)));
+            futures_util::future::try_join_all(images.iter().map(|image| self.pull(image, job)));
         limits
             .bound(pulling)
             .await
@@ -1137,7 +1306,7 @@ impl DockerExecutor {
         job_id: u64,
         network: &str,
         services: &[String],
-        trace: &mut TraceWriter<'_>,
+        log: &mut SetupLog<'_, '_>,
         limits: &Limits<'_>,
     ) -> usize {
         let mut checks = Vec::new();
@@ -1170,8 +1339,7 @@ impl DockerExecutor {
         if checks.is_empty() {
             return 0;
         }
-        trace
-            .write("Waiting for services to be up and running (timeout 30 seconds)...\n")
+        log.write("Waiting for services to be up and running (timeout 30 seconds)...\n")
             .await;
         let from_host = futures_util::future::join_all(checks.iter().map(|check| async move {
             match check.address {
@@ -1188,15 +1356,14 @@ impl DockerExecutor {
             match waited {
                 HostWait::Ready => {}
                 HostWait::TimedOut => {
-                    trace
-                        .write(&format!("{}\n", service_timeout_warning(check)))
+                    log.write(&format!("{}\n", service_timeout_warning(check)))
                         .await
                 }
                 HostWait::Unreachable => unreachable.push(check),
             }
         }
         if !unreachable.is_empty() {
-            self.wait_in_container(job_id, network, &unreachable, trace, limits)
+            self.wait_in_container(job_id, network, &unreachable, log, limits)
                 .await;
         }
         unreachable.len()
@@ -1209,7 +1376,7 @@ impl DockerExecutor {
         job_id: u64,
         network: &str,
         checks: &[&ServiceCheck],
-        trace: &mut TraceWriter<'_>,
+        log: &mut SetupLog<'_, '_>,
         limits: &Limits<'_>,
     ) {
         let tries = SERVICE_WAIT.as_millis() / SERVICE_POLL.as_millis();
@@ -1247,7 +1414,7 @@ impl DockerExecutor {
             )
             .await
         {
-            Ok(output) => trace.write(&output).await,
+            Ok(output) => log.write(&output).await,
             Err(e) => warn!("Could not check services: {:#}", e),
         }
     }
@@ -1379,10 +1546,11 @@ impl DockerExecutor {
         // nothing the job controls runs during cleanup. They are independent,
         // so they are removed at the same time.
         let removals = containers
+            .run
             .job
             .iter()
             .chain(&containers.helper)
-            .chain(&containers.services)
+            .chain(&containers.run.services)
             .map(|id| async move {
                 match self.force_remove(id).await {
                     Ok(()) => info!("🗑️  Removed container: {}", id),
@@ -1390,13 +1558,13 @@ impl DockerExecutor {
                 }
             });
         futures_util::future::join_all(removals).await;
-        if let Some(network) = &containers.network {
+        if let Some(network) = &containers.run.network {
             if let Err(e) = self.docker.remove_network(network).await {
                 warn!("Failed to remove network {}: {}", network, e);
             }
         }
 
-        if containers.job.is_some() || containers.helper.is_some() {
+        if containers.run.job.is_some() || containers.helper.is_some() {
             if let Err(e) = self.reset_ownership(job_id, job_dir).await {
                 warn!("Failed to reset workspace ownership: {:#}", e);
             }
@@ -2525,7 +2693,7 @@ mod tests {
                 job_id,
                 &network,
                 std::slice::from_ref(&first),
-                &mut trace,
+                &mut SetupLog::Trace(&mut trace),
                 &limits,
             )
             .await;
@@ -2540,7 +2708,13 @@ mod tests {
             address: None,
         };
         executor
-            .wait_in_container(job_id, &network, &[&check], &mut trace, &limits)
+            .wait_in_container(
+                job_id,
+                &network,
+                &[&check],
+                &mut SetupLog::Trace(&mut trace),
+                &limits,
+            )
             .await;
         let container_wait = started.elapsed();
         trace.finish().await;
@@ -2559,6 +2733,282 @@ mod tests {
         );
         assert!(log.contains("Waiting for services"), "{}", log);
         assert!(!log.contains("WARNING"), "{}", log);
+    }
+
+    /// Names of containers left of job `job_id`
+    async fn leftovers(job_id: u64) -> Vec<String> {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        docker
+            .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+                all: true,
+                filters: std::collections::HashMap::from([(
+                    "name".to_string(),
+                    vec![format!("turboci-job-{}", job_id)],
+                )]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_iter()
+            .flat_map(|container| container.names.unwrap_or_default())
+            .collect()
+    }
+
+    /// A job checking out a local repository (its workspace's origin.git)
+    /// next to a redis service that starts listening after `service_delay`
+    /// seconds; `hooks` and `script` as given
+    fn pipelined_job(
+        executor: &ExecutorType,
+        job_id: u64,
+        service: &str,
+        service_delay: u32,
+        hooks: serde_json::Value,
+        script: &[&str],
+    ) -> Job {
+        let job_dir = executor.builds_root().join(format!("job-{}", job_id));
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let work = job_dir.join("origin-work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "hello from git\n").unwrap();
+        git(&work, &["add", "file.txt"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        let sha = git(&work, &["rev-parse", "HEAD"]);
+        git(
+            &job_dir,
+            &["clone", "-q", "--bare", "origin-work", "origin.git"],
+        );
+        job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "redis:7-alpine"},
+            "git_info": {
+                "repo_url": "file:///builds/origin.git", "ref": "main", "ref_type": "branch",
+                "sha": sha, "before_sha": "", "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]
+            },
+            "variables": [
+                {"key": "GIT_CONFIG_COUNT", "value": "1"},
+                {"key": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+                {"key": "GIT_CONFIG_VALUE_0", "value": "*"}
+            ],
+            "services": [{
+                "name": service, "alias": "cache",
+                "command": ["sh", "-c", format!("sleep {}; exec redis-server", service_delay)]
+            }],
+            "hooks": hooks,
+            "steps": steps(script, &["echo after-ran"])
+        }))
+    }
+
+    /// An executor whose job, helper and service images are present
+    async fn with_pipeline_images() -> ExecutorType {
+        let executor = DockerExecutor::new(DockerConfig {
+            pull_policy: "if-not-present".to_string(),
+            ..DockerConfig::default()
+        })
+        .unwrap();
+        for image in ["redis:7-alpine", "alpine/git:latest"] {
+            executor.pull_if_missing(image).await.unwrap();
+        }
+        ExecutorType::Docker(executor)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_checkout_runs_while_services_start() {
+        let executor = with_pipeline_images().await;
+        let job_id = 914_000_000 + u64::from(std::process::id());
+        // Run one after the other, the hook and the service delay would
+        // take at least 12s
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            6,
+            serde_json::json!([{"name": "pre_get_sources_script", "script": ["sleep 6"]}]),
+            &["cat file.txt", "echo \"ping=$(redis-cli -h cache ping)\""],
+        );
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let started = Instant::now();
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        let took = started.elapsed();
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("hello from git"), "{}", log);
+        assert!(log.contains("ping=PONG"), "{}", log);
+        assert!(took < Duration::from_secs(12), "took {:?}\n{}", took, log);
+        // The services' progress follows the checkout's section
+        let sources_end = log.find("section_end:").expect("get_sources section");
+        let service = log.find("Starting service").expect("service started");
+        assert!(sources_end < service, "{}", log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_failed_service_stops_the_checkout_and_leaves_nothing() {
+        let executor = with_pipeline_images().await;
+        let job_id = 915_000_000 + u64::from(std::process::id());
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "turboci-missing.invalid/redis:1",
+            0,
+            serde_json::json!([{"name": "pre_get_sources_script", "script": ["sleep 60"]}]),
+            &["echo script-ran"],
+        );
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let started = Instant::now();
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        let took = started.elapsed();
+        trace.finish().await;
+        let log = trace.text();
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(failure.reason, FailureReason::ImagePullFailure, "{}", log);
+        assert!(
+            failure.message.contains("turboci-missing.invalid"),
+            "{}",
+            failure.message
+        );
+        assert!(took < Duration::from_secs(30), "took {:?}\n{}", took, log);
+        assert!(
+            !log.contains("script-ran") && !log.contains("after-ran"),
+            "{}",
+            log
+        );
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_failed_checkout_still_runs_after_script_next_to_services() {
+        let executor = with_pipeline_images().await;
+        let job_id = 916_000_000 + u64::from(std::process::id());
+        let mut j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            0,
+            serde_json::json!([]),
+            &["echo script-ran"],
+        );
+        j.git_info.as_mut().unwrap().repo_url = "file:///builds/missing.git".to_string();
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::ScriptFailure,
+            "{}",
+            log
+        );
+        assert!(!log.contains("\nscript-ran"), "{}", log);
+        assert!(log.contains("after-ran"), "{}", log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_cancel_stops_checkout_and_service_startup() {
+        let executor = with_pipeline_images().await;
+        let job_id = 917_000_000 + u64::from(std::process::id());
+        // Neither the hook nor the service would be done before the cancel
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            60,
+            serde_json::json!([{"name": "pre_get_sources_script", "script": ["sleep 60"]}]),
+            &["echo script-ran"],
+        );
+        let scrubber = SecretScrubber::new(vec![]);
+        let cancel = CancelSignal::default();
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber).with_cancel(cancel.clone());
+        let trigger = async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            cancel.update(RemoteState::Canceling);
+        };
+
+        let started = Instant::now();
+        let (outcome, ()) = tokio::join!(executor.execute(&j, &mut trace, &NoRestore), trigger);
+        let took = started.elapsed();
+        trace.finish().await;
+        let log = trace.text();
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::JobCanceled,
+            "{}",
+            log
+        );
+        assert!(took < Duration::from_secs(20), "took {:?}\n{}", took, log);
+        assert!(!log.contains("script-ran"), "{}", log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_job_timeout_stops_checkout_and_service_startup() {
+        let executor = with_pipeline_images().await;
+        let job_id = 918_000_000 + u64::from(std::process::id());
+        let mut j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            60,
+            serde_json::json!([{"name": "pre_get_sources_script", "script": ["sleep 60"]}]),
+            &["echo script-ran"],
+        );
+        j.runner_info = serde_json::from_value(serde_json::json!({"timeout": 4})).unwrap();
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let started = Instant::now();
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        let took = started.elapsed();
+        trace.finish().await;
+        let log = trace.text();
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::JobExecutionTimeout,
+            "{}",
+            log
+        );
+        assert!(took < Duration::from_secs(20), "took {:?}\n{}", took, log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
     }
 
     /// An executor with alpine:3.20 already present: the job timeout includes

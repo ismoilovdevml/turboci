@@ -390,6 +390,45 @@ async fn run_job_steps(
     restore: &impl Restore,
 ) -> JobOutcome {
     let cancel = trace.cancel();
+    let limits = Limits {
+        deadline,
+        cancel: &cancel,
+        stop_at: RemoteState::Canceling,
+    };
+    let failure = get_sources_section(job, sources, trace, dirs, &limits).await;
+    run_steps(job, deadline, failure, runner, trace, dirs, restore).await
+}
+
+/// The get_sources section of the log: hooks and checkout with `sources`
+/// within `limits`, after which `sources` is released. Returns why it failed.
+async fn get_sources_section(
+    job: &Job,
+    sources: &impl ScriptRunner,
+    trace: &mut TraceWriter<'_>,
+    dirs: &JobDirs,
+    limits: &Limits<'_>,
+) -> Option<JobFailure> {
+    trace
+        .section_start("get_sources", "Getting source from Git repository")
+        .await;
+    let fetched = get_sources(job, sources, trace, dirs, limits).await;
+    sources.sources_done().await;
+    trace.section_end("get_sources").await;
+    fetched.err().map(|e| e.failure(job))
+}
+
+/// What follows getting sources (which failed with `failure`, if it did):
+/// restore the cache and artifacts, then run the steps (see `run_job_steps`)
+async fn run_steps(
+    job: &Job,
+    deadline: Instant,
+    mut failure: Option<JobFailure>,
+    runner: &impl ScriptRunner,
+    trace: &mut TraceWriter<'_>,
+    dirs: &JobDirs,
+    restore: &impl Restore,
+) -> JobOutcome {
+    let cancel = trace.cancel();
     let canceled = || RunError::Canceled.failure(job);
     let timed_out = || RunError::TimedOut.failure(job);
 
@@ -398,13 +437,6 @@ async fn run_job_steps(
         cancel: &cancel,
         stop_at: RemoteState::Canceling,
     };
-    trace
-        .section_start("get_sources", "Getting source from Git repository")
-        .await;
-    let fetched = get_sources(job, sources, trace, dirs, &script_limits).await;
-    sources.sources_done().await;
-    trace.section_end("get_sources").await;
-    let mut failure = fetched.err().map(|e| e.failure(job));
     if failure.is_none() {
         // Bound like the scripts: a slow S3 transfer must not outlive the job
         // timeout or a cancel. The restore is then stopped and awaited, so no

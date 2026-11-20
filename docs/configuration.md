@@ -205,7 +205,10 @@ to the runner's user; it runs as root when `pre_get_sources_script` or
 workspace belongs to root, or when an earlier job left files in it that belong
 to another user. Jobs
 with `services` get their own network where each service is reachable by its
-aliases. Concurrent jobs that need the same image with the same registry
+aliases. The checkout runs while the job image is pulled and the services
+start; the log shows the services' progress after the `get_sources` section.
+If either fails, or the job times out or is canceled, the other is stopped
+and every container of the job is removed. Concurrent jobs that need the same image with the same registry
 login wait for one pull of it; a job never shares the pull of a job that
 logged in differently.
 
