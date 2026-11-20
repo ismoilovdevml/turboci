@@ -126,6 +126,8 @@ pub struct DockerConfig {
     pub shm_size: Option<String>,
     /// OOM killer preference of job and service containers (-1000 to 1000)
     pub oom_score_adjust: Option<i64>,
+    /// Most processes a job or service container may run (fork bomb guard)
+    pub pids_limit: Option<i64>,
     /// Services started for every job, before the job's own `services:`
     pub services: Vec<ServiceConfig>,
     /// Docker client config (`auths`) with registry logins used for pulls,
@@ -235,6 +237,9 @@ impl DockerConfig {
             .is_some_and(|score| !(-1000..=1000).contains(&score))
         {
             anyhow::bail!("executor.docker.oom_score_adjust must be between -1000 and 1000");
+        }
+        if self.pids_limit.is_some_and(|limit| limit < 1) {
+            anyhow::bail!("executor.docker.pids_limit must be at least 1 (unset for no limit)");
         }
         for policy in std::iter::once(&self.pull_policy).chain(&self.allowed_pull_policies) {
             if !matches!(policy.as_str(), "always" | "if-not-present" | "never") {
@@ -409,6 +414,7 @@ impl Default for DockerConfig {
             cpus: None,
             shm_size: None,
             oom_score_adjust: None,
+            pids_limit: None,
             services: Vec::new(),
             auth_config_file: None,
             insecure_registries: Vec::new(),
@@ -671,7 +677,7 @@ mod tests {
     #[test]
     fn parses_docker_limits() {
         let config = RunnerConfig::parse(
-            "runner_token = \"t\"\n[executor.docker]\nmemory = \"512m\"\ncpus = 1.5\npull_policy = \"if-not-present\"",
+            "runner_token = \"t\"\n[executor.docker]\nmemory = \"512m\"\ncpus = 1.5\npull_policy = \"if-not-present\"\npids_limit = 4096",
         )
         .unwrap();
         config.validate().unwrap();
@@ -679,11 +685,13 @@ mod tests {
             config.executor.docker.memory_bytes().unwrap(),
             Some(512 << 20)
         );
+        assert_eq!(config.executor.docker.pids_limit, Some(4096));
 
         for bad in [
             "memory = \"lots\"",
             "cpus = 0.0",
             "pull_policy = \"sometimes\"",
+            "pids_limit = 0",
         ] {
             let config =
                 RunnerConfig::parse(&format!("runner_token = \"t\"\n[executor.docker]\n{}", bad))

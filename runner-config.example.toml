@@ -97,6 +97,8 @@ helper_image = "alpine/git:latest"
 # cpus = 2.0
 # shm_size = "1g"
 # oom_score_adjust = 500
+# Most processes per container, so a fork bomb cannot exhaust the host
+# pids_limit = 4096
 
 # Docker config.json whose "auths" logins are used to pull private images
 # (default: ~/.docker/config.json of the service user)

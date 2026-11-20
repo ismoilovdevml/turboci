@@ -210,6 +210,7 @@ aliases.
 | `cpus` | – | CPU limit per container, e.g. `1.5` |
 | `shm_size` | – | Size of `/dev/shm`, e.g. `"1g"`. Docker's 64 MB is too small for browsers and some test runners |
 | `oom_score_adjust` | – | OOM killer preference of containers (-1000 to 1000) |
+| `pids_limit` | – | Most processes per container (at least 1), so a fork bomb cannot exhaust the host, e.g. `4096` |
 | `auth_config_file` | `~/.docker/config.json` of the service user | Docker client config whose `auths` are used to pull private images |
 | `insecure_registries` | `[]` | Registries (`host[:port]`) reached over HTTP or without certificate checks; docker:dind services get `--insecure-registry` for each |
 | `registry_ca` | `{}` | Registry → PEM CA file; mounted into docker:dind services as `/etc/docker/certs.d/<registry>/ca.crt` |

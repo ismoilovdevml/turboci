@@ -590,6 +590,7 @@ impl DockerExecutor {
             memory_reservation: self.config.memory_reservation_bytes().ok().flatten(),
             shm_size: self.config.shm_size_bytes().ok().flatten(),
             oom_score_adj: self.config.oom_score_adjust,
+            pids_limit: self.config.pids_limit,
             nano_cpus: self.config.cpus.map(|cpus| (cpus * 1e9) as i64),
             ..Default::default()
         }
@@ -1364,6 +1365,7 @@ mod tests {
             DockerExecutor::new(DockerConfig {
                 pull_policy: "if-not-present".to_string(),
                 memory: Some("256m".to_string()),
+                pids_limit: Some(128),
                 ..DockerConfig::default()
             })
             .unwrap(),
@@ -1378,7 +1380,8 @@ mod tests {
                     "for i in $(seq 1 20); do redis-cli -h redis ping >/dev/null 2>&1 && break; sleep 0.5; done",
                     "echo \"by-image $(redis-cli -h redis ping)\"",
                     "echo \"by-alias $(redis-cli -h cache ping)\"",
-                    "echo \"memory $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes)\""
+                    "echo \"memory $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes)\"",
+                    "echo \"pids $(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max)\""
                 ],
                 &[]
             )
@@ -1394,6 +1397,7 @@ mod tests {
         assert!(log.contains("by-image PONG"), "{}", log);
         assert!(log.contains("by-alias PONG"), "{}", log);
         assert!(log.contains("memory 268435456"), "{}", log);
+        assert!(log.contains("pids 128"), "{}", log);
 
         // Job container, service container and job network are all gone
         let docker = Docker::connect_with_local_defaults().unwrap();
