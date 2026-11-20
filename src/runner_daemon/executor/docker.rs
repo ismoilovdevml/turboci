@@ -1267,7 +1267,13 @@ impl ScriptRunner for DockerRunner<'_> {
                     }
                 };
                 let Some(chunk) = next else { break };
-                let text = match chunk? {
+                let chunk = chunk?;
+                if trace.is_truncated() {
+                    // Past the log limit the output is dropped: drain it, skip decoding
+                    trace.flush_if_due().await;
+                    continue;
+                }
+                let text = match chunk {
                     LogOutput::StdErr { message } => stderr.decode(&message),
                     LogOutput::StdOut { message } | LogOutput::Console { message } => {
                         stdout.decode(&message)

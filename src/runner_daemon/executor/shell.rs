@@ -129,10 +129,14 @@ impl ScriptRunner for ShellRunner {
                 }
                 n = out.read(&mut out_buf), if out_open => match n? {
                     0 => out_open = false,
+                    // Past the log limit the output is dropped: drain it, skip decoding
+                    _ if trace.is_truncated() => trace.flush_if_due().await,
                     n => trace.write(&stdout.decode(&out_buf[..n])).await,
                 },
                 n = err.read(&mut err_buf), if err_open => match n? {
                     0 => err_open = false,
+                    // Past the log limit the output is dropped: drain it, skip decoding
+                    _ if trace.is_truncated() => trace.flush_if_due().await,
                     n => trace.write(&stderr.decode(&err_buf[..n])).await,
                 },
                 _ = &mut deadline => {
