@@ -52,6 +52,18 @@ pub struct RunnerConfig {
     pub pre_build_script: Option<String>,
     pub post_build_script: Option<String>,
 
+    /// Admission control: no job is requested while the host has less memory
+    /// available (MemAvailable, Linux), such as "2g" (unset or "0" = off)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_free_memory: Option<String>,
+    /// No job is requested while the builds or cache directory's file system
+    /// has less space free, such as "10g" (unset or "0" = off)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_free_disk: Option<String>,
+    /// No job is requested while the 1-minute load average is above this (Linux)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_load_avg: Option<f64>,
+
     /// S3-compatible storage shared by runners, used next to `cache_dir`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_s3: Option<S3CacheConfig>,
@@ -440,6 +452,9 @@ impl Default for RunnerConfig {
             post_get_sources_script: None,
             pre_build_script: None,
             post_build_script: None,
+            min_free_memory: None,
+            min_free_disk: None,
+            max_load_avg: None,
             cache_s3: None,
             executor: ExecutorConfig::default(),
         }
@@ -561,6 +576,7 @@ impl RunnerConfig {
             );
         }
         self.cache_max_size_bytes()?;
+        self.validate_daemon_options()?;
         if let Some(s3) = &self.cache_s3 {
             super::s3::S3Location::parse(&s3.url, s3.region.as_deref())?;
             if s3.access_key.trim().is_empty() || s3.secret_key.trim().is_empty() {
@@ -629,6 +645,41 @@ impl RunnerConfig {
     pub fn create_example<P: AsRef<Path>>(path: P) -> Result<()> {
         let config = Self::default();
         config.save(path)
+    }
+}
+
+/// An optional size that must not be negative; `None` when unset or 0 (off)
+fn optional_size(field: &str, value: Option<&str>) -> Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = u64::try_from(parse_size(field, value)?)
+        .map_err(|_| anyhow::anyhow!("{} must not be negative", field))?;
+    Ok((bytes > 0).then_some(bytes))
+}
+
+/// Daemon options: admission control
+impl RunnerConfig {
+    /// `min_free_memory` in bytes; `None` when off
+    pub fn min_free_memory_bytes(&self) -> Result<Option<u64>> {
+        optional_size("min_free_memory", self.min_free_memory.as_deref())
+    }
+
+    /// `min_free_disk` in bytes; `None` when off
+    pub fn min_free_disk_bytes(&self) -> Result<Option<u64>> {
+        optional_size("min_free_disk", self.min_free_disk.as_deref())
+    }
+
+    fn validate_daemon_options(&self) -> Result<()> {
+        self.min_free_memory_bytes()?;
+        self.min_free_disk_bytes()?;
+        if self
+            .max_load_avg
+            .is_some_and(|load| !load.is_finite() || load <= 0.0)
+        {
+            anyhow::bail!("max_load_avg must be a number above 0");
+        }
+        Ok(())
     }
 }
 
@@ -1033,5 +1084,45 @@ mod tests {
             ..RunnerConfig::default()
         };
         assert!(!format!("{:?}", config).contains("s3-secret-value"));
+    }
+
+    /// A config with `runner_token` and `lines`
+    fn daemon_config(lines: &str) -> RunnerConfig {
+        RunnerConfig::parse(&format!("runner_token = \"t\"\n{}", lines)).unwrap()
+    }
+
+    #[test]
+    fn parses_the_admission_limits() {
+        let defaults = daemon_config("");
+        defaults.validate().unwrap();
+        assert_eq!(defaults.min_free_memory_bytes().unwrap(), None);
+        assert_eq!(defaults.min_free_disk_bytes().unwrap(), None);
+        assert_eq!(defaults.max_load_avg, None);
+
+        let content = "min_free_memory = \"2g\"\nmin_free_disk = \"512m\"\nmax_load_avg = 12.5";
+        let set = daemon_config(content);
+        set.validate().unwrap();
+        assert!(unknown_keys(content, &set).is_empty());
+        assert_eq!(set.min_free_memory_bytes().unwrap(), Some(2 << 30));
+        assert_eq!(set.min_free_disk_bytes().unwrap(), Some(512 << 20));
+        assert_eq!(set.max_load_avg, Some(12.5));
+        // "0" turns a limit off
+        let off = daemon_config("min_free_memory = \"0\"\nmin_free_disk = \"0\"");
+        off.validate().unwrap();
+        assert_eq!(off.min_free_memory_bytes().unwrap(), None);
+        assert_eq!(off.min_free_disk_bytes().unwrap(), None);
+
+        for bad in [
+            "min_free_memory = \"lots\"",
+            "min_free_memory = \"-1\"",
+            "min_free_disk = \"5t\"",
+            "min_free_disk = \"-1\"",
+            "max_load_avg = 0.0",
+            "max_load_avg = -2.0",
+            "max_load_avg = nan",
+            "max_load_avg = inf",
+        ] {
+            assert!(daemon_config(bad).validate().is_err(), "accepted {}", bad);
+        }
     }
 }

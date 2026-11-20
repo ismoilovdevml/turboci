@@ -35,6 +35,14 @@ state_dir = "/var/lib/turboci"
 # pre_build_script = "echo before before_script"
 # post_build_script = "echo after script"
 
+# Admission control: no job is requested while the host is short of memory
+# (MemAvailable, Linux), disk space (builds and cache directories) or CPU
+# (1-minute load average, not divided by the CPU count; Linux). Checked before
+# every job request; running jobs are never touched. Unset or "0": off
+# min_free_memory = "2g"
+# min_free_disk = "20g"
+# max_load_avg = 16.0
+
 # ===== CACHE CONFIGURATION =====
 cache_enabled = true
 # Local job cache (`cache:` in .gitlab-ci.yml), one directory per project

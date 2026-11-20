@@ -13,6 +13,7 @@ use cancel::{CancelSignal, Stop};
 use executor::{JobFailure, JobOutcome};
 use trace::TraceWriter;
 
+pub mod admission;
 pub mod artifacts;
 pub mod cancel;
 pub mod config;
@@ -374,6 +375,8 @@ pub struct RunnerDaemon {
     evicting: Arc<tokio::sync::RwLock<()>>,
     /// When unused workspaces were last looked for
     last_eviction: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Reads the host's free memory, disk space and load for admission control
+    probe: Arc<dyn admission::Probe>,
 }
 
 /// How often unused workspaces are looked for
@@ -428,7 +431,15 @@ impl RunnerDaemon {
             workspaces_in_use: Arc::default(),
             evicting: Arc::default(),
             last_eviction: Arc::default(),
+            probe: Arc::new(admission::HostProbe),
         }
+    }
+
+    /// Read the host's resources through `probe` instead
+    #[cfg(test)]
+    fn with_probe(mut self, probe: Arc<dyn admission::Probe>) -> Self {
+        self.probe = probe;
+        self
     }
 
     /// Share the job cache with other runners through S3
@@ -452,6 +463,17 @@ impl RunnerDaemon {
         info!("   Concurrent jobs: {}", self.config.concurrent);
         info!("   Check interval: {}s", self.config.check_interval);
         info!("   Cache enabled: {}", self.config.cache_enabled);
+        let limits = admission::Limits::from_config(&self.config)?;
+        if !limits.is_off() {
+            info!("   Admission limits: {}", limits.describe());
+        }
+        for key in limits.unsupported() {
+            warn!(
+                "{} is only checked on Linux: it is ignored on this host",
+                key
+            );
+        }
+        let mut gate = admission::Gate::default();
 
         self.executor.sweep_orphans().await;
         let rotation = AbortOnDrop(tokio::spawn(self.clone().rotate_token()));
@@ -466,6 +488,16 @@ impl RunnerDaemon {
                 permit = self.semaphore.clone().acquire_owned() => permit?,
                 _ = self.shutdown_requested() => break,
             };
+            // Short of memory, disk space or CPU: ask again after the check
+            // interval, without a request to GitLab
+            if !self.admit(&limits, &mut gate).await {
+                drop(permit);
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(self.config.check_interval)) => {}
+                    _ = self.shutdown_requested() => break,
+                }
+                continue;
+            }
             let claimed = claim_with_permit(
                 permit,
                 &self.gitlab,
@@ -525,6 +557,33 @@ impl RunnerDaemon {
         drop(rotation);
         info!("✅ Runner stopped");
         Ok(())
+    }
+
+    /// Whether the host meets the admission limits; changes are logged once
+    async fn admit(&self, limits: &admission::Limits, gate: &mut admission::Gate) -> bool {
+        if limits.is_off() {
+            return true;
+        }
+        let mut dirs = vec![self.executor.builds_root()];
+        if self.config.cache_enabled {
+            dirs.push(std::path::PathBuf::from(&self.config.cache_dir));
+        }
+        let (probe, checked) = (self.probe.clone(), limits.clone());
+        // statvfs on a hung network file system must not stall a worker
+        let violations =
+            tokio::task::spawn_blocking(move || admission::check(&checked, probe.as_ref(), &dirs))
+                .await
+                .unwrap_or_default();
+        match gate.update(&violations) {
+            Some(admission::Transition::Blocked(reasons)) => {
+                warn!("⏸️  Not taking new jobs: {}", reasons)
+            }
+            Some(admission::Transition::Admitted) => {
+                info!("▶️  Taking jobs again: the host is within the admission limits")
+            }
+            None => {}
+        }
+        violations.is_empty()
     }
 
     /// The checked-out project on the host (see `script::project_subdir`)
@@ -2466,6 +2525,53 @@ mod tests {
             .expect("claimed once the eviction ended")
             .unwrap();
         assert!(in_use(&daemon));
+    }
+
+    #[tokio::test]
+    async fn no_job_is_requested_while_the_host_is_short_of_resources() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Arc::new(admission::FixedProbe::default());
+        probe.set(None, None, Some(1 << 20));
+        let daemon = daemon_with(&server, dir.path(), |config| {
+            config.check_interval = 1;
+            config.min_free_disk = Some("1g".to_string());
+        })
+        .await
+        .with_probe(probe.clone());
+        let job_requests = || async {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/api/v4/jobs/request")
+                .count()
+        };
+        let handle = daemon.shutdown_handle();
+        let running = tokio::spawn(async move { daemon.start().await });
+
+        sleep(Duration::from_millis(1500)).await;
+        assert_eq!(job_requests().await, 0, "requested a job with a full disk");
+
+        probe.set(None, None, Some(5 << 30));
+        sleep(Duration::from_millis(1500)).await;
+        assert!(
+            job_requests().await > 0,
+            "no request once the disk had space"
+        );
+
+        handle.request(Shutdown::Graceful);
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("daemon stopped")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

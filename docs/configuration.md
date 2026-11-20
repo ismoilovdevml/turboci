@@ -64,6 +64,37 @@ environment = ["ANDROID_HOME=/home/ci/Android/Sdk", "GIT_STRATEGY=clone"]
 pre_get_sources_script = "export PATH=$PATH:/opt/flutter/bin"
 ```
 
+## Admission control
+
+The runner can hold off asking GitLab for jobs while the host is short of
+memory, disk space or CPU. All three limits are off by default.
+
+```toml
+min_free_memory = "2g"
+min_free_disk = "20g"
+max_load_avg = 16.0
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `min_free_memory` | unset | No job is requested while the memory available (`MemAvailable` in `/proc/meminfo`, page cache that can be dropped included) is below this size (`"512m"`, `"2g"`, bytes). Unset or `"0"`: off. Linux only |
+| `min_free_disk` | unset | No job is requested while the file system of the builds directory or of `cache_dir` has less space free than this. Unset or `"0"`: off |
+| `max_load_avg` | unset | No job is requested while the 1-minute load average is above this number. It is not divided by the CPU count: for a 16-core host, `16.0` means "all cores busy". Linux only |
+
+Before each job request, once a job slot is free, the runner checks the
+limits. When one is not met it sends no request, waits `check_interval` and
+checks again; jobs already running are never touched. The log shows each
+change, not every check:
+
+```text
+⏸️  Not taking new jobs: free disk space for /var/lib/turboci/builds 4.2 GB is below min_free_disk 20.0 GB
+▶️  Taking jobs again: the host is within the admission limits
+```
+
+A value that cannot be read (for example `/proc` not mounted) does not block
+jobs. On macOS only `min_free_disk` is checked; `min_free_memory` and
+`max_load_avg` are ignored, with a warning at start.
+
 ## Proxy
 
 ```toml
