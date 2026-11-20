@@ -373,6 +373,10 @@ trait ScriptRunner: Send + Sync {
         trace: &mut TraceWriter<'_>,
         limits: &Limits<'_>,
     ) -> Result<RunStatus>;
+
+    /// Called once getting sources has ended, after which the job's sources
+    /// runner is not used again
+    async fn sources_done(&self) {}
 }
 
 /// Directories as the job sees them
@@ -406,6 +410,7 @@ async fn run_job_steps(
         .section_start("get_sources", "Getting source from Git repository")
         .await;
     let fetched = get_sources(job, sources, trace, dirs, &script_limits).await;
+    sources.sources_done().await;
     trace.section_end("get_sources").await;
     let mut failure = fetched.err().map(|e| e.failure(job));
     if failure.is_none() {
@@ -1376,6 +1381,72 @@ mod tests {
         let (outcome, _) = run_shell(&j, dir.path()).await;
 
         assert!(outcome.is_ok());
+    }
+
+    /// Records what a job does with it, as `<name>:run` and `<name>:done`
+    struct Recorder<'a> {
+        name: &'static str,
+        events: &'a std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ScriptRunner for Recorder<'_> {
+        async fn run(
+            &self,
+            _script: &str,
+            _workdir: &str,
+            _trace: &mut TraceWriter<'_>,
+            _limits: &Limits<'_>,
+        ) -> Result<RunStatus> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{}:run", self.name));
+            Ok(RunStatus::Exited(0))
+        }
+
+        async fn sources_done(&self) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{}:done", self.name));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sources_runner_is_released_before_the_scripts_run() {
+        let j = job(serde_json::json!({
+            "id": 19, "token": "t",
+            "hooks": [{"name": "pre_get_sources_script", "script": ["echo hook"]}],
+            "steps": steps(&["echo script"], &["echo after"])
+        }));
+        let events = std::sync::Mutex::new(Vec::new());
+        let sources = Recorder {
+            name: "sources",
+            events: &events,
+        };
+        let runner = Recorder {
+            name: "job",
+            events: &events,
+        };
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, j.id, &j.token, &scrubber);
+        let dirs = JobDirs {
+            builds: "/builds".to_string(),
+            project: "/builds/project".to_string(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        let outcome = run_job_steps(
+            &j, deadline, &sources, &runner, &mut trace, &dirs, &NoRestore,
+        )
+        .await;
+
+        assert!(outcome.is_ok(), "{:?}", outcome);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["sources:run", "sources:done", "job:run", "job:run"]
+        );
     }
 
     #[tokio::test]

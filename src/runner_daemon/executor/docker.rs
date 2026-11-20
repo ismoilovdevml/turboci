@@ -531,12 +531,14 @@ impl DockerExecutor {
             docker: &self.docker,
             container_id: &id,
             env: env.to_docker(),
+            sources_only: false,
         };
-        let helper_id = containers.helper.clone().unwrap_or_else(|| id.clone());
+        // Still recorded in `containers`: removing it again at the end is a no-op
         let sources = DockerRunner {
             docker: &self.docker,
-            container_id: &helper_id,
+            container_id: containers.helper.as_deref().unwrap_or(&id),
             env: env.to_docker(),
+            sources_only: containers.helper.is_some(),
         };
         let dirs = JobDirs {
             builds: "/builds".to_string(),
@@ -1040,19 +1042,7 @@ impl DockerExecutor {
     }
 
     async fn force_remove(&self, id: &str) -> Result<()> {
-        use bollard::container::RemoveContainerOptions;
-
-        self.docker
-            .remove_container(
-                id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    ..Default::default()
-                }),
-            )
-            .await?;
-        Ok(())
+        force_remove(&self.docker, id).await
     }
 
     /// `chown -R` the workspace to the runner's uid/gid from a fresh container of
@@ -1109,10 +1099,37 @@ impl DockerExecutor {
     }
 }
 
+/// Kill and remove a container with its anonymous volumes; one that is
+/// already gone counts as removed
+async fn force_remove(docker: &Docker, id: &str) -> Result<()> {
+    use bollard::container::RemoveContainerOptions;
+
+    match docker
+        .remove_container(
+            id,
+            Some(RemoveContainerOptions {
+                force: true,
+                v: true,
+                ..Default::default()
+            }),
+        )
+        .await
+    {
+        Ok(())
+        | Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 struct DockerRunner<'a> {
     docker: &'a Docker,
     container_id: &'a str,
     env: Vec<String>,
+    /// A helper container that only checks out sources: removed once that is
+    /// done instead of idling until the job ends
+    sources_only: bool,
 }
 
 impl DockerRunner<'_> {
@@ -1161,6 +1178,14 @@ impl DockerRunner<'_> {
 
 #[async_trait]
 impl ScriptRunner for DockerRunner<'_> {
+    async fn sources_done(&self) {
+        if self.sources_only {
+            if let Err(e) = force_remove(self.docker, self.container_id).await {
+                warn!("Failed to remove container {}: {:#}", self.container_id, e);
+            }
+        }
+    }
+
     async fn run(
         &self,
         script: &str,
