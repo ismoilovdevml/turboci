@@ -345,6 +345,10 @@ pub struct RunnerDaemon {
     rotating: Arc<tokio::sync::Mutex<()>>,
     /// Workspaces of running jobs, never evicted
     workspaces_in_use: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    /// Held for writing while workspaces are evicted, and for reading while a
+    /// job claims its workspace: an eviction only removes workspaces that were
+    /// not in use when it started, so no job may claim one until it ends
+    evicting: Arc<tokio::sync::RwLock<()>>,
     /// When unused workspaces were last looked for
     last_eviction: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
@@ -397,6 +401,7 @@ impl RunnerDaemon {
             tokens: Arc::new(tokens),
             rotating: Arc::default(),
             workspaces_in_use: Arc::default(),
+            evicting: Arc::default(),
             last_eviction: Arc::default(),
         }
     }
@@ -650,9 +655,7 @@ impl RunnerDaemon {
 
         let project_dir = self.project_dir(&job);
         let workspace = self.executor.job_dir(&job);
-        if let Ok(mut in_use) = self.workspaces_in_use.lock() {
-            in_use.insert(workspace.clone());
-        }
+        self.claim_workspace(&workspace).await;
         self.evict_workspaces();
         let prepared = match self.executor.prepare(&job).await {
             Ok(()) => tokio::fs::create_dir_all(&project_dir)
@@ -761,6 +764,14 @@ impl RunnerDaemon {
             .await
     }
 
+    /// Mark a workspace in use, once no eviction that may remove it is running
+    async fn claim_workspace(&self, workspace: &std::path::Path) {
+        let _no_eviction = self.evicting.read().await;
+        if let Ok(mut in_use) = self.workspaces_in_use.lock() {
+            in_use.insert(workspace.to_path_buf());
+        }
+    }
+
     /// Remove workspaces no job used for `workspace_max_age_days`, in the
     /// background and at most once per `EVICTION_INTERVAL`
     fn evict_workspaces(&self) {
@@ -777,6 +788,7 @@ impl RunnerDaemon {
         }
         let daemon = self.clone();
         tokio::spawn(async move {
+            let _evicting = daemon.evicting.write().await;
             let in_use = daemon
                 .workspaces_in_use
                 .lock()
@@ -2284,6 +2296,37 @@ mod tests {
             .await
             .expect("daemon stopped while the job request was held")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_job_claims_its_workspace_only_after_a_running_eviction() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let workspace = dir.path().join("builds/project-5-0");
+        let in_use = |daemon: &RunnerDaemon| {
+            daemon
+                .workspaces_in_use
+                .lock()
+                .unwrap()
+                .contains(&workspace)
+        };
+
+        let eviction = daemon.evicting.clone().write_owned().await;
+        let claim = tokio::spawn({
+            let (daemon, workspace) = (daemon.clone(), workspace.clone());
+            async move { daemon.claim_workspace(&workspace).await }
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert!(!claim.is_finished(), "claimed during an eviction");
+        assert!(!in_use(&daemon));
+
+        drop(eviction);
+        tokio::time::timeout(Duration::from_secs(5), claim)
+            .await
+            .expect("claimed once the eviction ended")
+            .unwrap();
+        assert!(in_use(&daemon));
     }
 
     #[test]
