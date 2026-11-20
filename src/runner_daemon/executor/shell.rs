@@ -162,10 +162,17 @@ impl ScriptRunner for ShellRunner {
     }
 }
 
+/// SIGKILL the script's process group (its pid is the group id), without
+/// starting a `kill` process
 fn kill_process_group(pid: Option<u32>) {
-    if let Some(pid) = pid {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", pid)])
-            .status();
+    #[cfg(unix)]
+    if let Some(pid) = pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        // ESRCH: everything in the group has already exited
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
