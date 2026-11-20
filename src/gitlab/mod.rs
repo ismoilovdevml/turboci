@@ -81,33 +81,36 @@ pub struct GitLabClient {
 }
 
 impl GitLabClient {
+    /// A client without proxy or extra CA
+    #[cfg(test)]
     pub fn new(url: String, token: String) -> Self {
-        Self {
-            client: crate::net::client_builder()
-                .timeout(std::time::Duration::from_secs(30))
+        Self::with_http(url, token, crate::net::client_builder())
+            .expect("HTTP client with the default TLS backend")
+    }
+
+    /// A client sending every request through the proxy of `network`, trusting
+    /// its CA. The HTTP client is built once, here.
+    pub fn with_network(url: String, token: String, network: &crate::net::Network) -> Result<Self> {
+        Self::with_http(url, token, network.client_builder()?)
+    }
+
+    fn with_http(url: String, token: String, http: reqwest::ClientBuilder) -> Result<Self> {
+        Ok(Self {
+            client: http
+                .timeout(API_TIMEOUT)
                 .build()
-                .expect("HTTP client with the default TLS backend"),
+                .context("Failed to build HTTP client")?,
             url,
             token,
             system_id: format!("r_{}", &Uuid::new_v4().simple().to_string()[..12]),
             executor: "docker".to_string(),
-        }
+        })
     }
 
     /// Report the configured executor and its capabilities to GitLab
     pub fn with_executor(mut self, executor: &str) -> Self {
         self.executor = executor.to_string();
         self
-    }
-
-    /// Send every request through the proxy of `network`, trusting its CA
-    pub fn with_network(mut self, network: &crate::net::Network) -> Result<Self> {
-        self.client = network
-            .client_builder()?
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to build HTTP client")?;
-        Ok(self)
     }
 
     /// Use a persisted system ID (see `runner_daemon::system_id`)
@@ -881,6 +884,9 @@ pub struct RetryConfig {
     pub when: Vec<String>,
 }
 
+/// Timeout of API calls (the client default)
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Timeout for artifact transfers (the client default of 30s is for API calls)
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
 
@@ -1314,9 +1320,9 @@ mod tests {
             ca_pem: Some(pem),
             ..Default::default()
         };
-        assert!(GitLabClient::new("https://x".to_string(), "t".to_string())
-            .with_network(&network)
-            .is_ok());
+        assert!(
+            GitLabClient::with_network("https://x".to_string(), "t".to_string(), &network).is_ok()
+        );
     }
 
     #[test]
@@ -1325,8 +1331,7 @@ mod tests {
             ca_pem: Some("not a certificate".to_string()),
             ..Default::default()
         };
-        let result =
-            GitLabClient::new("https://x".to_string(), "t".to_string()).with_network(&network);
+        let result = GitLabClient::with_network("https://x".to_string(), "t".to_string(), &network);
         assert!(result.is_err());
     }
 

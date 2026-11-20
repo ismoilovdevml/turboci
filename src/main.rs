@@ -66,14 +66,14 @@ async fn main() -> Result<()> {
                 instance,
             );
             info!("   System ID: {}", system_id);
-            let gitlab = GitLabClient::new(
+            let network = runner_config.network()?;
+            let gitlab = GitLabClient::with_network(
                 runner_config.gitlab_url.clone(),
                 runner_config.runner_token.clone(),
-            )
+                &network,
+            )?
             .with_system_id(system_id.clone())
             .with_executor(&runner_config.executor.executor_type);
-            let network = runner_config.network()?;
-            let gitlab = gitlab.with_network(&network)?;
             if let Some(proxy) = &network.proxy {
                 // Only the host: the URL may hold a password
                 let host = reqwest::Url::parse(proxy)
