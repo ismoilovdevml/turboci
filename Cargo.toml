@@ -20,7 +20,7 @@ bytes = "1"
 sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["now"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "smallvec", "std", "tracing-log"] }
 glob = "0.3"
 regex = "1"
 aho-corasick = "1.1.5"

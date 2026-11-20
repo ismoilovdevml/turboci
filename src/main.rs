@@ -37,6 +37,10 @@ enum Commands {
     Upgrade,
 }
 
+/// Log filter when RUST_LOG is unset: TurboCI's own info lines, only
+/// warnings and errors from libraries (hyper, bollard, rustls)
+const DEFAULT_LOG_FILTER: &str = "warn,turboci=info";
+
 /// Blocking pool cap: archive building and extraction, file I/O and DNS
 /// lookups run there; tokio's default of 512 threads is far more than a
 /// runner needs and each thread reserves its own stack
@@ -60,7 +64,9 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
 
