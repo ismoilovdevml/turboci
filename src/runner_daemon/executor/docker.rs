@@ -338,6 +338,39 @@ fn workspace_owner(dir: &Path) -> Option<String> {
     }
 }
 
+/// User the sources helper runs as: the workspace's owner, so the checkout
+/// belongs to the runner's user right away. Root (`None`) when the runner's or
+/// the job's pre/post_get_sources_script hooks run in the helper (they may
+/// need root, e.g. to install packages), when the workspace belongs to root,
+/// or when anything in it belongs to someone else (an earlier job's files
+/// that could not be handed back), which only root may replace.
+async fn sources_user(job: &Job, job_dir: &Path) -> Option<String> {
+    let hooks = ["pre_get_sources_script", "post_get_sources_script"];
+    if hooks.iter().any(|hook| !hook_lines(job, hook).is_empty()) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta = tokio::fs::metadata(job_dir).await.ok()?;
+        let (uid, gid) = (meta.uid(), meta.gid());
+        if uid == 0 {
+            return None;
+        }
+        let dir = job_dir.to_path_buf();
+        let others = tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid))
+            .await
+            .unwrap_or(true);
+        (!others).then(|| format!("{}:{}", uid, gid))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = job_dir;
+        None
+    }
+}
+
 fn pull_failure(message: String) -> JobFailure {
     JobFailure {
         reason: FailureReason::ImagePullFailure,
@@ -701,8 +734,9 @@ impl DockerExecutor {
             // Container API calls are not interrupted (a dropped create could
             // leave a container nobody removes), so a cancel is seen between them
             limits.check(job)?;
+            let user = sources_user(job, job_dir).await;
             let id = self
-                .start_helper(job, job_dir, &env)
+                .start_helper(job, job_dir, &env, user)
                 .await
                 .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
             containers.helper = Some(id);
@@ -819,10 +853,18 @@ impl DockerExecutor {
         run_job_steps(job, deadline, &sources, &runner, trace, &dirs, restore).await
     }
 
-    /// Start the container that checks out sources, with the workspace mounted
-    async fn start_helper(&self, job: &Job, job_dir: &Path, env: &JobEnv) -> Result<String> {
+    /// Start the container that checks out sources as `user` (root when
+    /// `None`, see `sources_user`), with the workspace mounted
+    async fn start_helper(
+        &self,
+        job: &Job,
+        job_dir: &Path,
+        env: &JobEnv,
+        user: Option<String>,
+    ) -> Result<String> {
         let config = ContainerCreateBody {
             image: Some(self.config.helper_image.clone()),
+            user,
             working_dir: Some("/builds".to_string()),
             env: Some(env.to_docker()),
             // Helper images may have their own entrypoint (alpine/git's is `git`)
@@ -2095,6 +2137,124 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_checkout_belongs_to_the_workspace_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let project = 935_000_000 + u64::from(std::process::id());
+        let workspace = executor
+            .builds_root()
+            .join(format!("project-{}-0", project));
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let work = workspace.join("origin-work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "hello from git\n").unwrap();
+        git(&work, &["add", "file.txt"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        let sha = git(&work, &["rev-parse", "HEAD"]);
+        git(
+            &workspace,
+            &["clone", "-q", "--bare", "origin-work", "origin.git"],
+        );
+        // The runner's user owns the workspace; as root, uid 1000 plays it,
+        // and the directories the runner creates have to be its too
+        std::fs::create_dir_all(workspace.join("project")).unwrap();
+        let meta = std::fs::metadata(&workspace).unwrap();
+        let owner = if meta.uid() == 0 {
+            for entry in walkdir::WalkDir::new(&workspace) {
+                std::os::unix::fs::chown(entry.unwrap().path(), Some(1000), Some(1000)).unwrap();
+            }
+            "1000:1000".to_string()
+        } else {
+            format!("{}:{}", meta.uid(), meta.gid())
+        };
+
+        let run = |id: u64, hooks: serde_json::Value| {
+            let j = job(serde_json::json!({
+                "id": id, "token": "t", "allow_git_fetch": true,
+                "image": {"name": "alpine:3.20"},
+                "job_info": {"name": "build", "stage": "test", "project_id": project, "project_name": "app"},
+                "git_info": {
+                    "repo_url": "file:///builds/origin.git", "ref": "main", "ref_type": "branch",
+                    "sha": sha, "before_sha": "", "protected": false,
+                    "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]
+                },
+                // Root in the helper reads the origin of another user
+                "variables": [
+                    {"key": "GIT_CONFIG_COUNT", "value": "1"},
+                    {"key": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+                    {"key": "GIT_CONFIG_VALUE_0", "value": "*"}
+                ],
+                "hooks": hooks,
+                // .git/config is written anew by every checkout
+                "steps": steps(&["stat -c 'config-owner=%u:%g' .git/config", "cat file.txt"], &[])
+            }));
+            let executor = executor.clone();
+            async move {
+                let scrubber = SecretScrubber::new(vec![]);
+                let mut trace = TraceWriter::new(None, j.id, "t", &scrubber);
+                let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+                trace.finish().await;
+                (outcome, trace.text(), j)
+            }
+        };
+
+        // A clone, then a fetch into the kept checkout, both as the owner
+        let (outcome, log, _) = run(project, serde_json::json!([])).await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains(&format!("config-owner={}", owner)), "{}", log);
+        assert!(log.contains("hello from git"), "{}", log);
+        let (outcome, log, _) = run(project + 1, serde_json::json!([])).await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(
+            log.contains("Reusing the checkout of an earlier job"),
+            "{}",
+            log
+        );
+        assert!(!log.contains("cloning again"), "{}", log);
+        assert!(log.contains(&format!("config-owner={}", owner)), "{}", log);
+
+        // With a get-sources hook the helper stays root
+        let (outcome, log, last) = run(
+            project + 2,
+            serde_json::json!([{"name": "pre_get_sources_script", "script": ["echo hook-ran"]}]),
+        )
+        .await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("hook-ran"), "{}", log);
+        assert!(log.contains("config-owner=0:0"), "{}", log);
+        assert!(!log.contains("cloning again"), "{}", log);
+
+        executor.cleanup(&last, false).await;
+        assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_job_replacing_sh_cannot_hang_cleanup() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -2658,6 +2818,52 @@ mod tests {
         executor.cleanup(&j, false).await;
         assert_eq!(files, vec!["new.txt".to_string()]);
         assert!(!ran, "the job's core.fsmonitor command ran");
+    }
+
+    #[tokio::test]
+    async fn sources_run_as_the_workspace_owner_only_when_safe() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        std::fs::create_dir_all(workspace.join("project/.git")).unwrap();
+        let plain = job(serde_json::json!({"id": 1, "token": "t"}));
+        let hooked = |name: &str| {
+            job(serde_json::json!({
+                "id": 1, "token": "t",
+                "hooks": [{"name": name, "script": ["apk add git-lfs"]}]
+            }))
+        };
+
+        for name in ["pre_get_sources_script", "post_get_sources_script"] {
+            assert_eq!(
+                sources_user(&hooked(name), workspace).await,
+                None,
+                "{}",
+                name
+            );
+        }
+        let meta = std::fs::metadata(workspace).unwrap();
+        if meta.uid() != 0 {
+            assert_eq!(
+                sources_user(&plain, workspace).await,
+                Some(format!("{}:{}", meta.uid(), meta.gid()))
+            );
+            return;
+        }
+        // As root: a root-owned workspace keeps root
+        assert_eq!(sources_user(&plain, workspace).await, None);
+        for entry in walkdir::WalkDir::new(workspace) {
+            std::os::unix::fs::chown(entry.unwrap().path(), Some(1000), Some(1000)).unwrap();
+        }
+        assert_eq!(
+            sources_user(&plain, workspace).await,
+            Some("1000:1000".to_string())
+        );
+        // A leftover of someone else's that only root may remove
+        std::fs::write(workspace.join("project/.git/index.lock"), "").unwrap();
+        assert_eq!(sources_user(&plain, workspace).await, None);
+        assert_eq!(sources_user(&plain, &workspace.join("missing")).await, None);
     }
 
     #[test]

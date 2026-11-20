@@ -198,7 +198,12 @@ locally.
 ### Docker
 
 Each job runs in its own container. Sources are checked out by a short-lived
-helper container, so job images need neither `git` nor any other tool. Jobs
+helper container, so job images need neither `git` nor any other tool. The
+helper runs as the owner of the workspace directory, so the checkout belongs
+to the runner's user; it runs as root when `pre_get_sources_script` or
+`post_get_sources_script` hooks are set (they may need root), when the
+workspace belongs to root, or when an earlier job left files in it that belong
+to another user. Jobs
 with `services` get their own network where each service is reachable by its
 aliases. Concurrent jobs that need the same image with the same registry
 login wait for one pull of it; a job never shares the pull of a job that
