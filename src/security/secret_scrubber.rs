@@ -1,4 +1,6 @@
-use regex::Regex;
+use aho_corasick::{AhoCorasick, MatchKind};
+use regex::{Regex, RegexSet};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use crate::gitlab::Job;
@@ -8,6 +10,53 @@ const MAX_HOLDBACK: usize = 256;
 /// Most output ever held back: an unbounded pattern (e.g. `password=` followed by
 /// megabytes without spaces) must not stop the log or grow memory without limit
 const MAX_PENDING: usize = 16 * 1024;
+/// Shorter exact secrets are not masked (they would mask ordinary words)
+const MIN_SECRET_LEN: usize = 5;
+const MASK: &str = "[MASKED]";
+
+/// Secrets that look like tokens, keys or passwords, masked in every job
+const DEFAULT_PATTERNS: [&str; 12] = [
+    // GitLab tokens
+    r"glrt-[a-zA-Z0-9_-]{20,}",
+    r"GR1348941[a-zA-Z0-9]{20,}",
+    // GitHub tokens
+    r"gh[pousr]_[A-Za-z0-9_]{36,}",
+    // AWS credentials
+    r"AKIA[0-9A-Z]{16}",
+    r"aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{40}",
+    // Generic API keys
+    r"api[_-]?key\s*[:=]\s*[a-zA-Z0-9_-]{32,}",
+    // Generic secrets
+    r"secret\s*[:=]\s*[a-zA-Z0-9_-]{16,}",
+    // Passwords
+    r"password\s*[:=]\s*\S{8,}",
+    // Private keys
+    r"-----BEGIN [A-Z]+ PRIVATE KEY-----",
+    // JWT tokens
+    r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*",
+    // Database URLs
+    r"(postgres|mysql|mongodb)://[^:]+:([^@]+)@",
+    // Redis URLs with passwords
+    r"redis://[^:]*:([^@]+)@",
+];
+
+/// The default patterns, compiled once and shared by every job
+struct Patterns {
+    list: Vec<Regex>,
+    /// All of `list` in one pass, to skip text none of them matches
+    set: RegexSet,
+}
+
+fn default_patterns() -> &'static Patterns {
+    static PATTERNS: OnceLock<Patterns> = OnceLock::new();
+    PATTERNS.get_or_init(|| Patterns {
+        list: DEFAULT_PATTERNS
+            .iter()
+            .map(|p| Regex::new(p).unwrap())
+            .collect(),
+        set: RegexSet::new(DEFAULT_PATTERNS).unwrap(),
+    })
+}
 
 /// Characters that can be part of a token, key or password matched by the patterns
 fn is_token_char(c: char) -> bool {
@@ -16,8 +65,14 @@ fn is_token_char(c: char) -> bool {
 
 /// Length of the longest proper prefix of `secret` that `text` ends with
 fn suffix_prefix_len(text: &str, secret: &str) -> usize {
-    (1..secret.len())
+    let Some(&last) = text.as_bytes().last() else {
+        return 0;
+    };
+    // Only a prefix ending in the same byte as `text` can match
+    let bytes = secret.as_bytes();
+    (1..secret.len().min(text.len() + 1))
         .rev()
+        .filter(|&k| bytes[k - 1] == last)
         .find(|&k| secret.is_char_boundary(k) && text.ends_with(&secret[..k]))
         .unwrap_or(0)
 }
@@ -25,79 +80,101 @@ fn suffix_prefix_len(text: &str, secret: &str) -> usize {
 /// Secret scrubber for masking sensitive information in logs and traces
 #[derive(Clone)]
 pub struct SecretScrubber {
-    #[allow(dead_code)]
     secrets: Vec<String>,
-    patterns: Vec<Regex>,
+    /// Finds any maskable secret in one pass; `None` when there is none
+    /// (or the automaton could not be built)
+    finder: Option<AhoCorasick>,
 }
-
-#[allow(dead_code)]
-static DEFAULT_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
 
 impl SecretScrubber {
     /// Create a new secret scrubber with custom secrets
     pub fn new(secrets: Vec<String>) -> Self {
-        let patterns = Self::get_default_patterns();
-
-        Self {
+        let mut scrubber = Self {
             secrets,
-            patterns: patterns.clone(),
+            finder: None,
+        };
+        scrubber.build_finder();
+        scrubber
+    }
+
+    fn build_finder(&mut self) {
+        let maskable: Vec<&str> = self.maskable_secrets().collect();
+        self.finder = if maskable.is_empty() {
+            None
+        } else {
+            AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .build(maskable)
+                .ok()
+        };
+    }
+
+    /// Secrets in masking order, without those too short to mask
+    fn maskable_secrets(&self) -> impl Iterator<Item = &str> {
+        self.secrets
+            .iter()
+            .map(String::as_str)
+            .filter(|s| s.len() >= MIN_SECRET_LEN)
+    }
+
+    /// Whether `text` contains any secret that is masked
+    fn contains_secret(&self, text: &str) -> bool {
+        match &self.finder {
+            Some(finder) => finder.is_match(text),
+            // No automaton: check each secret (there is none in the common case)
+            None => self.maskable_secrets().any(|s| text.contains(s)),
         }
     }
 
-    /// Get default secret patterns (tokens, keys, passwords, etc.)
-    fn get_default_patterns() -> &'static Vec<Regex> {
-        DEFAULT_PATTERNS.get_or_init(|| {
-            vec![
-                // GitLab tokens
-                Regex::new(r"glrt-[a-zA-Z0-9_-]{20,}").unwrap(),
-                Regex::new(r"GR1348941[a-zA-Z0-9]{20,}").unwrap(),
-                // GitHub tokens
-                Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}").unwrap(),
-                // AWS credentials
-                Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
-                Regex::new(r"aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{40}").unwrap(),
-                // Generic API keys
-                Regex::new(r"api[_-]?key\s*[:=]\s*[a-zA-Z0-9_-]{32,}").unwrap(),
-                // Generic secrets
-                Regex::new(r"secret\s*[:=]\s*[a-zA-Z0-9_-]{16,}").unwrap(),
-                // Passwords
-                Regex::new(r"password\s*[:=]\s*\S{8,}").unwrap(),
-                // Private keys
-                Regex::new(r"-----BEGIN [A-Z]+ PRIVATE KEY-----").unwrap(),
-                // JWT tokens
-                Regex::new(r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*").unwrap(),
-                // Database URLs
-                Regex::new(r"(postgres|mysql|mongodb)://[^:]+:([^@]+)@").unwrap(),
-                // Redis URLs with passwords
-                Regex::new(r"redis://[^:]*:([^@]+)@").unwrap(),
-            ]
-        })
-    }
+    /// Scrub secrets from text, replacing them with [MASKED]. Text with nothing
+    /// to mask is returned as it is, without a copy.
+    pub fn scrub<'t>(&self, text: &'t str) -> Cow<'t, str> {
+        let patterns = default_patterns();
+        if !self.contains_secret(text) && !patterns.set.is_match(text) {
+            return Cow::Borrowed(text);
+        }
 
-    /// Scrub secrets from text, replacing them with [MASKED]
-    pub fn scrub(&self, text: &str) -> String {
+        // Mask custom secrets (exact match), in order: longer ones first
         let mut result = text.to_string();
-
-        // Mask custom secrets (exact match)
-        for secret in &self.secrets {
-            if !secret.is_empty() && secret.len() > 4 {
-                result = result.replace(secret, "[MASKED]");
+        for secret in self.maskable_secrets() {
+            if result.contains(secret) {
+                result = result.replace(secret, MASK);
             }
         }
 
-        // Mask pattern-based secrets
-        for pattern in &self.patterns {
-            result = pattern.replace_all(&result, "[MASKED]").to_string();
+        // Mask pattern-based secrets one pattern after the other: a pattern can
+        // match text that includes what an earlier one masked
+        for pattern in &patterns.list {
+            if let Cow::Owned(masked) = pattern.replace_all(&result, MASK) {
+                result = masked;
+            }
         }
 
-        result
+        Cow::Owned(result)
+    }
+
+    /// `scrub` for an owned string, which is returned as it is when nothing is masked
+    fn scrub_owned(&self, text: String) -> String {
+        match self.scrub(&text) {
+            Cow::Owned(masked) => masked,
+            Cow::Borrowed(_) => text,
+        }
     }
 
     /// Add a custom secret to the scrubber
     pub fn add_secret(&mut self, secret: String) {
-        if !secret.is_empty() && !self.secrets.contains(&secret) {
+        if self.push_secret(secret) {
+            self.build_finder();
+        }
+    }
+
+    /// Adds `secret` unless it is empty or known; the finder is not rebuilt
+    fn push_secret(&mut self, secret: String) -> bool {
+        let new = !secret.is_empty() && !self.secrets.contains(&secret);
+        if new {
             self.secrets.push(secret);
         }
+        new
     }
 
     /// Copy of this scrubber that also masks the job's token, dependency tokens
@@ -114,38 +191,38 @@ impl SecretScrubber {
         for value in values {
             let encoded = percent_encode(&value);
             if encoded != value {
-                scrubber.add_secret(encoded);
+                scrubber.push_secret(encoded);
             }
-            scrubber.add_secret(value);
+            scrubber.push_secret(value);
         }
         // Mask longer secrets first so a shorter one cannot break a longer match
         scrubber.secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        scrubber.build_finder();
         scrubber
     }
 
     /// Byte ranges of everything `scrub` would mask
     fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
         let mut ranges = Vec::new();
-        for secret in self.secrets.iter().filter(|s| s.len() > 4) {
-            ranges.extend(
-                text.match_indices(secret.as_str())
-                    .map(|(start, m)| (start, start + m.len())),
-            );
+        if self.contains_secret(text) {
+            for secret in self.maskable_secrets() {
+                ranges.extend(
+                    text.match_indices(secret)
+                        .map(|(start, m)| (start, start + m.len())),
+                );
+            }
         }
-        for pattern in &self.patterns {
-            ranges.extend(pattern.find_iter(text).map(|m| (m.start(), m.end())));
+        let patterns = default_patterns();
+        if patterns.set.is_match(text) {
+            for pattern in &patterns.list {
+                ranges.extend(pattern.find_iter(text).map(|m| (m.start(), m.end())));
+            }
         }
         ranges
     }
 
     fn longest_secret(&self) -> usize {
         self.secrets.iter().map(String::len).max().unwrap_or(0)
-    }
-
-    /// Add a custom pattern to the scrubber
-    #[allow(dead_code)]
-    pub fn add_pattern(&mut self, pattern: Regex) {
-        self.patterns.push(pattern);
     }
 }
 
@@ -205,22 +282,30 @@ impl<'a> StreamScrubber<'a> {
             .map(|secret| suffix_prefix_len(&self.pending, secret))
             .max()
             .unwrap_or(0);
-        let token_run: usize = self
+        // Token characters are ASCII, so this many chars is MAX_HOLDBACK bytes
+        let token_run = self
             .pending
             .chars()
             .rev()
+            .take(MAX_HOLDBACK)
             .take_while(|&c| is_token_char(c))
-            .map(char::len_utf8)
-            .sum();
-        let mut boundary = len - secret_start.max(token_run.min(MAX_HOLDBACK));
+            .count();
+        let mut boundary = len - secret_start.max(token_run);
         while !self.pending.is_char_boundary(boundary) {
             boundary -= 1;
         }
-        // Never cut through a match, and keep matches touching the end (they may grow)
+        // Never cut through a match, and keep matches touching the end (they may
+        // grow). Moving the boundary back can put it inside another match, so
+        // repeat until no match is cut.
         let matches = self.scrubber.match_ranges(&self.pending);
-        for &(start, end) in &matches {
-            if start < boundary && (end > boundary || end == len) {
-                boundary = start;
+        let mut moved = true;
+        while moved {
+            moved = false;
+            for &(start, end) in &matches {
+                if start < boundary && (end > boundary || end == len) {
+                    boundary = start;
+                    moved = true;
+                }
             }
         }
         // ...unless that holds back too much. Exact secrets are never split (the
@@ -237,7 +322,7 @@ impl<'a> StreamScrubber<'a> {
                 let head = self.pending[..start].to_string();
                 self.pending.clear();
                 self.swallowing = true;
-                return self.scrubber.scrub(&head) + "[MASKED]";
+                return self.scrubber.scrub(&head).into_owned() + MASK;
             }
             boundary = len - limit;
             while !self.pending.is_char_boundary(boundary) {
@@ -247,14 +332,20 @@ impl<'a> StreamScrubber<'a> {
 
         let rest = self.pending.split_off(boundary);
         let ready = std::mem::replace(&mut self.pending, rest);
-        self.scrubber.scrub(&ready)
+        // Every secret or pattern match inside `ready` starts before the boundary
+        // (the search above reports the leftmost one), so without such a match
+        // there is nothing to mask
+        if matches.iter().all(|&(start, _)| start >= boundary) {
+            return ready;
+        }
+        self.scrubber.scrub_owned(ready)
     }
 
     /// Flush everything still held back
     pub fn finish(&mut self) -> String {
         self.swallowing = false;
         let rest = std::mem::take(&mut self.pending);
-        self.scrubber.scrub(&rest)
+        self.scrubber.scrub_owned(rest)
     }
 }
 
@@ -369,6 +460,85 @@ mod tests {
         assert!(!out.contains(&token[30..]), "{}", out);
     }
 
+    /// Stream `text` split at every position and check each result against `scrub`
+    fn assert_stream_matches_scrub_at_every_split(scrubber: &SecretScrubber, text: &str) {
+        let whole = scrubber.scrub(text);
+        for split in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
+            let mut stream = StreamScrubber::new(scrubber);
+            let mut out = stream.push(&text[..split]);
+            out.push_str(&stream.push(&text[split..]));
+            out.push_str(&stream.finish());
+            assert_eq!(out, whole, "split at {split}");
+        }
+    }
+
+    /// Exact secrets, and pattern matches without whitespace, are masked however the
+    /// output is split. (A match with whitespace, like `password: value`, is not
+    /// held back at the space: split there, its value goes out unmasked.)
+    #[test]
+    fn stream_scrubber_masks_secrets_and_patterns_split_anywhere() {
+        let scrubber = SecretScrubber::new(vec![]).with_job_secrets(&job_with_secrets());
+        let text = "clone https://gitlab-ci-token:job-token-abc123@host/r.git\n\
+                    key=s3cr3t/with+chars enc=s3cr3t%2Fwith%2Bchars ✓\n\
+                    Runner token: glrt-TESTtoken0000synthetic1111notreal22 done\n\
+                    password=MyP@ssw0rd123\n";
+
+        assert_stream_matches_scrub_at_every_split(&scrubber, text);
+        let masked = scrubber.scrub(text);
+        for leaked in ["job-token", "s3cr3t", "glrt-", "MyP@ss"] {
+            assert!(!masked.contains(leaked), "{leaked} leaked: {masked}");
+        }
+    }
+
+    #[test]
+    fn longest_overlapping_secret_wins() {
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "token": "job-token-abc123",
+            "variables": [
+                {"key": "SHORT", "value": "cdef12", "masked": true},
+                {"key": "LONG", "value": "abcdef1234", "masked": true}
+            ]
+        }))
+        .unwrap();
+        let scrubber = SecretScrubber::new(vec![]).with_job_secrets(&job);
+        let text = "key=abcdef1234 and cdef12\n";
+
+        assert_eq!(scrubber.scrub(text), "key=[MASKED] and [MASKED]\n");
+        assert_stream_matches_scrub_at_every_split(&scrubber, text);
+    }
+
+    #[test]
+    fn text_without_secrets_is_returned_as_is() {
+        let scrubber = SecretScrubber::new(vec![]).with_job_secrets(&job_with_secrets());
+        let text = "   Compiling serde v1.0.200\nnpm WARN deprecated inflight@1.0.6 ✓\n";
+
+        let scrubbed = scrubber.scrub(text);
+        assert!(matches!(scrubbed, Cow::Borrowed(_)));
+        assert_eq!(scrubbed, text);
+
+        let mut stream = StreamScrubber::new(&scrubber);
+        assert_eq!(stream.push(text), text);
+        assert_eq!(stream.finish(), "");
+    }
+
+    #[test]
+    fn stream_scrubber_holds_back_a_secret_that_overlaps_a_held_back_match() {
+        // The secret ends inside a pattern match that runs to the end of the
+        // chunk: holding back from the match's start alone would cut the secret
+        let scrubber = SecretScrubber::new(vec!["pw-s3cr3t-glrt-ab".to_string()]);
+        let mut stream = StreamScrubber::new(&scrubber);
+        let first = format!("x pw-s3cr3t-glrt-ab{}", "c".repeat(300));
+
+        let mut out = stream.push(&first);
+        assert_eq!(out, "x ");
+        out.push_str(&stream.push(" end\n"));
+        out.push_str(&stream.finish());
+
+        assert!(!out.contains("s3cr3t"), "{out}");
+        assert_eq!(out, scrubber.scrub(&format!("{first} end\n")));
+    }
+
     #[test]
     fn test_scrub_gitlab_token() {
         let scrubber = SecretScrubber::new(vec![]);
@@ -408,5 +578,82 @@ mod tests {
         let scrubbed = scrubber.scrub(text);
         assert!(scrubbed.contains("[MASKED]"));
         assert!(!scrubbed.contains("secretpass123"));
+    }
+
+    /// Log lines like a build prints, with a masked value now and then
+    fn bench_log(bytes: usize) -> String {
+        let lines = [
+            "   Compiling serde_json v1.0.120 (/builds/group/project/vendor/serde_json)\n",
+            "npm WARN deprecated inflight@1.0.6: This module is not supported, and leaks memory.\n",
+            "2026-11-20T10:15:42.123Z INFO  app::server > listening on 0.0.0.0:8080 (pid 4242)\n",
+            "Step 7/12 : RUN apt-get update && apt-get install -y --no-install-recommends curl\n",
+            "test integration::cache::restores_archive_from_s3 ... ok\n",
+            "Downloading https://registry.example.com/v2/library/node/blobs/sha256:4f4fb700ef54\n",
+        ];
+        let mut log = String::with_capacity(bytes + 128);
+        let mut i = 0;
+        while log.len() < bytes {
+            if i % 1000 == 999 {
+                log.push_str("export DEPLOY=s3cr3t-value-07 done\n");
+            }
+            log.push_str(lines[i % lines.len()]);
+            i += 1;
+        }
+        log
+    }
+
+    fn bench_scrubber() -> SecretScrubber {
+        let variables: Vec<_> = (0..9)
+            .map(|i| serde_json::json!({"key": format!("V{i}"), "value": format!("s3cr3t-value-{i:02}"), "masked": true}))
+            .collect();
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "id": 1, "token": "glcbt-64_benchjobtoken0000000000", "variables": variables
+        }))
+        .unwrap();
+        SecretScrubber::new(vec!["glrt-benchrunnertoken00000000000".to_string()])
+            .with_job_secrets(&job)
+    }
+
+    fn bench_run(name: &str, log: &str, scrubber: &SecretScrubber) {
+        use std::hash::{Hash, Hasher};
+        let report = |what: &str, secs: f64, out: &str| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            out.hash(&mut hash);
+            println!(
+                "{name} {what}: {:.1} MB/s (output hash {:x})",
+                log.len() as f64 / secs / 1e6,
+                hash.finish()
+            );
+        };
+
+        let mut out = String::with_capacity(log.len());
+        let mut stream = StreamScrubber::new(scrubber);
+        let started = std::time::Instant::now();
+        for chunk in log.as_bytes().chunks(8192) {
+            out.push_str(&stream.push(std::str::from_utf8(chunk).unwrap()));
+        }
+        out.push_str(&stream.finish());
+        report("stream", started.elapsed().as_secs_f64(), &out);
+
+        out.clear();
+        let started = std::time::Instant::now();
+        for chunk in log.as_bytes().chunks(8192) {
+            out.push_str(&scrubber.scrub(std::str::from_utf8(chunk).unwrap()));
+        }
+        report("scrub", started.elapsed().as_secs_f64(), &out);
+    }
+
+    /// cargo test --release bench_stream_scrubber -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_stream_scrubber() {
+        let scrubber = bench_scrubber();
+        bench_run("plain", &bench_log(50 * 1024 * 1024), &scrubber);
+        let line = "2026-11-20T10:15:42Z password=notreallysecret0 api_key=0123456789abcdef0123456789abcdef s3cr3t-value-03 ok\n";
+        bench_run(
+            "matching",
+            &line.repeat(50 * 1024 * 1024 / line.len()),
+            &scrubber,
+        );
     }
 }
