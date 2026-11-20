@@ -42,3 +42,10 @@ wiremock = "0.6"
 [[bin]]
 name = "turboci"
 path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# No panic = "abort": a panicking job is caught with catch_unwind, which needs unwinding
