@@ -16,6 +16,7 @@ blake3 = "1"
 base64 = "0.22"
 walkdir = "2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart", "stream"], default-features = false }
+bytes = "1"
 sha2 = "0.10"
 chrono = "0.4"
 tracing = "0.1"

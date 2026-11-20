@@ -357,17 +357,17 @@ impl GitLabClient {
         }
         let url = format!("{}/api/v4/jobs/{}/trace", self.url, job_id);
         let end_offset = offset + trace.len();
-        let trace_owned = trace.to_vec();
-        let token_owned = token.to_string();
+        // Copied once; a retry shares the buffer instead of copying it again
+        let body = bytes::Bytes::copy_from_slice(trace);
 
         self.retry_with_backoff(|| async {
             let response = self
                 .client
                 .patch(&url)
-                .header("JOB-TOKEN", &token_owned)
+                .header("JOB-TOKEN", token)
                 .header("Content-Range", format!("{}-{}", offset, end_offset - 1))
                 .header("Content-Type", "text/plain")
-                .body(trace_owned.clone())
+                .body(body.clone())
                 .send()
                 .await
                 .context("Failed to stream trace")?;
@@ -577,10 +577,12 @@ impl GitLabClient {
             StatusCode::NOT_FOUND => anyhow::bail!("job #{} has no artifacts", job_id),
             status => anyhow::bail!("Artifact download failed: {}", status),
         }
-        // Streamed to disk: archives can be larger than the runner's memory
-        let mut file = tokio::fs::File::create(dest)
+        // Streamed to disk: archives can be larger than the runner's memory.
+        // Buffered, so small network chunks do not each cost a write.
+        let file = tokio::fs::File::create(dest)
             .await
             .with_context(|| format!("Failed to create {}", dest.display()))?;
+        let mut file = tokio::io::BufWriter::with_capacity(DOWNLOAD_BUFFER, file);
         let mut body = response.bytes_stream();
         let mut size = 0u64;
         while let Some(chunk) = body.next().await {
@@ -942,6 +944,9 @@ const API_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout of a job request: longer than Workhorse holds it while long polling
 /// (`apiCiLongPollingDuration`, 50s by default)
 const JOB_REQUEST_TIMEOUT: Duration = Duration::from_secs(70);
+
+/// Write buffer of artifact downloads
+const DOWNLOAD_BUFFER: usize = 256 * 1024;
 
 /// Timeout for artifact transfers (the client default of 30s is for API calls)
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -1612,6 +1617,28 @@ mod tests {
 
         assert_eq!(size, 8);
         assert_eq!(std::fs::read(dest.path()).unwrap(), b"zip-data");
+    }
+
+    #[tokio::test]
+    async fn download_larger_than_the_write_buffer_is_complete() {
+        let server = MockServer::start().await;
+        let archive: Vec<u8> = (0..DOWNLOAD_BUFFER * 3 + 17)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/9/artifacts"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
+            .mount(&server)
+            .await;
+
+        let dest = tempfile::NamedTempFile::new().unwrap();
+        let size = client(&server)
+            .download_artifacts_to(9, "dep-token", dest.path())
+            .await
+            .unwrap();
+
+        assert_eq!(size, archive.len() as u64);
+        assert_eq!(std::fs::read(dest.path()).unwrap(), archive);
     }
 
     #[tokio::test]
