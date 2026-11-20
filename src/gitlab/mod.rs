@@ -243,7 +243,7 @@ impl GitLabClient {
                             let trace =
                                 format!("TurboCI could not parse the job payload: {}\n", reason);
                             let _ = self
-                                .patch_trace(identity.id, &identity.token, trace.as_bytes(), 0)
+                                .patch_trace(identity.id, &identity.token, trace.into(), 0)
                                 .await;
                             if let Err(update_err) = self
                                 .update_job(
@@ -341,11 +341,12 @@ impl GitLabClient {
 
     /// Append to the job trace at `offset` (Content-Range is inclusive: offset-(end-1)).
     /// Returns the new end offset, or on 416 the length GitLab already has.
+    /// `trace` is shared, not copied, by the retries.
     pub async fn patch_trace(
         &self,
         job_id: u64,
         token: &str,
-        trace: &[u8],
+        trace: bytes::Bytes,
         offset: usize,
     ) -> Result<TracePatch> {
         if trace.is_empty() {
@@ -357,8 +358,6 @@ impl GitLabClient {
         }
         let url = format!("{}/api/v4/jobs/{}/trace", self.url, job_id);
         let end_offset = offset + trace.len();
-        // Copied once; a retry shares the buffer instead of copying it again
-        let body = bytes::Bytes::copy_from_slice(trace);
 
         self.retry_with_backoff(|| async {
             let response = self
@@ -367,7 +366,7 @@ impl GitLabClient {
                 .header("JOB-TOKEN", token)
                 .header("Content-Range", format!("{}-{}", offset, end_offset - 1))
                 .header("Content-Type", "text/plain")
-                .body(body.clone())
+                .body(trace.clone())
                 .send()
                 .await
                 .context("Failed to stream trace")?;
@@ -1374,7 +1373,10 @@ mod tests {
             .await;
         let client = client(&server);
 
-        let patch = client.patch_trace(7, "t", b"x", 0).await.unwrap();
+        let patch = client
+            .patch_trace(7, "t", bytes::Bytes::from_static(b"x"), 0)
+            .await
+            .unwrap();
         assert_eq!(patch.remote, RemoteState::Canceling);
         assert_eq!(patch.offset, 1);
         assert_eq!(
@@ -1392,7 +1394,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let patch = client(&server).patch_trace(7, "t", b"x", 0).await.unwrap();
+        let patch = client(&server)
+            .patch_trace(7, "t", bytes::Bytes::from_static(b"x"), 0)
+            .await
+            .unwrap();
 
         assert_eq!(patch.remote, RemoteState::Aborted);
         assert_eq!(patch.offset, 0);
@@ -1468,7 +1473,7 @@ mod tests {
             .await;
 
         let next = client(&server)
-            .patch_trace(7, "job-token", b"hello", 10)
+            .patch_trace(7, "job-token", bytes::Bytes::from_static(b"hello"), 10)
             .await
             .unwrap();
 
@@ -1486,7 +1491,7 @@ mod tests {
             .await;
 
         let next = client(&server)
-            .patch_trace(7, "job-token", b"hello", 10)
+            .patch_trace(7, "job-token", bytes::Bytes::from_static(b"hello"), 10)
             .await
             .unwrap();
 

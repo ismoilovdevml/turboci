@@ -137,7 +137,7 @@ impl<'a> TraceWriter<'a> {
             .patch_trace(
                 self.job_id,
                 &self.token,
-                &self.trace[self.sent..],
+                bytes::Bytes::copy_from_slice(&self.trace[self.sent..]),
                 self.sent,
             )
             .await
