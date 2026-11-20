@@ -200,7 +200,9 @@ locally.
 Each job runs in its own container. Sources are checked out by a short-lived
 helper container, so job images need neither `git` nor any other tool. Jobs
 with `services` get their own network where each service is reachable by its
-aliases.
+aliases. Concurrent jobs that need the same image with the same registry
+login wait for one pull of it; a job never shares the pull of a job that
+logged in differently.
 
 | Key | Default | Description |
 |---|---|---|

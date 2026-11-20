@@ -12,6 +12,141 @@ pub struct DockerExecutor {
     /// Value of the `turboci.runner` label on every container and network this
     /// runner creates, so leftovers of a crash can be found and removed
     owner: String,
+    /// Image pulls in progress, shared by the jobs of this runner
+    pulls: Arc<Flights<PullOutcome>>,
+}
+
+/// How a pull ended, as every job waiting for it sees it
+type PullOutcome = std::result::Result<(), JobFailure>;
+
+/// An image reference and the identity of the registry login it is pulled
+/// with (see `login_identity`)
+type PullKey = (String, String);
+
+type Flight<T> = futures_util::future::Shared<futures_util::future::BoxFuture<'static, T>>;
+type WeakFlight<T> = futures_util::future::WeakShared<futures_util::future::BoxFuture<'static, T>>;
+type FlightMap<T> = std::collections::HashMap<PullKey, WeakFlight<T>>;
+
+/// Work in progress by key, so concurrent callers with the same key wait for
+/// one run of it and all get its output, errors included. The work runs while
+/// at least one caller still waits for it: when the last one gives up (a
+/// canceled job), it is dropped, and the next caller starts it anew. Entries
+/// leave the map as soon as their work ended or was dropped.
+struct Flights<T: Clone> {
+    running: std::sync::Mutex<FlightMap<T>>,
+}
+
+impl<T: Clone> Default for Flights<T> {
+    fn default() -> Self {
+        Self {
+            running: std::sync::Mutex::new(FlightMap::new()),
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Flights<T> {
+    /// Output of the work running under `key`, or of `start()` when none is
+    async fn join(
+        &self,
+        key: PullKey,
+        start: impl FnOnce() -> futures_util::future::BoxFuture<'static, T>,
+    ) -> T {
+        use futures_util::FutureExt;
+
+        // Declared before `flight`, so it is dropped after it: by then this
+        // caller no longer keeps the work alive
+        let _forget = ForgetEnded(&self.running);
+        let flight: Flight<T> = {
+            let mut running = lock_flights(&self.running);
+            match running.get(&key).and_then(|weak| weak.upgrade()) {
+                Some(flight) => flight,
+                None => {
+                    let flight = start().shared();
+                    // Not polled yet, so it cannot have ended
+                    if let Some(weak) = flight.downgrade() {
+                        running.insert(key, weak);
+                    }
+                    flight
+                }
+            }
+        };
+        flight.await
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        lock_flights(&self.running).len()
+    }
+}
+
+/// The map of running work; a panic elsewhere cannot leave it inconsistent
+fn lock_flights<T: Clone>(
+    running: &std::sync::Mutex<FlightMap<T>>,
+) -> std::sync::MutexGuard<'_, FlightMap<T>> {
+    running
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Removes the entries of work that ended or that nobody waits for any more
+struct ForgetEnded<'a, T: Clone>(&'a std::sync::Mutex<FlightMap<T>>);
+
+impl<T: Clone> Drop for ForgetEnded<'_, T> {
+    fn drop(&mut self) {
+        lock_flights(self.0).retain(|_, weak| weak.upgrade().is_some());
+    }
+}
+
+/// Identifies a registry login without holding its secret: concurrent pulls
+/// are only shared between jobs that use the same one, so no job gets an
+/// image through another job's login
+fn login_identity(credentials: Option<&bollard::auth::DockerCredentials>) -> String {
+    let Some(credentials) = credentials else {
+        return "anonymous".to_string();
+    };
+    let mut hasher = blake3::Hasher::new();
+    for part in [
+        &credentials.serveraddress,
+        &credentials.username,
+        &credentials.password,
+        &credentials.identitytoken,
+        &credentials.registrytoken,
+    ] {
+        // Length-prefixed, so ("ab", "c") and ("a", "bc") differ
+        let part = part.as_deref().unwrap_or("");
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Pull `image` from its registry
+async fn pull_image(
+    docker: &Docker,
+    image: &str,
+    credentials: Option<bollard::auth::DockerCredentials>,
+) -> PullOutcome {
+    use bollard::image::CreateImageOptions;
+
+    let reference = image::with_default_tag(image);
+    let options = Some(CreateImageOptions {
+        from_image: reference.as_str(),
+        ..Default::default()
+    });
+    let mut stream = docker.create_image(options, None, credentials);
+    while let Some(progress) = stream.next().await {
+        if let Err(e) = progress {
+            let error = e.to_string();
+            let hint = image::registry_pull_hint(&error, image::registry(image))
+                .map(|hint| format!("\n{}", hint))
+                .unwrap_or_default();
+            return Err(pull_failure(format!(
+                "failed to pull image {}: {}{}",
+                image, error, hint
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Label marking containers and networks with the runner that created them
@@ -205,6 +340,7 @@ impl DockerExecutor {
             config,
             owner: "turboci".to_string(),
             ca_pem: None,
+            pulls: Arc::default(),
         })
     }
 
@@ -723,10 +859,8 @@ impl DockerExecutor {
             .map(drop)
     }
 
-    /// Pull `image` from its registry
+    /// Pull `image` from its registry with the job's login for it
     async fn pull(&self, image: &str, job: &Job) -> JobOutcome {
-        use bollard::image::CreateImageOptions;
-
         let credentials = self
             .registry_login(image, job)
             .await
@@ -736,25 +870,29 @@ impl DockerExecutor {
                 serveraddress: Some(image::registry(image).to_string()),
                 ..Default::default()
             });
-        let reference = image::with_default_tag(image);
-        let options = Some(CreateImageOptions {
-            from_image: reference.as_str(),
-            ..Default::default()
-        });
-        let mut stream = self.docker.create_image(options, None, credentials);
-        while let Some(progress) = stream.next().await {
-            if let Err(e) = progress {
-                let error = e.to_string();
-                let hint = image::registry_pull_hint(&error, image::registry(image))
-                    .map(|hint| format!("\n{}", hint))
-                    .unwrap_or_default();
-                return Err(pull_failure(format!(
-                    "failed to pull image {}: {}{}",
-                    image, error, hint
-                )));
-            }
-        }
-        Ok(())
+        self.pull_shared(image, credentials).await
+    }
+
+    /// Pull `image` with `credentials`, or wait for the pull of the same
+    /// image with the same login that another job already started
+    async fn pull_shared(
+        &self,
+        image: &str,
+        credentials: Option<bollard::auth::DockerCredentials>,
+    ) -> PullOutcome {
+        use futures_util::FutureExt;
+
+        let key = (
+            image::with_default_tag(image),
+            login_identity(credentials.as_ref()),
+        );
+        let docker = Arc::clone(&self.docker);
+        let image = image.to_string();
+        self.pulls
+            .join(key, move || {
+                async move { pull_image(&docker, &image, credentials).await }.boxed()
+            })
+            .await
     }
 
     /// Create a bridge network for the job (replacing a leftover one)
@@ -1038,21 +1176,13 @@ impl DockerExecutor {
 
     /// Pull a runner-internal image (no job credentials) when it is not present
     async fn pull_if_missing(&self, image: &str) -> Result<()> {
-        use bollard::image::CreateImageOptions;
-
         let reference = image::with_default_tag(image);
         if self.docker.inspect_image(&reference).await.is_ok() {
             return Ok(());
         }
-        let options = Some(CreateImageOptions {
-            from_image: reference.as_str(),
-            ..Default::default()
-        });
-        let mut stream = self.docker.create_image(options, None, None);
-        while let Some(progress) = stream.next().await {
-            progress.with_context(|| format!("Failed to pull {}", image))?;
-        }
-        Ok(())
+        self.pull_shared(image, None)
+            .await
+            .map_err(|failure| anyhow::anyhow!(failure.message))
     }
 
     async fn force_remove(&self, id: &str) -> Result<()> {
@@ -1953,6 +2083,40 @@ mod tests {
         assert!(kept, "another runner's container was removed");
     }
 
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_concurrent_pulls_of_one_image_share_the_pull_and_its_error() {
+        let executor = DockerExecutor::new(DockerConfig::default()).unwrap();
+        let image = "busybox:1.36";
+        let _ = executor
+            .docker
+            .remove_image(
+                image,
+                None::<bollard::query_parameters::RemoveImageOptions>,
+                None,
+            )
+            .await;
+
+        let (a, b) = tokio::join!(
+            executor.pull_shared(image, None),
+            executor.pull_shared(image, None)
+        );
+        assert!(a.is_ok() && b.is_ok(), "{:?} {:?}", a, b);
+        assert!(executor.docker.inspect_image(image).await.is_ok());
+        assert_eq!(executor.pulls.len(), 0);
+
+        let missing = "turboci-missing.invalid/none:1";
+        let (a, b) = tokio::join!(
+            executor.pull_shared(missing, None),
+            executor.pull_shared(missing, None)
+        );
+        let (a, b) = (a.unwrap_err(), b.unwrap_err());
+        assert_eq!(a.reason, FailureReason::ImagePullFailure);
+        assert_eq!(a.message, b.message);
+        assert!(a.message.contains(missing), "{}", a.message);
+        assert_eq!(executor.pulls.len(), 0);
+    }
+
     /// An executor with alpine:3.20 already present: the job timeout includes
     /// image pulls, which short timeouts in tests must not depend on
     async fn with_alpine_pulled() -> ExecutorType {
@@ -2257,7 +2421,162 @@ mod tests {
             config,
             ca_pem: None,
             owner: "turboci".to_string(),
+            pulls: Arc::default(),
         }
+    }
+
+    fn key(image: &str, login: &str) -> PullKey {
+        (image.to_string(), login.to_string())
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_with_one_key_share_one_run_and_its_error() {
+        use futures_util::FutureExt;
+
+        let flights = Flights::<std::result::Result<(), String>>::default();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let start = || {
+            starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Err("registry said no".to_string())
+            }
+            .boxed()
+        };
+
+        let (a, b, c) = tokio::join!(
+            flights.join(key("alpine:3.20", "anonymous"), start),
+            flights.join(key("alpine:3.20", "anonymous"), start),
+            flights.join(key("alpine:3.20", "anonymous"), start),
+        );
+
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for outcome in [a, b, c] {
+            assert_eq!(outcome, Err("registry said no".to_string()));
+        }
+        assert_eq!(flights.len(), 0, "an ended run stayed in the map");
+
+        // Ended runs are not reused: the next caller starts a new one
+        let _ = flights.join(key("alpine:3.20", "anonymous"), start).await;
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn another_login_or_image_gets_a_run_of_its_own() {
+        use futures_util::FutureExt;
+
+        let flights = Flights::<u32>::default();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let start = |value: u32| {
+            let starts = &starts;
+            move || {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    value
+                }
+                .boxed()
+            }
+        };
+
+        let outcomes = tokio::join!(
+            flights.join(key("app:1", "anonymous"), start(1)),
+            flights.join(key("app:1", "login-a"), start(2)),
+            flights.join(key("app:1", "login-b"), start(3)),
+            flights.join(key("app:2", "login-a"), start(4)),
+        );
+
+        assert_eq!(outcomes, (1, 2, 3, 4));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(flights.len(), 0);
+    }
+
+    /// Sets its flag when dropped
+    struct OnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn work_nobody_waits_for_is_dropped_and_forgotten() {
+        use futures_util::FutureExt;
+
+        let flights = Flights::<u32>::default();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let endless = {
+            let dropped = Arc::clone(&dropped);
+            move || {
+                async move {
+                    let _guard = OnDrop(dropped);
+                    std::future::pending::<u32>().await
+                }
+                .boxed()
+            }
+        };
+
+        // Both waiters give up, as canceled jobs do
+        let gave_up = tokio::time::timeout(Duration::from_millis(50), async {
+            tokio::join!(
+                flights.join(key("app:1", "anonymous"), endless.clone()),
+                flights.join(key("app:1", "anonymous"), endless),
+            )
+        })
+        .await;
+
+        assert!(gave_up.is_err());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(flights.len(), 0, "abandoned work stayed in the map");
+        let fresh = flights
+            .join(key("app:1", "anonymous"), || async { 7 }.boxed())
+            .await;
+        assert_eq!(fresh, 7);
+    }
+
+    #[tokio::test]
+    async fn work_goes_on_while_one_waiter_remains() {
+        use futures_util::FutureExt;
+
+        let flights = Flights::<u32>::default();
+        let start = || {
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                5
+            }
+            .boxed()
+        };
+
+        let gives_up = tokio::time::timeout(
+            Duration::from_millis(10),
+            flights.join(key("app:1", "anonymous"), start),
+        );
+        let (gave_up, stayed) =
+            tokio::join!(gives_up, flights.join(key("app:1", "anonymous"), start));
+
+        assert!(gave_up.is_err());
+        assert_eq!(stayed, 5);
+        assert_eq!(flights.len(), 0);
+    }
+
+    #[test]
+    fn login_identities_differ_by_login_and_hide_the_secret() {
+        let login = |user: &str, password: &str| bollard::auth::DockerCredentials {
+            username: Some(user.to_string()),
+            password: Some(password.to_string()),
+            serveraddress: Some("registry.corp".to_string()),
+            ..Default::default()
+        };
+        let a = login_identity(Some(&login("ci", "secret-one")));
+
+        assert_eq!(a, login_identity(Some(&login("ci", "secret-one"))));
+        assert_ne!(a, login_identity(Some(&login("ci", "secret-two"))));
+        assert_ne!(a, login_identity(Some(&login("other", "secret-one"))));
+        assert_ne!(a, login_identity(None));
+        // Length-prefixed parts: moving a character between them changes it
+        assert_ne!(login_identity(Some(&login("cis", "ecret-one"))), a);
+        assert!(!a.contains("secret-one"));
     }
 
     #[test]
