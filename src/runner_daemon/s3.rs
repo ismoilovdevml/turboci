@@ -24,6 +24,12 @@ const IO_CHUNK: usize = 256 * 1024;
 
 const ATTEMPTS: u32 = 3;
 
+/// Replaces the shared client's total timeout (meant for GitLab API calls)
+/// on every S3 request: a transfer may take as long as it keeps moving, and
+/// the stall timeout ends one that does not. Not `Duration::MAX`, which
+/// would rely on every layer saturating the deadline.
+const NO_TOTAL_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
@@ -327,14 +333,11 @@ impl std::fmt::Debug for Bucket {
 }
 
 impl Bucket {
-    /// `http` carries the runner's proxy and CA; a connect timeout is added
-    /// here. Transfers have no total timeout, only a stall timeout.
-    pub fn new(config: &S3CacheConfig, http: reqwest::ClientBuilder) -> Result<Self> {
+    /// `client` is the runner's shared HTTP client (proxy, CA, connect
+    /// timeout). Its total timeout, meant for API calls, is replaced on
+    /// every request: transfers have only a stall timeout.
+    pub fn new(config: &S3CacheConfig, client: reqwest::Client) -> Result<Self> {
         let location = S3Location::parse(&config.url, config.region.as_deref())?;
-        let client = http
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .context("Failed to build the S3 HTTP client")?;
         Ok(Self {
             client,
             location,
@@ -475,6 +478,7 @@ impl Bucket {
             let mut request = self
                 .client
                 .request(method.clone(), &url)
+                .timeout(NO_TOTAL_TIMEOUT)
                 .header("x-amz-content-sha256", payload_hash)
                 .header("x-amz-date", &amz_date)
                 .header("authorization", authorization);
@@ -782,7 +786,7 @@ mod tests {
                 secret_key: "SK".to_string(),
                 region: None,
             },
-            reqwest::Client::builder(),
+            reqwest::Client::new(),
         )
         .unwrap()
         .with_retry_delay(std::time::Duration::from_millis(10))
@@ -790,6 +794,46 @@ mod tests {
 
     fn bucket(server: &MockServer, prefix: &str) -> Bucket {
         bucket_at(format!("{}/ci-cache{}", server.uri(), prefix))
+    }
+
+    /// S3 shares GitLab's client, whose 30 s total timeout is for API calls
+    #[tokio::test]
+    async fn the_shared_clients_total_timeout_does_not_end_transfers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"zip".to_vec())
+                    .set_delay(Duration::from_millis(400)),
+            )
+            .mount(&server)
+            .await;
+        let api_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let b = Bucket::new(
+            &crate::runner_daemon::config::S3CacheConfig {
+                url: format!("{}/ci-cache", server.uri()),
+                access_key: "AK".to_string(),
+                secret_key: "SK".to_string(),
+                region: None,
+            },
+            api_client,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let download = b
+            .get_to_file(&b.object_key(1, "k.zip"), None, dir.path())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(download, Download::Downloaded { bytes: 3, .. }),
+            "{:?}",
+            download
+        );
     }
 
     /// A server that answers one request with `reply` and then goes silent
@@ -860,7 +904,7 @@ mod tests {
                 secret_key: "SK".to_string(),
                 region: None,
             },
-            reqwest::Client::builder(),
+            reqwest::Client::new(),
         )
         .unwrap();
         let key = b.object_key(7, "feature%2Fx%20y%25.zip");
@@ -1085,7 +1129,7 @@ mod tests {
                 secret_key: "SK".to_string(),
                 region: None,
             },
-            reqwest::Client::builder(),
+            reqwest::Client::new(),
         )
         .unwrap()
         .with_retry_delay(std::time::Duration::from_millis(10));

@@ -164,9 +164,11 @@ async fn run() -> Result<()> {
 
             let executor = executor.with_ca_pem(network.ca_pem.clone());
             let cache_s3 = runner_config.s3_cache().cloned();
+            // S3 shares GitLab's HTTP client: one proxy and CA setup, one pool
+            let http = gitlab.http();
             let mut daemon = RunnerDaemon::new(runner_config, gitlab, executor);
             if let Some(s3) = &cache_s3 {
-                let bucket = runner_daemon::s3::Bucket::new(s3, network.client_builder()?)?;
+                let bucket = runner_daemon::s3::Bucket::new(s3, http)?;
                 // In the background: a slow S3 must not delay taking jobs
                 let (probe, url) = (bucket.clone(), s3.url.clone());
                 tokio::spawn(async move {

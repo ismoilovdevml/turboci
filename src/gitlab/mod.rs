@@ -103,6 +103,7 @@ impl GitLabClient {
     fn with_http(url: String, token: String, http: reqwest::ClientBuilder) -> Result<Self> {
         Ok(Self {
             client: http
+                .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(API_TIMEOUT)
                 .build()
                 .context("Failed to build HTTP client")?,
@@ -112,6 +113,12 @@ impl GitLabClient {
             info: RunnerInfo::new("docker"),
             last_update: Arc::default(),
         })
+    }
+
+    /// The runner's HTTP client (proxy, CA, connection pool), shared with
+    /// the S3 cache, whose requests set their own timeouts
+    pub fn http(&self) -> reqwest::Client {
+        self.client.clone()
     }
 
     /// Report the configured executor and its capabilities to GitLab
@@ -936,6 +943,10 @@ pub struct RetryConfig {
     #[serde(default)]
     pub when: Vec<String>,
 }
+
+/// Timeout of establishing a connection (TCP, proxy and TLS), for GitLab
+/// and the S3 cache alike
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout of API calls (the client default)
 const API_TIMEOUT: Duration = Duration::from_secs(30);

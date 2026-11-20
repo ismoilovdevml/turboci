@@ -499,7 +499,7 @@ mod tests {
                 secret_key: "SK".to_string(),
                 region: None,
             },
-            reqwest::Client::builder(),
+            reqwest::Client::new(),
         )
         .unwrap()
         .with_retry_delay(std::time::Duration::from_millis(10))
@@ -1325,7 +1325,7 @@ mod tests {
                     secret_key: "turboci-secret".to_string(),
                     region: None,
                 },
-                reqwest::Client::builder(),
+                reqwest::Client::new(),
             )
             .unwrap()
             .with_retry_delay(std::time::Duration::from_millis(200))
