@@ -103,6 +103,18 @@ helper_image = "alpine/git:latest"
 # oom_score_adjust = 500
 # Most processes per container, so a fork bomb cannot exhaust the host
 # pids_limit = 4096
+# Relative CPU weight (Docker's default is 1024): unlike cpus, a container may
+# still use idle CPU, it only gets less of it while the CPUs are busy
+# cpu_shares = 512
+
+# Storage driver options of job and service containers; size needs overlay2
+# on xfs mounted with pquota
+# [executor.docker.storage_opt]
+# size = "20G"
+
+# tmpfs mounts of job containers (not services): path -> mount options
+# [executor.docker.tmpfs]
+# "/tmp" = "rw,noexec,size=1g"
 
 # Docker config.json whose "auths" logins are used to pull private images
 # (default: ~/.docker/config.json of the service user)

@@ -219,10 +219,23 @@ aliases.
 | `shm_size` | – | Size of `/dev/shm`, e.g. `"1g"`. Docker's 64 MB is too small for browsers and some test runners |
 | `oom_score_adjust` | – | OOM killer preference of containers (-1000 to 1000) |
 | `pids_limit` | – | Most processes per container (at least 1), so a fork bomb cannot exhaust the host, e.g. `4096` |
+| `cpu_shares` | – | Relative CPU weight of job and service containers (2 to 262144; Docker's default is 1024). Unlike `cpus` it caps nothing: a container may use idle CPU, it only gets a smaller share while the CPUs are busy |
+| `storage_opt` | `{}` | Storage driver options of job and service containers, e.g. `size = "20G"` (overlay2 needs xfs mounted with `pquota` for `size`; dockerd rejects the container otherwise) |
+| `tmpfs` | `{}` | tmpfs mounts of job containers (not services): container path → mount options, e.g. `"/tmp" = "rw,noexec,size=1g"`. Paths at or below `/builds` are rejected: they would hide the workspace |
 | `auth_config_file` | `~/.docker/config.json` of the service user | Docker client config whose `auths` are used to pull private images |
 | `insecure_registries` | `[]` | Registries (`host[:port]`) reached over HTTP or without certificate checks; docker:dind services get `--insecure-registry` for each |
 | `registry_ca` | `{}` | Registry → PEM CA file; mounted into docker:dind services as `/etc/docker/certs.d/<registry>/ca.crt` |
 | `services` | `[]` | Services started for every job (see below) |
+
+`tmpfs` and `storage_opt` are tables:
+
+```toml
+[executor.docker.tmpfs]
+"/tmp" = "rw,noexec,size=1g"
+
+[executor.docker.storage_opt]
+size = "20G"
+```
 
 `volumes` takes `host:container[:mode]` binds and bare container paths. A
 bare path such as `"/cache"` becomes a Docker volume that keeps its content

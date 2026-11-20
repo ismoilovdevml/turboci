@@ -505,7 +505,7 @@ impl DockerExecutor {
                 "while :; do sleep 3600; done".to_string(),
             ]),
             host_config: Some(
-                self.host_config(
+                self.job_host_config(
                     std::iter::once(format!("{}:/builds", job_dir.display()))
                         .chain(volumes.iter().cloned())
                         .collect(),
@@ -592,7 +592,20 @@ impl DockerExecutor {
             oom_score_adj: self.config.oom_score_adjust,
             pids_limit: self.config.pids_limit,
             nano_cpus: self.config.cpus.map(|cpus| (cpus * 1e9) as i64),
+            cpu_shares: self.config.cpu_shares,
+            storage_opt: (!self.config.storage_opt.is_empty())
+                .then(|| self.config.storage_opt.clone().into_iter().collect()),
             ..Default::default()
+        }
+    }
+
+    /// Host settings of the job container: those it shares with services,
+    /// plus the workspace and the job-only tmpfs mounts
+    fn job_host_config(&self, binds: Vec<String>, network: Option<&str>) -> HostConfig {
+        HostConfig {
+            tmpfs: (!self.config.tmpfs.is_empty())
+                .then(|| self.config.tmpfs.clone().into_iter().collect()),
+            ..self.host_config(binds, network)
         }
     }
 
@@ -1361,6 +1374,89 @@ mod tests {
         // ...and the runner's user can delete the workspace
         executor.cleanup(&j, false).await;
         assert!(!job_dir.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_job_gets_tmpfs_mounts() {
+        let docker_executor = DockerExecutor::new(DockerConfig {
+            pull_policy: "if-not-present".to_string(),
+            tmpfs: std::collections::BTreeMap::from([(
+                "/scratch".to_string(),
+                "rw,size=16m".to_string(),
+            )]),
+            ..DockerConfig::default()
+        })
+        .unwrap();
+        docker_executor
+            .pull_if_missing("alpine:3.20")
+            .await
+            .unwrap();
+        let executor = ExecutorType::Docker(docker_executor);
+        let job_id = 912_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "alpine:3.20"},
+            "steps": steps(
+                &[
+                    "grep ' /scratch ' /proc/mounts",
+                    "echo x > /scratch/f && echo tmpfs-writable",
+                ],
+                &[]
+            )
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("tmpfs /scratch tmpfs"), "{}", log);
+        assert!(log.contains("size=16384k"), "{}", log);
+        assert!(log.contains("tmpfs-writable"), "{}", log);
+        executor.cleanup(&j, false).await;
+    }
+
+    /// Only created, not started: a CPU weight needs a cgroup that nested
+    /// test daemons cannot always provide
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_accepts_the_cpu_weight_of_job_containers() {
+        let executor = DockerExecutor::new(DockerConfig {
+            cpu_shares: Some(512),
+            ..DockerConfig::default()
+        })
+        .unwrap()
+        .with_owner(&format!("cpu-shares-test-{}", std::process::id()));
+        executor.pull_if_missing("alpine:3.20").await.unwrap();
+        let id = executor
+            .create_named(
+                &format!("turboci-cpu-shares-test-{}", std::process::id()),
+                ContainerCreateBody {
+                    image: Some("alpine:3.20".to_string()),
+                    host_config: Some(executor.job_host_config(Vec::new(), None)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let info = executor
+            .docker
+            .inspect_container(
+                &id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+        executor.force_remove(&id).await.unwrap();
+
+        let shares = info
+            .unwrap()
+            .host_config
+            .and_then(|config| config.cpu_shares);
+        assert_eq!(shares, Some(512));
     }
 
     #[tokio::test]
@@ -2149,6 +2245,62 @@ mod tests {
             "{}",
             script
         );
+    }
+
+    /// An executor whose Docker client is never used: it points nowhere
+    fn offline(config: DockerConfig) -> DockerExecutor {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        DockerExecutor {
+            docker: Arc::new(docker),
+            config,
+            ca_pem: None,
+            owner: "turboci".to_string(),
+        }
+    }
+
+    #[test]
+    fn cpu_shares_and_storage_options_reach_jobs_and_services_tmpfs_only_jobs() {
+        let executor = offline(DockerConfig {
+            cpu_shares: Some(512),
+            tmpfs: std::collections::BTreeMap::from([(
+                "/tmp".to_string(),
+                "rw,size=64m".to_string(),
+            )]),
+            storage_opt: std::collections::BTreeMap::from([(
+                "size".to_string(),
+                "20G".to_string(),
+            )]),
+            ..DockerConfig::default()
+        });
+
+        let service = executor.host_config(Vec::new(), Some("net"));
+        let job = executor.job_host_config(vec!["/w:/builds".to_string()], Some("net"));
+
+        for config in [&service, &job] {
+            assert_eq!(config.cpu_shares, Some(512));
+            assert_eq!(
+                config
+                    .storage_opt
+                    .as_ref()
+                    .unwrap()
+                    .get("size")
+                    .map(String::as_str),
+                Some("20G")
+            );
+            assert_eq!(config.network_mode.as_deref(), Some("net"));
+        }
+        assert!(service.tmpfs.is_none());
+        assert_eq!(
+            job.tmpfs.as_ref().unwrap().get("/tmp").map(String::as_str),
+            Some("rw,size=64m")
+        );
+        assert_eq!(job.binds, Some(vec!["/w:/builds".to_string()]));
+
+        let unset = offline(DockerConfig::default());
+        let job = unset.job_host_config(Vec::new(), None);
+        assert!(job.cpu_shares.is_none() && job.tmpfs.is_none() && job.storage_opt.is_none());
     }
 
     #[test]

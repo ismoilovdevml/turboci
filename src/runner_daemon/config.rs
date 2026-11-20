@@ -125,6 +125,10 @@ pub struct DockerConfig {
     pub memory_reservation: Option<String>,
     /// CPU limit per container, e.g. 1.5
     pub cpus: Option<f64>,
+    /// Relative CPU weight of job and service containers (Docker's default
+    /// is 1024). Unlike `cpus` it only matters while the CPUs are busy: a
+    /// container may use idle CPU whatever its weight
+    pub cpu_shares: Option<i64>,
     /// Size of /dev/shm in job and service containers, e.g. "1g" (Docker's
     /// default of 64m is too small for browsers and some test runners)
     pub shm_size: Option<String>,
@@ -144,6 +148,12 @@ pub struct DockerConfig {
     /// Registry (`host[:port]`) → PEM CA file, mounted into docker:dind
     /// services as /etc/docker/certs.d/<registry>/ca.crt
     pub registry_ca: std::collections::BTreeMap<String, String>,
+    /// tmpfs mounts of job containers: container path → mount options
+    /// (empty for Docker's defaults), e.g. "/tmp" = "rw,noexec,size=1g"
+    pub tmpfs: std::collections::BTreeMap<String, String>,
+    /// Storage driver options of job and service containers, e.g.
+    /// size = "20G" (overlay2 needs xfs with pquota for it)
+    pub storage_opt: std::collections::BTreeMap<String, String>,
 }
 
 /// A service in `[[executor.docker.services]]`
@@ -244,6 +254,52 @@ impl DockerConfig {
         }
         if self.pids_limit.is_some_and(|limit| limit < 1) {
             anyhow::bail!("executor.docker.pids_limit must be at least 1 (unset for no limit)");
+        }
+        // dockerd silently clamps weights outside this range
+        if self
+            .cpu_shares
+            .is_some_and(|shares| !(2..=262_144).contains(&shares))
+        {
+            anyhow::bail!("executor.docker.cpu_shares must be between 2 and 262144");
+        }
+        for (path, options) in &self.tmpfs {
+            let clean = Path::new(path).components().all(|part| {
+                matches!(
+                    part,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            });
+            if !path.starts_with('/') || path == "/" || !clean || path.contains([':', ',']) {
+                anyhow::bail!(
+                    "executor.docker.tmpfs: {:?} must be an absolute container path other than /",
+                    path
+                );
+            }
+            if Path::new(path).starts_with("/builds") {
+                anyhow::bail!(
+                    "executor.docker.tmpfs: {:?} would hide the job's workspace (/builds)",
+                    path
+                );
+            }
+            if options.chars().any(char::is_whitespace) {
+                anyhow::bail!(
+                    "executor.docker.tmpfs: options for {} must not contain spaces, got {:?}",
+                    path,
+                    options
+                );
+            }
+        }
+        for (key, value) in &self.storage_opt {
+            let valid = |text: &str| {
+                !text.is_empty() && !text.contains('=') && !text.chars().any(char::is_whitespace)
+            };
+            if !valid(key) || !valid(value) {
+                anyhow::bail!(
+                    "executor.docker.storage_opt: {:?} = {:?} must be a non-empty option and value, e.g. size = \"20G\"",
+                    key,
+                    value
+                );
+            }
         }
         for policy in std::iter::once(&self.pull_policy).chain(&self.allowed_pull_policies) {
             if !matches!(policy.as_str(), "always" | "if-not-present" | "never") {
@@ -417,6 +473,7 @@ impl Default for DockerConfig {
             memory_swap: None,
             memory_reservation: None,
             cpus: None,
+            cpu_shares: None,
             shm_size: None,
             oom_score_adjust: None,
             pids_limit: None,
@@ -424,6 +481,8 @@ impl Default for DockerConfig {
             auth_config_file: None,
             insecure_registries: Vec::new(),
             registry_ca: std::collections::BTreeMap::new(),
+            tmpfs: std::collections::BTreeMap::new(),
+            storage_opt: std::collections::BTreeMap::new(),
             builds_dir: None,
         }
     }
@@ -709,6 +768,48 @@ mod tests {
             "cpus = 0.0",
             "pull_policy = \"sometimes\"",
             "pids_limit = 0",
+        ] {
+            let config =
+                RunnerConfig::parse(&format!("runner_token = \"t\"\n[executor.docker]\n{}", bad))
+                    .unwrap();
+            assert!(config.validate().is_err(), "accepted {}", bad);
+        }
+    }
+
+    #[test]
+    fn parses_cpu_shares_tmpfs_and_storage_options() {
+        let config = RunnerConfig::parse(
+            "runner_token = \"t\"\n[executor.docker]\ncpu_shares = 512\n\
+             [executor.docker.tmpfs]\n\"/tmp\" = \"rw,noexec,size=1g\"\n\"/scratch\" = \"\"\n\
+             [executor.docker.storage_opt]\nsize = \"20G\"\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let docker = &config.executor.docker;
+        assert_eq!(docker.cpu_shares, Some(512));
+        assert_eq!(docker.tmpfs["/tmp"], "rw,noexec,size=1g");
+        assert_eq!(docker.tmpfs["/scratch"], "");
+        assert_eq!(docker.storage_opt["size"], "20G");
+
+        let defaults = RunnerConfig::parse("runner_token = \"t\"").unwrap();
+        assert_eq!(defaults.executor.docker.cpu_shares, None);
+        assert!(defaults.executor.docker.tmpfs.is_empty());
+        assert!(defaults.executor.docker.storage_opt.is_empty());
+
+        for bad in [
+            "cpu_shares = 1",
+            "cpu_shares = 262145",
+            "cpu_shares = -5",
+            "[executor.docker.tmpfs]\n\"tmp\" = \"\"",
+            "[executor.docker.tmpfs]\n\"/\" = \"\"",
+            "[executor.docker.tmpfs]\n\"/a/../etc\" = \"\"",
+            "[executor.docker.tmpfs]\n\"/a:b\" = \"\"",
+            "[executor.docker.tmpfs]\n\"/builds\" = \"\"",
+            "[executor.docker.tmpfs]\n\"/builds/project\" = \"\"",
+            "[executor.docker.tmpfs]\n\"/tmp\" = \"size=1g, noexec\"",
+            "[executor.docker.storage_opt]\nsize = \"\"",
+            "[executor.docker.storage_opt]\n\"size=1\" = \"20G\"",
+            "[executor.docker.storage_opt]\nsize = \"20 G\"",
         ] {
             let config =
                 RunnerConfig::parse(&format!("runner_token = \"t\"\n[executor.docker]\n{}", bad))
