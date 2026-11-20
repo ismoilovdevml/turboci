@@ -1045,26 +1045,31 @@ impl DockerExecutor {
         force_remove(&self.docker, id).await
     }
 
-    /// `chown -R` the workspace to the runner's uid/gid from a fresh container of
-    /// the (trusted) helper image, never from the job's own image
+    /// Give the workspace back to the runner's uid/gid (the owner of
+    /// `job_dir`) from a fresh container of the (trusted) helper image, never
+    /// from the job's own image. Skipped when everything already belongs to
+    /// it, e.g. jobs running as the runner's user, or Docker Desktop.
     async fn reset_ownership(&self, job_id: u64, job_dir: &Path) -> Result<()> {
         #[cfg(unix)]
         {
             use bollard::container::{StartContainerOptions, WaitContainerOptions};
             use std::os::unix::fs::MetadataExt;
 
-            let meta = std::fs::metadata(job_dir)?;
+            let meta = tokio::fs::metadata(job_dir).await?;
+            let (uid, gid) = (meta.uid(), meta.gid());
+            let dir = job_dir.to_path_buf();
+            let needed =
+                tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid)).await?;
+            if !needed {
+                return Ok(());
+            }
             // Jobs without sources to check out never pulled the helper image
             self.pull_if_missing(&self.config.helper_image).await?;
             let config = ContainerCreateBody {
                 image: Some(self.config.helper_image.clone()),
                 user: Some("0".to_string()),
                 entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
-                cmd: Some(vec![format!(
-                    "chown -R {}:{} /builds",
-                    meta.uid(),
-                    meta.gid()
-                )]),
+                cmd: Some(vec![chown_script(uid, gid)]),
                 network_disabled: Some(true),
                 host_config: Some(HostConfig {
                     binds: Some(vec![format!("{}:/builds", job_dir.display())]),
@@ -1097,6 +1102,30 @@ impl DockerExecutor {
         }
         Ok(())
     }
+}
+
+/// Script that gives everything below /builds to `uid:gid`, touching only
+/// what belongs to someone else (a kept workspace is mostly the runner's
+/// already). Symbolic links are changed themselves, never followed. A helper
+/// image whose find cannot do this falls back to chown -R.
+fn chown_script(uid: u32, gid: u32) -> String {
+    format!(
+        "find /builds \\( ! -user {uid} -o ! -group {gid} \\) -exec chown -h {uid}:{gid} {{}} + \
+         || chown -R -h {uid}:{gid} /builds"
+    )
+}
+
+/// Whether anything in `dir` (symbolic links not followed) belongs to
+/// another user or group than `uid:gid`, or cannot be checked
+#[cfg(unix)]
+fn owned_by_others(dir: &Path, uid: u32, gid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    walkdir::WalkDir::new(dir).into_iter().any(|entry| {
+        entry
+            .and_then(|entry| entry.metadata())
+            .map_or(true, |meta| meta.uid() != uid || meta.gid() != gid)
+    })
 }
 
 /// Kill and remove a container with its anonymous volumes; one that is
@@ -2076,6 +2105,41 @@ mod tests {
         executor.cleanup(&j, false).await;
         assert_eq!(files, vec!["new.txt".to_string()]);
         assert!(!ran, "the job's core.fsmonitor command ran");
+    }
+
+    #[test]
+    fn ownership_check_does_not_follow_symlinks() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        let (uid, gid) = (meta.uid(), meta.gid());
+        std::fs::create_dir_all(dir.path().join("project/.git")).unwrap();
+        std::fs::write(dir.path().join("project/file"), "x").unwrap();
+        // Points at a file of root's: the link itself is the runner's
+        std::os::unix::fs::symlink("/etc/hosts", dir.path().join("project/link")).unwrap();
+
+        assert!(!owned_by_others(dir.path(), uid, gid));
+        assert!(owned_by_others(dir.path(), uid + 1, gid));
+        assert!(owned_by_others(dir.path(), uid, gid + 1));
+        assert!(owned_by_others(&dir.path().join("missing"), uid, gid));
+    }
+
+    #[test]
+    fn chown_touches_only_what_others_own_and_never_follows_links() {
+        let script = chown_script(1000, 1001);
+        assert!(
+            script.starts_with(
+                "find /builds \\( ! -user 1000 -o ! -group 1001 \\) -exec chown -h 1000:1001 {} +"
+            ),
+            "{}",
+            script
+        );
+        assert!(
+            script.ends_with("|| chown -R -h 1000:1001 /builds"),
+            "{}",
+            script
+        );
     }
 
     #[test]
