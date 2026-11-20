@@ -43,6 +43,10 @@ state_dir = "/var/lib/turboci"
 # min_free_disk = "20g"
 # max_load_avg = 16.0
 
+# Prometheus metrics on http://<metrics_listen>/metrics (IP:port; no
+# authentication, keep it on loopback or a management network). Unset: off
+# metrics_listen = "127.0.0.1:9252"
+
 # ===== CACHE CONFIGURATION =====
 cache_enabled = true
 # Local job cache (`cache:` in .gitlab-ci.yml), one directory per project

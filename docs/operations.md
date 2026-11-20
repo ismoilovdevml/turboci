@@ -52,6 +52,49 @@ also delete the objects under `<prefix>/project-<id>/` in the bucket, or use
 *Clear runner caches* on the project's **Build → Pipelines** page, which
 gives the jobs new cache keys.
 
+## Metrics
+
+With `metrics_listen = "127.0.0.1:9252"` the runner serves Prometheus
+metrics on `http://127.0.0.1:9252/metrics`; any other path or method gets
+404. The endpoint has no authentication: keep it on loopback or a management
+network. A port that is taken stops the runner at start with an error.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: turboci
+    static_configs:
+      - targets: ["ci-runner-01:9252"]
+```
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `turboci_runner_info{version,revision,executor}` | gauge | Always 1; the labels say what runs |
+| `turboci_jobs_running` | gauge | Jobs running now |
+| `turboci_concurrent_jobs` | gauge | Job slots (`concurrent`) |
+| `turboci_jobs_finished_total{result}` | counter | Jobs that ended: `success`, `failed`, `canceled` (in GitLab) |
+| `turboci_jobs_failed_total{reason}` | counter | Failed jobs by failure reason: `script_failure`, `runner_system_failure`, `job_execution_timeout`, `image_pull_failure`, `job_canceled` |
+| `turboci_job_requests_total{result}` | counter | Job requests to GitLab: `job`, `no_job`, `error` |
+| `turboci_admission_blocked{resource}` | gauge | 1 while [admission control](configuration.md#admission-control) holds off jobs for `memory`, `disk` or `load` |
+| `turboci_cache_restores_total{result}` | counter | Cache entries restored: `hit`, `miss`, `error` |
+| `turboci_cache_uploads_total{result}` | counter | Saved archives in S3: `sent`, `unchanged` (S3 had the same content), `failed` |
+| `turboci_cache_s3_errors_total` | counter | S3 calls for the cache that failed; the jobs used the local cache |
+| `process_start_time_seconds` | gauge | Start of the runner process (Unix time) |
+| `process_resident_memory_bytes` | gauge | Resident memory of the runner (Linux) |
+
+Alerts worth having:
+
+```yaml
+- alert: TurboCIRequestErrors
+  expr: rate(turboci_job_requests_total{result="error"}[10m]) > 0
+  for: 15m
+- alert: TurboCIAdmissionBlocked
+  expr: max by (instance) (turboci_admission_blocked) == 1
+  for: 30m
+- alert: TurboCISystemFailures
+  expr: increase(turboci_jobs_failed_total{reason="runner_system_failure"}[1h]) > 3
+```
+
 ## Runner token rotation
 
 When the GitLab instance gives runner tokens an expiry (*Admin → Settings →

@@ -63,6 +63,10 @@ pub struct RunnerConfig {
     /// No job is requested while the 1-minute load average is above this (Linux)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_load_avg: Option<f64>,
+    /// `IP:port` of the Prometheus endpoint (GET /metrics), such as
+    /// "127.0.0.1:9252" (unset = off)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics_listen: Option<String>,
 
     /// S3-compatible storage shared by runners, used next to `cache_dir`
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -455,6 +459,7 @@ impl Default for RunnerConfig {
             min_free_memory: None,
             min_free_disk: None,
             max_load_avg: None,
+            metrics_listen: None,
             cache_s3: None,
             executor: ExecutorConfig::default(),
         }
@@ -658,8 +663,23 @@ fn optional_size(field: &str, value: Option<&str>) -> Result<Option<u64>> {
     Ok((bytes > 0).then_some(bytes))
 }
 
-/// Daemon options: admission control
+/// Daemon options: admission control and metrics
 impl RunnerConfig {
+    /// Address of the metrics endpoint; `None` when off
+    pub fn metrics_addr(&self) -> Result<Option<std::net::SocketAddr>> {
+        self.metrics_listen
+            .as_deref()
+            .map(|value| {
+                value.trim().parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "metrics_listen must be IP:port, such as \"127.0.0.1:9252\", got {:?}",
+                        value
+                    )
+                })
+            })
+            .transpose()
+    }
+
     /// `min_free_memory` in bytes; `None` when off
     pub fn min_free_memory_bytes(&self) -> Result<Option<u64>> {
         optional_size("min_free_memory", self.min_free_memory.as_deref())
@@ -673,6 +693,7 @@ impl RunnerConfig {
     fn validate_daemon_options(&self) -> Result<()> {
         self.min_free_memory_bytes()?;
         self.min_free_disk_bytes()?;
+        self.metrics_addr()?;
         if self
             .max_load_avg
             .is_some_and(|load| !load.is_finite() || load <= 0.0)
@@ -1123,6 +1144,36 @@ mod tests {
             "max_load_avg = inf",
         ] {
             assert!(daemon_config(bad).validate().is_err(), "accepted {}", bad);
+        }
+    }
+
+    #[test]
+    fn parses_the_metrics_address() {
+        assert_eq!(daemon_config("").metrics_addr().unwrap(), None);
+        let content = "metrics_listen = \"127.0.0.1:9252\"";
+        let config = daemon_config(content);
+        config.validate().unwrap();
+        assert!(unknown_keys(content, &config).is_empty());
+        assert_eq!(
+            config.metrics_addr().unwrap(),
+            Some("127.0.0.1:9252".parse().unwrap())
+        );
+        daemon_config("metrics_listen = \"[::1]:9252\"")
+            .validate()
+            .unwrap();
+        daemon_config("metrics_listen = \"0.0.0.0:9252\"")
+            .validate()
+            .unwrap();
+
+        for bad in [
+            "localhost:9252",
+            "9252",
+            "127.0.0.1",
+            "",
+            "http://127.0.0.1:9252",
+        ] {
+            let config = daemon_config(&format!("metrics_listen = {:?}", bad));
+            assert!(config.validate().is_err(), "accepted {:?}", bad);
         }
     }
 }

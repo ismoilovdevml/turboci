@@ -50,6 +50,7 @@ work_dir = "/var/lib/turboci/builds"
 | `check_interval` | `3` | Seconds between job requests while idle |
 | `tls_ca_file` | – | PEM CA for a GitLab with a self-signed or internal certificate; also given to jobs as `CI_SERVER_TLS_CA_FILE` and `GIT_SSL_CAINFO` |
 | `state_dir` | `/var/lib/turboci` | Where the runner keeps state it writes: its system ID and a [rotated token](operations.md#runner-token-rotation) |
+| `metrics_listen` | unset | `IP:port` of the [Prometheus endpoint](operations.md#metrics), e.g. `"127.0.0.1:9252"`. Unset: no endpoint |
 | `environment` | `[]` | `KEY=value` variables added to every job; they override the job's own |
 | `pre_get_sources_script` | – | Script run before the checkout of every job (before the job's `hooks:pre_get_sources_script`) |
 | `post_get_sources_script` | – | Script run after the checkout |

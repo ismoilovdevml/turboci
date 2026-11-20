@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
@@ -21,6 +21,7 @@ pub mod executor;
 pub mod git;
 pub mod image;
 pub mod job_cache;
+pub mod metrics;
 pub mod s3;
 pub mod script;
 pub mod system_id;
@@ -377,6 +378,8 @@ pub struct RunnerDaemon {
     last_eviction: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Reads the host's free memory, disk space and load for admission control
     probe: Arc<dyn admission::Probe>,
+    /// Counters served on `metrics_listen`
+    metrics: Arc<metrics::Metrics>,
 }
 
 /// How often unused workspaces are looked for
@@ -432,6 +435,7 @@ impl RunnerDaemon {
             evicting: Arc::default(),
             last_eviction: Arc::default(),
             probe: Arc::new(admission::HostProbe),
+            metrics: Arc::default(),
         }
     }
 
@@ -474,6 +478,21 @@ impl RunnerDaemon {
             );
         }
         let mut gate = admission::Gate::default();
+        // Bound before anything else, so a taken port stops the runner at once
+        let _metrics = match self.config.metrics_addr()? {
+            Some(addr) => {
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("metrics_listen: cannot listen on {}", addr))?;
+                info!("   Metrics: http://{}/metrics", addr);
+                let daemon = self.clone();
+                Some(AbortOnDrop(tokio::spawn(metrics::serve(
+                    listener,
+                    Arc::new(move || daemon.render_metrics()),
+                ))))
+            }
+            None => None,
+        };
 
         self.executor.sweep_orphans().await;
         let rotation = AbortOnDrop(tokio::spawn(self.clone().rotate_token()));
@@ -521,6 +540,7 @@ impl RunnerDaemon {
                         .unwrap_or("unknown");
                     info!("📦 Received job #{} ({})", job.id, job_name);
 
+                    self.metrics.request(metrics::Request::Job);
                     let daemon = self.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -531,8 +551,12 @@ impl RunnerDaemon {
                     backoff.succeeded();
                     None
                 }
-                Ok(None) => Some(backoff.succeeded()),
+                Ok(None) => {
+                    self.metrics.request(metrics::Request::NoJob);
+                    Some(backoff.succeeded())
+                }
                 Err(e) => {
+                    self.metrics.request(metrics::Request::Error);
                     let wait = backoff.failed();
                     warn!(
                         "Failed to request job: {:#} (retrying in {:.1}s)",
@@ -559,21 +583,27 @@ impl RunnerDaemon {
         Ok(())
     }
 
+    /// The metrics as served on `metrics_listen`
+    fn render_metrics(&self) -> String {
+        let concurrent = self.config.concurrent as usize;
+        self.metrics.render(&metrics::Gauges {
+            running: concurrent.saturating_sub(self.semaphore.available_permits()) as u64,
+            concurrent: concurrent as u64,
+            executor: match self.executor.as_ref() {
+                executor::ExecutorType::Docker(_) => "docker",
+                executor::ExecutorType::Shell(_) => "shell",
+            }
+            .to_string(),
+        })
+    }
+
     /// Whether the host meets the admission limits; changes are logged once
     async fn admit(&self, limits: &admission::Limits, gate: &mut admission::Gate) -> bool {
-        if limits.is_off() {
-            return true;
-        }
-        let mut dirs = vec![self.executor.builds_root()];
-        if self.config.cache_enabled {
-            dirs.push(std::path::PathBuf::from(&self.config.cache_dir));
-        }
-        let (probe, checked) = (self.probe.clone(), limits.clone());
-        // statvfs on a hung network file system must not stall a worker
-        let violations =
-            tokio::task::spawn_blocking(move || admission::check(&checked, probe.as_ref(), &dirs))
-                .await
-                .unwrap_or_default();
+        let violations = if limits.is_off() {
+            Vec::new()
+        } else {
+            self.check_admission(limits).await
+        };
         match gate.update(&violations) {
             Some(admission::Transition::Blocked(reasons)) => {
                 warn!("⏸️  Not taking new jobs: {}", reasons)
@@ -583,7 +613,24 @@ impl RunnerDaemon {
             }
             None => {}
         }
+        for resource in admission::Resource::ALL {
+            self.metrics
+                .set_admission_blocked(resource, gate.is_blocked(resource));
+        }
         violations.is_empty()
+    }
+
+    /// The admission limits the host violates now
+    async fn check_admission(&self, limits: &admission::Limits) -> Vec<admission::Violation> {
+        let mut dirs = vec![self.executor.builds_root()];
+        if self.config.cache_enabled {
+            dirs.push(std::path::PathBuf::from(&self.config.cache_dir));
+        }
+        let (probe, checked) = (self.probe.clone(), limits.clone());
+        // statvfs on a hung network file system must not stall a worker
+        tokio::task::spawn_blocking(move || admission::check(&checked, probe.as_ref(), &dirs))
+            .await
+            .unwrap_or_default()
     }
 
     /// The checked-out project on the host (see `script::project_subdir`)
@@ -844,7 +891,12 @@ impl RunnerDaemon {
         if cancel.state() == RemoteState::Aborted && !stopped_by_shutdown {
             // Canceled in GitLab: it already has the final state and rejects updates
             info!("🛑 Job #{} was canceled", job.id);
+            self.metrics.job_finished(metrics::JobEnd::Canceled);
             return Ok(());
+        }
+        match &outcome {
+            Ok(()) => self.metrics.job_finished(metrics::JobEnd::Success),
+            Err(failure) => self.metrics.job_failed(&failure.reason),
         }
         self.gitlab
             .update_job(job.id, &job.token, state, reason, exit_code)
@@ -969,6 +1021,14 @@ impl RunnerDaemon {
                         .cache
                         .restore(project_id(job), &keys, &workspace, stop)
                         .await;
+                }
+                self.metrics.cache_restore(match &restored {
+                    Ok(restored) if restored.hit.is_some() => metrics::CacheRestore::Hit,
+                    Ok(_) => metrics::CacheRestore::Miss,
+                    Err(_) => metrics::CacheRestore::Error,
+                });
+                if let Ok(restored) = &restored {
+                    self.metrics.cache_s3_errors(restored.warnings.len() as u64);
                 }
                 match restored {
                     Ok(restored) => {
@@ -1272,6 +1332,21 @@ impl RunnerDaemon {
                 }
                 saved = self.cache.save(project_id(job), &key, &workspace, &paths) => saved,
             };
+            if let Ok(Some(saved)) = &saved {
+                match &saved.upload {
+                    Some(Ok(job_cache::Upload::Sent)) => {
+                        self.metrics.cache_upload(metrics::CacheUpload::Sent)
+                    }
+                    Some(Ok(job_cache::Upload::Unchanged)) => {
+                        self.metrics.cache_upload(metrics::CacheUpload::Unchanged)
+                    }
+                    Some(Err(_)) => {
+                        self.metrics.cache_upload(metrics::CacheUpload::Failed);
+                        self.metrics.cache_s3_errors(1);
+                    }
+                    None => {}
+                }
+            }
             match saved {
                 Ok(Some(saved)) => {
                     trace
@@ -2572,6 +2647,70 @@ mod tests {
             .expect("daemon stopped")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn jobs_and_cache_restores_are_counted() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let script = ["mkdir -p out vendor", "echo x > out/a", "echo y > vendor/b"];
+
+        daemon
+            .execute_job(lifecycle_job(61, &script, "on_success"))
+            .await
+            .unwrap();
+        daemon
+            .execute_job(lifecycle_job(62, &script, "on_success"))
+            .await
+            .unwrap();
+        daemon
+            .execute_job(lifecycle_job(63, &["exit 3"], "on_success"))
+            .await
+            .unwrap();
+
+        let text = daemon.render_metrics();
+        for line in [
+            "turboci_jobs_finished_total{result=\"success\"} 2",
+            "turboci_jobs_finished_total{result=\"failed\"} 1",
+            "turboci_jobs_failed_total{reason=\"script_failure\"} 1",
+            // The first job found no cache, the next two the first one's
+            "turboci_cache_restores_total{result=\"miss\"} 1",
+            "turboci_cache_restores_total{result=\"hit\"} 2",
+            "turboci_jobs_running 0",
+            "turboci_concurrent_jobs 4",
+            "turboci_admission_blocked{resource=\"disk\"} 0",
+        ] {
+            assert!(
+                text.lines().any(|l| l == line),
+                "missing {:?} in\n{}",
+                line,
+                text
+            );
+        }
+        assert!(text.contains("executor=\"shell\"} 1"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn a_taken_metrics_port_stops_the_runner_at_start() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap().to_string();
+        let daemon = daemon_with(&server, dir.path(), |config| {
+            config.metrics_listen = Some(addr.clone())
+        })
+        .await;
+
+        let error = tokio::time::timeout(Duration::from_secs(5), daemon.start())
+            .await
+            .expect("start returned")
+            .unwrap_err();
+        assert!(
+            format!("{:#}", error).contains("metrics_listen"),
+            "{:#}",
+            error
+        );
     }
 
     #[test]

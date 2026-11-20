@@ -75,6 +75,19 @@ pub enum Resource {
     Load,
 }
 
+impl Resource {
+    pub const ALL: [Resource; 3] = [Resource::Memory, Resource::Disk, Resource::Load];
+
+    /// Label value in metrics
+    pub fn name(self) -> &'static str {
+        match self {
+            Resource::Memory => "memory",
+            Resource::Disk => "disk",
+            Resource::Load => "load",
+        }
+    }
+}
+
 /// A limit the host does not meet right now
 #[derive(Debug, Clone, PartialEq)]
 pub struct Violation {
@@ -228,6 +241,10 @@ impl Gate {
                     .join("; "),
             )
         })
+    }
+
+    pub fn is_blocked(&self, resource: Resource) -> bool {
+        self.blocked.contains(&resource)
     }
 }
 
@@ -393,6 +410,8 @@ mod tests {
             gate.update(&[violation(Resource::Disk, "disk full")]),
             Some(Transition::Blocked("disk full".to_string()))
         );
+        assert!(gate.is_blocked(Resource::Disk));
+        assert!(!gate.is_blocked(Resource::Load));
         // Still blocked by the same resource, with other numbers: no new line
         assert_eq!(
             gate.update(&[violation(Resource::Disk, "disk still full")]),
