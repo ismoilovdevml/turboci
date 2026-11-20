@@ -186,6 +186,142 @@ fn service_ports(config: Option<&bollard::models::ContainerConfig>) -> Vec<u16> 
     ports
 }
 
+/// How long a service may take to accept connections, like gitlab-runner
+const SERVICE_WAIT: Duration = Duration::from_secs(30);
+/// Pause between connection attempts: a service that is ready after 1.1s
+/// must not hold the job until the next full second
+const SERVICE_POLL: Duration = Duration::from_millis(200);
+/// Limit of one connection attempt (like `nc -w1`)
+const SERVICE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A service to wait for: its container name (its host name on the job
+/// network), the TCP ports that show it is up and, when the runner's host
+/// can reach the job network, its address there
+struct ServiceCheck {
+    host: String,
+    ports: Vec<u16>,
+    address: Option<std::net::IpAddr>,
+}
+
+/// The warning for a service that did not accept connections in time
+fn service_timeout_warning(check: &ServiceCheck) -> String {
+    format!(
+        "WARNING: service {} (port {}) did not respond within {}s",
+        check.host,
+        check
+            .ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        SERVICE_WAIT.as_secs()
+    )
+}
+
+/// What one connection attempt to a service port showed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortProbe {
+    /// Accepted: the service is up
+    Open,
+    /// Refused or reset by the service's own network stack: it is reachable,
+    /// but nothing listens on the port yet
+    Closed,
+    /// No answer in time, no route, or any other error: the host may not
+    /// reach the job network at all
+    Silent,
+}
+
+impl PortProbe {
+    fn of_error(error: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        match error.kind() {
+            ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted => PortProbe::Closed,
+            _ => PortProbe::Silent,
+        }
+    }
+}
+
+/// Try to connect to `address` once
+async fn probe_port(address: std::net::SocketAddr) -> PortProbe {
+    match tokio::time::timeout(
+        SERVICE_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    {
+        Ok(Ok(_)) => PortProbe::Open,
+        Ok(Err(e)) => PortProbe::of_error(&e),
+        Err(_) => PortProbe::Silent,
+    }
+}
+
+/// How waiting for a service from the runner's host ended
+#[derive(Debug, PartialEq, Eq)]
+enum HostWait {
+    Ready,
+    TimedOut,
+    /// The first attempt neither connected nor was refused: the host does not
+    /// reach the service, which has to be checked from the job network
+    Unreachable,
+}
+
+/// Wait from the runner's host until one of `ports` at `ip` accepts
+/// connections (docker:dind exposes 2376 for TLS even when it only listens
+/// on 2375), for up to `timeout`
+async fn wait_from_host(ip: std::net::IpAddr, ports: &[u16], timeout: Duration) -> HostWait {
+    let give_up = Instant::now() + timeout;
+    let mut first = true;
+    loop {
+        let probes = futures_util::future::join_all(
+            ports
+                .iter()
+                .map(|&port| probe_port(std::net::SocketAddr::new(ip, port))),
+        )
+        .await;
+        if probes.contains(&PortProbe::Open) {
+            return HostWait::Ready;
+        }
+        // Later on, a service that stops answering for a moment (busy
+        // booting) is only not ready yet
+        if first && !probes.contains(&PortProbe::Closed) {
+            return HostWait::Unreachable;
+        }
+        first = false;
+        if Instant::now() >= give_up {
+            return HostWait::TimedOut;
+        }
+        tokio::time::sleep(SERVICE_POLL).await;
+    }
+}
+
+/// Whether `gateway`, the job network's address on its bridge, belongs to
+/// this host: the network is then a bridge here, whose containers the runner
+/// reaches directly. Not with Docker Desktop, a remote or rootless daemon or
+/// rootless Podman, whose networks are in another machine or namespace.
+fn bridge_is_local(gateway: std::net::IpAddr) -> bool {
+    // Binding succeeds only to an address of one of the host's interfaces
+    cfg!(target_os = "linux") && std::net::UdpSocket::bind((gateway, 0)).is_ok()
+}
+
+/// The service's address on `network` when the runner's host reaches it
+fn host_reachable_address(
+    info: &bollard::models::ContainerInspectResponse,
+    network: &str,
+) -> Option<std::net::IpAddr> {
+    let endpoint = info
+        .network_settings
+        .as_ref()?
+        .networks
+        .as_ref()?
+        .get(network)?;
+    let parse = |value: &Option<String>| value.as_deref()?.parse::<std::net::IpAddr>().ok();
+    let gateway = parse(&endpoint.gateway)?;
+    let address = parse(&endpoint.ip_address)?;
+    bridge_is_local(gateway).then_some(address)
+}
+
 /// `uid:gid` owning a host directory, to run a helper as that user
 fn workspace_owner(dir: &Path) -> Option<String> {
     #[cfg(unix)]
@@ -950,7 +1086,10 @@ impl DockerExecutor {
 
     /// Wait until the services' exposed TCP ports accept connections, like
     /// gitlab-runner (up to 30s each, then a warning), so scripts do not start
-    /// against a database that is still booting
+    /// against a database that is still booting. Services are checked in
+    /// parallel, from the runner's host when it reaches the job network,
+    /// otherwise from a container on that network. Returns how many services
+    /// were checked from a container.
     async fn wait_for_services(
         &self,
         job_id: u64,
@@ -958,7 +1097,7 @@ impl DockerExecutor {
         services: &[String],
         trace: &mut TraceWriter<'_>,
         limits: &Limits<'_>,
-    ) {
+    ) -> usize {
         let mut checks = Vec::new();
         for id in services {
             let Ok(info) = self
@@ -971,43 +1110,91 @@ impl DockerExecutor {
             else {
                 continue;
             };
-            let host = info
-                .name
-                .unwrap_or_default()
-                .trim_start_matches('/')
-                .to_string();
             let ports = service_ports(info.config.as_ref());
             if ports.is_empty() {
                 continue;
             }
-            // Like gitlab-runner: the service is up once any of its ports
-            // accepts connections (docker:dind exposes 2376 for TLS even when
-            // it only listens on 2375). Services are checked in parallel.
-            let any_port = ports
-                .iter()
-                .map(|port| format!("nc -z -w1 {} {}", host, port))
-                .collect::<Vec<_>>()
-                .join(" || ");
-            // Polled every 0.2s (150 tries = 30s): a service that is ready
-            // after 1.1s must not hold the job until the next full second
-            checks.push(format!(
-                "( i=0; until {any_port}; do i=$((i+1)); \
-                 if [ $i -ge 150 ]; then echo \"WARNING: service {host} (port {ports}) did not respond within 30s\"; break; fi; \
-                 sleep 0.2; done ) &",
-                ports = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", "),
-            ));
+            checks.push(ServiceCheck {
+                host: info
+                    .name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim_start_matches('/')
+                    .to_string(),
+                address: host_reachable_address(&info, network),
+                ports,
+            });
         }
-        checks.push("wait".to_string());
-        if checks.len() == 1 {
-            return;
+        if checks.is_empty() {
+            return 0;
         }
         trace
             .write("Waiting for services to be up and running (timeout 30 seconds)...\n")
             .await;
+        let from_host = futures_util::future::join_all(checks.iter().map(|check| async move {
+            match check.address {
+                Some(ip) => wait_from_host(ip, &check.ports, SERVICE_WAIT).await,
+                None => HostWait::Unreachable,
+            }
+        }));
+        // Stopped by the job timeout or a cancel, which the caller reports
+        let Ok(waited) = limits.bound(from_host).await else {
+            return 0;
+        };
+        let mut unreachable = Vec::new();
+        for (check, waited) in checks.iter().zip(waited) {
+            match waited {
+                HostWait::Ready => {}
+                HostWait::TimedOut => {
+                    trace
+                        .write(&format!("{}\n", service_timeout_warning(check)))
+                        .await
+                }
+                HostWait::Unreachable => unreachable.push(check),
+            }
+        }
+        if !unreachable.is_empty() {
+            self.wait_in_container(job_id, network, &unreachable, trace, limits)
+                .await;
+        }
+        unreachable.len()
+    }
+
+    /// `wait_for_services` for `checks`, from a short-lived helper container
+    /// on the job network
+    async fn wait_in_container(
+        &self,
+        job_id: u64,
+        network: &str,
+        checks: &[&ServiceCheck],
+        trace: &mut TraceWriter<'_>,
+        limits: &Limits<'_>,
+    ) {
+        let tries = SERVICE_WAIT.as_millis() / SERVICE_POLL.as_millis();
+        let mut script: Vec<String> = checks
+            .iter()
+            .map(|check| {
+                // The service is up once any of its ports accepts connections
+                let any_port = check
+                    .ports
+                    .iter()
+                    .map(|port| format!("nc -z -w1 {} {}", check.host, port))
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                format!(
+                    "( i=0; until {any_port}; do i=$((i+1)); \
+                     if [ $i -ge {tries} ]; then echo {warning}; break; fi; \
+                     sleep {poll}; done ) &",
+                    warning = script::quote(&service_timeout_warning(check)),
+                    poll = SERVICE_POLL.as_secs_f64(),
+                )
+            })
+            .collect();
+        script.push("wait".to_string());
         match self
             .run_helper(
                 &format!("turboci-job-{}-svc-wait", job_id),
-                &checks.join("\n"),
+                &script.join("\n"),
                 HostConfig {
                     network_mode: Some(network.to_string()),
                     ..Default::default()
@@ -2117,6 +2304,103 @@ mod tests {
         assert_eq!(executor.pulls.len(), 0);
     }
 
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_service_ports_are_probed_from_the_host_or_a_container() {
+        let owner = format!("svc-wait-test-{}", std::process::id());
+        let executor = DockerExecutor::new(DockerConfig::default())
+            .unwrap()
+            .with_owner(&owner);
+        executor.pull_if_missing("redis:7-alpine").await.unwrap();
+        let job_id = 913_000_000 + u64::from(std::process::id());
+        let network = format!("turboci-job-{}", job_id);
+        executor.create_network(&network).await.unwrap();
+        let j = job(serde_json::json!({"id": job_id, "token": "t"}));
+        let start_service = |index: usize| {
+            let executor = &executor;
+            let j = &j;
+            let network = &network;
+            async move {
+                let service: crate::gitlab::Service = serde_json::from_value(serde_json::json!({
+                    "name": "redis:7-alpine",
+                    "command": ["sh", "-c", "sleep 2; exec redis-server"]
+                }))
+                .unwrap();
+                let id = executor
+                    .create_service(
+                        j,
+                        &format!("turboci-job-{}-svc-{}", job_id, index),
+                        "redis:7-alpine",
+                        &service,
+                        &std::collections::HashMap::new(),
+                        executor.host_config(Vec::new(), Some(network.as_str())),
+                    )
+                    .await
+                    .unwrap();
+                executor
+                    .docker
+                    .start_container(
+                        &id,
+                        None::<bollard::container::StartContainerOptions<String>>,
+                    )
+                    .await
+                    .unwrap();
+                id
+            }
+        };
+        let cancel = CancelSignal::default();
+        let limits = Limits {
+            deadline: Instant::now() + Duration::from_secs(120),
+            cancel: &cancel,
+            stop_at: RemoteState::Canceling,
+        };
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        // From the host, which reaches a local bridge (Linux)
+        let first = start_service(0).await;
+        let started = Instant::now();
+        let in_container = executor
+            .wait_for_services(
+                job_id,
+                &network,
+                std::slice::from_ref(&first),
+                &mut trace,
+                &limits,
+            )
+            .await;
+        let host_wait = started.elapsed();
+
+        // From a container on the job network, as without a local bridge
+        let second = start_service(1).await;
+        let started = Instant::now();
+        let check = ServiceCheck {
+            host: format!("turboci-job-{}-svc-1", job_id),
+            ports: vec![6379],
+            address: None,
+        };
+        executor
+            .wait_in_container(job_id, &network, &[&check], &mut trace, &limits)
+            .await;
+        let container_wait = started.elapsed();
+        trace.finish().await;
+        let log = trace.text();
+
+        for id in [&first, &second] {
+            executor.force_remove(id).await.unwrap();
+        }
+        executor.docker.remove_network(&network).await.unwrap();
+        assert_eq!(in_container, 0, "{}", log);
+        assert!(host_wait >= Duration::from_millis(1500), "{:?}", host_wait);
+        assert!(
+            container_wait >= Duration::from_millis(1500),
+            "{:?}",
+            container_wait
+        );
+        assert!(log.contains("Waiting for services"), "{}", log);
+        assert!(!log.contains("WARNING"), "{}", log);
+    }
+
     /// An executor with alpine:3.20 already present: the job timeout includes
     /// image pulls, which short timeouts in tests must not depend on
     async fn with_alpine_pulled() -> ExecutorType {
@@ -2620,6 +2904,134 @@ mod tests {
         let unset = offline(DockerConfig::default());
         let job = unset.job_host_config(Vec::new(), None);
         assert!(job.cpu_shares.is_none() && job.tmpfs.is_none() && job.storage_opt.is_none());
+    }
+
+    #[test]
+    fn port_probe_errors_tell_closed_from_unreachable() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            assert_eq!(PortProbe::of_error(&Error::from(kind)), PortProbe::Closed);
+        }
+        for kind in [
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::TimedOut,
+            ErrorKind::PermissionDenied,
+        ] {
+            assert_eq!(PortProbe::of_error(&Error::from(kind)), PortProbe::Silent);
+        }
+    }
+
+    /// A local port nothing listens on
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[tokio::test]
+    async fn host_wait_is_ready_once_any_port_accepts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open = listener.local_addr().unwrap().port();
+        let localhost = std::net::IpAddr::from([127, 0, 0, 1]);
+
+        let waited = wait_from_host(localhost, &[closed_port(), open], SERVICE_WAIT).await;
+
+        assert_eq!(waited, HostWait::Ready);
+    }
+
+    #[tokio::test]
+    async fn host_wait_keeps_trying_a_refusing_port_until_it_opens_or_times_out() {
+        let localhost = std::net::IpAddr::from([127, 0, 0, 1]);
+        let started = Instant::now();
+        let waited = wait_from_host(localhost, &[closed_port()], Duration::from_millis(500)).await;
+        assert_eq!(waited, HostWait::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(500));
+
+        // The service starts listening after a few attempts
+        let port = closed_port();
+        let late = async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap()
+        };
+        let ports = [port];
+        let (waited, _listener) =
+            tokio::join!(wait_from_host(localhost, &ports, SERVICE_WAIT), late);
+        assert_eq!(waited, HostWait::Ready);
+    }
+
+    #[tokio::test]
+    async fn host_wait_gives_up_at_once_on_an_address_it_cannot_reach() {
+        // TEST-NET-1 is never assigned: no route, or no answer
+        let unreachable = std::net::IpAddr::from([192, 0, 2, 1]);
+        let started = Instant::now();
+
+        let waited = wait_from_host(unreachable, &[5432], SERVICE_WAIT).await;
+
+        assert_eq!(waited, HostWait::Unreachable);
+        assert!(started.elapsed() < SERVICE_CONNECT_TIMEOUT + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn only_bridges_of_this_host_are_reached_directly() {
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(
+            bridge_is_local(std::net::IpAddr::from([127, 0, 0, 1])),
+            linux
+        );
+        assert!(!bridge_is_local(std::net::IpAddr::from([192, 0, 2, 1])));
+
+        let inspected = |gateway: &str| bollard::models::ContainerInspectResponse {
+            network_settings: Some(bollard::models::NetworkSettings {
+                networks: Some(std::collections::HashMap::from([(
+                    "turboci-job-1".to_string(),
+                    bollard::models::EndpointSettings {
+                        gateway: Some(gateway.to_string()),
+                        ip_address: Some("127.0.0.2".to_string()),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let local = inspected("127.0.0.1");
+        assert_eq!(
+            host_reachable_address(&local, "turboci-job-1"),
+            linux.then(|| std::net::IpAddr::from([127, 0, 0, 2]))
+        );
+        assert_eq!(host_reachable_address(&local, "bridge"), None);
+        assert_eq!(
+            host_reachable_address(&inspected("192.0.2.1"), "turboci-job-1"),
+            None
+        );
+        assert_eq!(
+            host_reachable_address(&inspected(""), "turboci-job-1"),
+            None
+        );
+    }
+
+    #[test]
+    fn service_warnings_name_the_service_and_its_ports() {
+        let check = ServiceCheck {
+            host: "turboci-job-1-svc-0".to_string(),
+            ports: vec![2375, 2376],
+            address: None,
+        };
+        assert_eq!(
+            service_timeout_warning(&check),
+            "WARNING: service turboci-job-1-svc-0 (port 2375, 2376) did not respond within 30s"
+        );
     }
 
     #[test]

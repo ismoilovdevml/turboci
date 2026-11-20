@@ -25,7 +25,7 @@ lists what a runner has to do, and how TurboCI does it.
 |---|---|
 | `image:name`, `entrypoint` | The job image needs no `git`: sources are checked out by a helper container |
 | `image:pull_policy` | Honoured when listed in [`allowed_pull_policies`](configuration.md#docker) |
-| `services` | Own network per job; reachable by name-derived aliases and `alias`; `variables`, `command`, `entrypoint` per service. The script starts once service ports accept connections (up to 30 s) |
+| `services` | Own network per job; reachable by name-derived aliases and `alias`; `variables`, `command`, `entrypoint` per service. The script starts once service ports accept connections (up to 30 s), checked from the runner's host when it reaches the job network (Linux with a local dockerd), otherwise from a short-lived helper container on that network |
 | Private images | `DOCKER_AUTH_CONFIG`, the runner's Docker `config.json`, or GitLab's registry credentials; see [private registries](configuration.md#private-registries) |
 | Runner services | Services from the runner config start for every job, e.g. Docker-in-Docker; see [services for every job](configuration.md#services-for-every-job) |
 
