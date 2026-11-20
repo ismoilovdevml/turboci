@@ -49,7 +49,7 @@ impl ShellExecutor {
         job: &Job,
         deadline: Instant,
         trace: &mut TraceWriter<'_>,
-        restore: &dyn Restore,
+        restore: &impl Restore,
     ) -> JobOutcome {
         trace.write("Using Shell executor...\n").await;
 
@@ -87,7 +87,6 @@ struct ShellRunner {
     env: Vec<(String, String)>,
 }
 
-#[async_trait]
 impl ScriptRunner for ShellRunner {
     async fn run(
         &self,

@@ -7,7 +7,6 @@
 #![allow(deprecated)]
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{ContainerCreateBody, HostConfig};
@@ -131,7 +130,7 @@ impl ExecutorType {
         &self,
         job: &Job,
         trace: &mut TraceWriter<'_>,
-        restore: &dyn Restore,
+        restore: &impl Restore,
     ) -> JobOutcome {
         use futures_util::FutureExt;
 
@@ -272,9 +271,13 @@ async fn remove_dir(dir: &Path) -> bool {
 /// checked out and before the scripts run (gitlab-runner's order: otherwise
 /// `git checkout -f` would revert restored tracked files). Extractions end
 /// once `stop` is set.
-#[async_trait]
 pub trait Restore: Send + Sync {
-    async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>, stop: &Stop) -> JobOutcome;
+    fn restore(
+        &self,
+        job: &Job,
+        trace: &mut TraceWriter<'_>,
+        stop: &Stop,
+    ) -> impl std::future::Future<Output = JobOutcome> + Send;
 }
 
 /// Nothing to restore
@@ -282,7 +285,6 @@ pub trait Restore: Send + Sync {
 pub struct NoRestore;
 
 #[cfg(test)]
-#[async_trait]
 impl Restore for NoRestore {
     async fn restore(&self, _job: &Job, _trace: &mut TraceWriter<'_>, _stop: &Stop) -> JobOutcome {
         Ok(())
@@ -353,19 +355,20 @@ fn job_timeout(job: &Job) -> Duration {
 }
 
 /// How an executor runs a shell script in a directory, streaming output to the trace
-#[async_trait]
 trait ScriptRunner: Send + Sync {
-    async fn run(
+    fn run(
         &self,
         script: &str,
         workdir: &str,
         trace: &mut TraceWriter<'_>,
         limits: &Limits<'_>,
-    ) -> Result<RunStatus>;
+    ) -> impl std::future::Future<Output = Result<RunStatus>> + Send;
 
     /// Called once getting sources has ended, after which the job's sources
     /// runner is not used again
-    async fn sources_done(&self) {}
+    fn sources_done(&self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// Directories as the job sees them
@@ -380,11 +383,11 @@ struct JobDirs {
 async fn run_job_steps(
     job: &Job,
     deadline: Instant,
-    sources: &dyn ScriptRunner,
-    runner: &dyn ScriptRunner,
+    sources: &impl ScriptRunner,
+    runner: &impl ScriptRunner,
     trace: &mut TraceWriter<'_>,
     dirs: &JobDirs,
-    restore: &dyn Restore,
+    restore: &impl Restore,
 ) -> JobOutcome {
     let cancel = trace.cancel();
     let canceled = || RunError::Canceled.failure(job);
@@ -408,7 +411,8 @@ async fn run_job_steps(
         // extraction still writes to the workspace while after_script, the
         // saves and the cleanup run.
         let stop = Stop::default();
-        let mut restoring = restore.restore(job, trace, &stop);
+        let restoring = restore.restore(job, trace, &stop);
+        tokio::pin!(restoring);
         let interrupted = tokio::select! {
             restored = &mut restoring => {
                 failure = restored.err();
@@ -601,7 +605,7 @@ impl RunError {
 
 async fn get_sources(
     job: &Job,
-    runner: &dyn ScriptRunner,
+    runner: &impl ScriptRunner,
     trace: &mut TraceWriter<'_>,
     dirs: &JobDirs,
     limits: &Limits<'_>,
@@ -634,7 +638,7 @@ async fn run_hook(
     job: &Job,
     name: &str,
     dir: &str,
-    runner: &dyn ScriptRunner,
+    runner: &impl ScriptRunner,
     trace: &mut TraceWriter<'_>,
     limits: &Limits<'_>,
 ) -> std::result::Result<(), RunError> {
@@ -661,7 +665,7 @@ async fn run_hook(
 
 async fn checkout(
     job: &Job,
-    runner: &dyn ScriptRunner,
+    runner: &impl ScriptRunner,
     trace: &mut TraceWriter<'_>,
     dirs: &JobDirs,
     limits: &Limits<'_>,
@@ -923,7 +927,7 @@ mod tests {
         job: &Job,
         work_dir: &Path,
         state: RemoteState,
-        restore: &dyn Restore,
+        restore: &impl Restore,
     ) -> (JobOutcome, String) {
         let executor = ExecutorType::Shell(ShellExecutor::new(Some(
             work_dir.to_string_lossy().into_owned(),
@@ -980,7 +984,6 @@ mod tests {
     /// stuck in the network: only the grace period ends it
     struct EndlessRestore;
 
-    #[async_trait]
     impl Restore for EndlessRestore {
         async fn restore(
             &self,
@@ -1050,7 +1053,6 @@ mod tests {
         into: PathBuf,
     }
 
-    #[async_trait]
     impl Restore for ExtractRestore {
         async fn restore(
             &self,
@@ -1146,7 +1148,6 @@ mod tests {
     /// Writes a new VERSION into the project, like an artifact from an earlier job
     struct BumpVersion(PathBuf);
 
-    #[async_trait]
     impl Restore for BumpVersion {
         async fn restore(
             &self,
@@ -1378,7 +1379,6 @@ mod tests {
         events: &'a std::sync::Mutex<Vec<String>>,
     }
 
-    #[async_trait]
     impl ScriptRunner for Recorder<'_> {
         async fn run(
             &self,

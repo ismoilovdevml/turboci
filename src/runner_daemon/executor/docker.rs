@@ -325,7 +325,7 @@ impl DockerExecutor {
         job_dir: &Path,
         deadline: Instant,
         trace: &mut TraceWriter<'_>,
-        restore: &dyn Restore,
+        restore: &impl Restore,
     ) -> JobOutcome {
         use futures_util::FutureExt;
 
@@ -353,7 +353,7 @@ impl DockerExecutor {
         deadline: Instant,
         trace: &mut TraceWriter<'_>,
         containers: &mut JobContainers,
-        restore: &dyn Restore,
+        restore: &impl Restore,
     ) -> JobOutcome {
         // Like the scripts, pulls and service startup stop at the job timeout
         // and once the job is being canceled
@@ -1206,7 +1206,6 @@ impl DockerRunner<'_> {
     }
 }
 
-#[async_trait]
 impl ScriptRunner for DockerRunner<'_> {
     async fn sources_done(&self) {
         if self.sources_only {

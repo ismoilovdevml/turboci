@@ -201,7 +201,6 @@ struct WorkspaceRestore<'a> {
     variables: &'a Variables,
 }
 
-#[async_trait::async_trait]
 impl executor::Restore for WorkspaceRestore<'_> {
     async fn restore(&self, job: &Job, trace: &mut TraceWriter<'_>, stop: &Stop) -> JobOutcome {
         self.daemon

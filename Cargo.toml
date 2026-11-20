@@ -24,7 +24,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 glob = "0.3"
 regex = "1"
 aho-corasick = "1.1.5"
-async-trait = "0.1"
 # One deflate backend (zlib-rs) for flate2 and zip; zip's "deflate" would add
 # miniz_oxide and zopfli, which only serves compression levels above 9.
 # runtime_detection lets zlib-rs pick SSE/AVX2 code paths on x86_64.
