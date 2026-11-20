@@ -8,8 +8,10 @@
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::time::Sleep;
 use tracing::warn;
 
 use super::cancel::CancelSignal;
@@ -144,6 +146,14 @@ impl<'a> TraceWriter<'a> {
     pub async fn section_end(&mut self, name: &str) {
         self.write(&format!("{}\x1b[0K", section_marker("end", name)))
             .await;
+    }
+
+    /// When pending output is due for sending: the update interval GitLab asked
+    /// for after the last flush. `None` while there is nothing to send, so a
+    /// quiet job is not woken; GitLab learns it is alive from the job heartbeat,
+    /// not from trace updates.
+    pub fn next_flush_at(&self) -> Option<Instant> {
+        (self.sent < self.len()).then(|| self.last_flush + self.update_interval)
     }
 
     /// Send pending output once the update interval has passed
@@ -358,6 +368,31 @@ impl<'a> TraceWriter<'a> {
                 .max(needed);
             self.tail.reserve_exact(target - self.tail.len());
         }
+    }
+}
+
+/// Wakes an output loop when its trace has output due, instead of a ticker
+/// that also wakes a quiet one. A `select!` branch of the loop is
+/// `_ = flush.wait(trace.next_flush_at()) => trace.flush().await`.
+#[derive(Default)]
+pub struct FlushTimer {
+    sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl FlushTimer {
+    /// Completes at `due`, never for `None`. Cancel safe; the timer is reset
+    /// only when `due` changes, not for every chunk of output.
+    pub async fn wait(&mut self, due: Option<Instant>) {
+        let Some(due) = due.map(tokio::time::Instant::from_std) else {
+            return std::future::pending().await;
+        };
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(due)));
+        if sleep.deadline() != due {
+            sleep.as_mut().reset(due);
+        }
+        sleep.as_mut().await;
     }
 }
 
@@ -598,6 +633,131 @@ mod tests {
 
         trace.last_flush -= Duration::from_secs(31);
         trace.flush_if_due().await;
+        assert_eq!(patches(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn flush_is_due_only_with_output_to_send() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(
+                ResponseTemplate::new(202).insert_header("X-GitLab-Trace-Update-Interval", "30"),
+            )
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
+        assert_eq!(trace.next_flush_at(), None);
+
+        trace.write("first\n").await;
+        assert_eq!(
+            trace.next_flush_at(),
+            Some(trace.last_flush + DEFAULT_UPDATE_INTERVAL)
+        );
+        assert!(trace.flush().await);
+        assert_eq!(trace.next_flush_at(), None);
+
+        // The interval GitLab asked for
+        trace.write("second\n").await;
+        assert_eq!(
+            trace.next_flush_at(),
+            Some(trace.last_flush + Duration::from_secs(30))
+        );
+    }
+
+    /// An executor's output loop: output arrives on `output` until it closes
+    async fn output_loop(
+        trace: &mut TraceWriter<'_>,
+        mut output: tokio::sync::mpsc::Receiver<&'static str>,
+    ) -> Vec<Duration> {
+        let started = Instant::now();
+        let mut flush = FlushTimer::default();
+        let mut flushes = Vec::new();
+        loop {
+            tokio::select! {
+                text = output.recv() => match text {
+                    Some(text) => trace.write(text).await,
+                    None => return flushes,
+                },
+                _ = flush.wait(trace.next_flush_at()) => {
+                    flushes.push(started.elapsed());
+                    trace.flush().await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_job_is_not_flushed_and_pending_output_is_sent_on_time() {
+        let server = MockServer::start().await;
+        accept_all(&server).await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
+        trace.update_interval = Duration::from_millis(300);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let script = tokio::spawn(async move {
+            tx.send("one line\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            tx.send("last line\n").await.unwrap();
+            // Quiet for several update intervals
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        });
+        let flushes = output_loop(&mut trace, rx).await;
+        script.await.unwrap();
+
+        // Each line once the interval since the last flush passed, then nothing
+        // while the job is quiet
+        assert_eq!(flushes.len(), 2, "{:?}", flushes);
+        assert!(flushes[0] >= Duration::from_millis(250), "{:?}", flushes);
+        assert!(flushes[0] < Duration::from_millis(400), "{:?}", flushes);
+        assert!(flushes[1] >= Duration::from_millis(550), "{:?}", flushes);
+        assert!(flushes[1] < Duration::from_millis(1000), "{:?}", flushes);
+        assert_eq!(
+            patches(&server).await,
+            vec![
+                ("0-8".to_string(), "one line\n".to_string()),
+                ("9-18".to_string(), "last line\n".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_timer_follows_the_update_interval() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(
+                ResponseTemplate::new(202).insert_header("X-GitLab-Trace-Update-Interval", "1"),
+            )
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
+        let mut flush = FlushTimer::default();
+
+        trace.write("first\n").await;
+        trace.flush().await;
+        assert_eq!(trace.update_interval, Duration::from_secs(1));
+        // Nothing pending: the timer never fires
+        let quiet = tokio::time::timeout(
+            Duration::from_millis(1500),
+            flush.wait(trace.next_flush_at()),
+        );
+        assert!(quiet.await.is_err());
+
+        trace.last_flush = Instant::now();
+        trace.write("second\n").await;
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(3), flush.wait(trace.next_flush_at()))
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(950), "{:?}", waited);
+        assert!(waited < Duration::from_millis(1500), "{:?}", waited);
+        trace.flush().await;
         assert_eq!(patches(&server).await.len(), 2);
     }
 

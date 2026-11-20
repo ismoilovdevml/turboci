@@ -1248,7 +1248,7 @@ impl ScriptRunner for DockerRunner<'_> {
             let deadline = tokio::time::sleep_until(limits.deadline);
             let cancel = limits.cancel.reached(limits.stop_at);
             tokio::pin!(deadline, cancel);
-            let mut flush = flush_interval();
+            let mut flush = FlushTimer::default();
             loop {
                 let next = tokio::select! {
                     next = output.next() => next,
@@ -1261,8 +1261,8 @@ impl ScriptRunner for DockerRunner<'_> {
                         return Ok(RunStatus::Canceled);
                     }
                     // A quiet script must not keep its last lines from GitLab
-                    _ = flush.tick() => {
-                        trace.flush_if_due().await;
+                    _ = flush.wait(trace.next_flush_at()) => {
+                        trace.flush().await;
                         continue;
                     }
                 };

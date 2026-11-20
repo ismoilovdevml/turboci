@@ -121,11 +121,12 @@ impl ScriptRunner for ShellRunner {
         let deadline = tokio::time::sleep_until(limits.deadline);
         let cancel = limits.cancel.reached(limits.stop_at);
         tokio::pin!(deadline, cancel);
-        let mut flush = flush_interval();
+        let mut flush = FlushTimer::default();
         while out_open || err_open {
             tokio::select! {
-                _ = flush.tick() => {
-                    trace.flush_if_due().await;
+                // A quiet script must not keep its last lines from GitLab
+                _ = flush.wait(trace.next_flush_at()) => {
+                    trace.flush().await;
                 }
                 n = out.read(&mut out_buf), if out_open => match n? {
                     0 => out_open = false,

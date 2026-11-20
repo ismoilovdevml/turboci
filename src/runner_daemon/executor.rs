@@ -26,7 +26,7 @@ use super::config::DockerConfig;
 use super::git::{self, GitStrategy};
 use super::image::{self, PullPolicy};
 use super::script::{self, JobEnv};
-use super::trace::TraceWriter;
+use super::trace::{FlushTimer, TraceWriter};
 use crate::gitlab::{FailureReason, Job, RemoteState};
 
 mod docker;
@@ -44,17 +44,6 @@ const DEFAULT_AFTER_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
 /// `[[ ]]`, `source` and arrays
 const SHELL_DETECT: &str =
     r#"if command -v bash >/dev/null 2>&1; then exec bash -c "$1"; fi; exec sh -c "$1""#;
-
-/// How often a quiet script's pending output is checked for sending
-const TRACE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Ticks every TRACE_FLUSH_INTERVAL while a script runs. A tick that comes
-/// late (a slow trace upload) is not made up for with a burst of ticks.
-fn flush_interval() -> tokio::time::Interval {
-    let mut flush = tokio::time::interval(TRACE_FLUSH_INTERVAL);
-    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    flush
-}
 
 /// Upper bound for resetting workspace ownership after a job
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
