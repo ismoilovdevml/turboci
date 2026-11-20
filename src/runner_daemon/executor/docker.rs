@@ -1110,11 +1110,19 @@ impl ScriptRunner for DockerRunner<'_> {
         if let StartExecResults::Attached { mut output, .. } =
             self.docker.start_exec(&exec.id, None).await?
         {
-            let mut flush = tokio::time::interval(TRACE_FLUSH_INTERVAL);
+            // Created once, not for every chunk of output
+            let deadline = tokio::time::sleep_until(limits.deadline);
+            let cancel = limits.cancel.reached(limits.stop_at);
+            tokio::pin!(deadline, cancel);
+            let mut flush = flush_interval();
             loop {
                 let next = tokio::select! {
-                    next = tokio::time::timeout_at(limits.deadline, output.next()) => next,
-                    _ = limits.cancel.reached(limits.stop_at) => {
+                    next = output.next() => next,
+                    _ = &mut deadline => {
+                        self.stop_scripts().await;
+                        return Ok(RunStatus::TimedOut);
+                    }
+                    _ = &mut cancel => {
                         self.stop_scripts().await;
                         return Ok(RunStatus::Canceled);
                     }
@@ -1124,15 +1132,8 @@ impl ScriptRunner for DockerRunner<'_> {
                         continue;
                     }
                 };
-                let chunk = match next {
-                    Err(_) => {
-                        self.stop_scripts().await;
-                        return Ok(RunStatus::TimedOut);
-                    }
-                    Ok(None) => break,
-                    Ok(Some(chunk)) => chunk?,
-                };
-                let text = match chunk {
+                let Some(chunk) = next else { break };
+                let text = match chunk? {
                     LogOutput::StdErr { message } => stderr.decode(&message),
                     LogOutput::StdOut { message } | LogOutput::Console { message } => {
                         stdout.decode(&message)

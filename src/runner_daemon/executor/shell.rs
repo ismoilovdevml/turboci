@@ -116,7 +116,11 @@ impl ScriptRunner for ShellRunner {
         let (mut out_open, mut err_open) = (true, true);
         let (mut stdout, mut stderr) = (Utf8Decoder::default(), Utf8Decoder::default());
 
-        let mut flush = tokio::time::interval(TRACE_FLUSH_INTERVAL);
+        // Created once, not for every chunk of output: both loops below wait on them
+        let deadline = tokio::time::sleep_until(limits.deadline);
+        let cancel = limits.cancel.reached(limits.stop_at);
+        tokio::pin!(deadline, cancel);
+        let mut flush = flush_interval();
         while out_open || err_open {
             tokio::select! {
                 _ = flush.tick() => {
@@ -130,12 +134,12 @@ impl ScriptRunner for ShellRunner {
                     0 => err_open = false,
                     n => trace.write(&stderr.decode(&err_buf[..n])).await,
                 },
-                _ = tokio::time::sleep_until(limits.deadline) => {
+                _ = &mut deadline => {
                     kill_process_group(pid);
                     let _ = child.wait().await;
                     return Ok(RunStatus::TimedOut);
                 }
-                _ = limits.cancel.reached(limits.stop_at) => {
+                _ = &mut cancel => {
                     kill_process_group(pid);
                     let _ = child.wait().await;
                     return Ok(RunStatus::Canceled);
@@ -147,12 +151,12 @@ impl ScriptRunner for ShellRunner {
 
         let status = tokio::select! {
             status = child.wait() => status?,
-            _ = tokio::time::sleep_until(limits.deadline) => {
+            _ = &mut deadline => {
                 kill_process_group(pid);
                 let _ = child.wait().await;
                 return Ok(RunStatus::TimedOut);
             }
-            _ = limits.cancel.reached(limits.stop_at) => {
+            _ = &mut cancel => {
                 kill_process_group(pid);
                 let _ = child.wait().await;
                 return Ok(RunStatus::Canceled);
