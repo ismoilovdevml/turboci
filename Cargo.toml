@@ -22,7 +22,8 @@ chrono = { version = "0.4", default-features = false, features = ["now"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "smallvec", "std", "tracing-log"] }
 glob = "0.3"
-regex = "1"
+# No Unicode tables: the scrubber patterns spell out the classes they need
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 aho-corasick = "1.1.5"
 # One deflate backend (zlib-rs) for flate2 and zip; zip's "deflate" would add
 # miniz_oxide and zopfli, which only serves compression levels above 9.
@@ -64,9 +65,49 @@ wiremock = "0.6"
 name = "turboci"
 path = "src/main.rs"
 
+# Optimized for size, apart from the crates that do the CPU-heavy work
+# (compression, hashing, TLS, the scrubber's searches), which keep opt-level 3.
+# The benches (scrubber, cache archives, trace) stay within noise of a
+# whole-program opt-level 3, for a 20% smaller binary.
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
 # No panic = "abort": a panicking job is caught with catch_unwind, which needs unwinding
+
+[profile.release.package.zstd-sys]
+opt-level = 3
+
+[profile.release.package.zstd-safe]
+opt-level = 3
+
+[profile.release.package.zstd]
+opt-level = 3
+
+[profile.release.package.zlib-rs]
+opt-level = 3
+
+[profile.release.package.flate2]
+opt-level = 3
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.blake3]
+opt-level = 3
+
+[profile.release.package.regex]
+opt-level = 3
+
+[profile.release.package.regex-automata]
+opt-level = 3
+
+[profile.release.package.aho-corasick]
+opt-level = 3
+
+[profile.release.package.memchr]
+opt-level = 3
+
+[profile.release.package.ring]
+opt-level = 3

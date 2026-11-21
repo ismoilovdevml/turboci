@@ -21,10 +21,19 @@ const MAX_PENDING: usize = 16 * 1024;
 const MIN_SECRET_LEN: usize = 5;
 const MASK: &str = "[MASKED]";
 
+/// Unicode white space (`\s`, the White_Space property, as `char::is_whitespace`)
+/// spelled out: regex is built without its Unicode tables, which `\s` needs
+macro_rules! ws {
+    () => {
+        r"\t\n\x0B\x0C\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}"
+    };
+}
+
 /// Secrets that look like tokens, keys or passwords, masked in every job. A
 /// match is masked as a whole, from its first byte to its last. No anchors,
 /// `\b` or other look-around: the stream scrubber relies on a match not
-/// depending on the text after it.
+/// depending on the text after it. No `\s`, `\w`, `\d`, `\b`, `\p` or `(?i)`
+/// either: they need the Unicode tables regex is built without.
 const DEFAULT_PATTERNS: [&str; 12] = [
     // GitLab tokens
     r"glrt-[a-zA-Z0-9_-]{20,}",
@@ -33,13 +42,25 @@ const DEFAULT_PATTERNS: [&str; 12] = [
     r"gh[pousr]_[A-Za-z0-9_]{36,}",
     // AWS credentials
     r"AKIA[0-9A-Z]{16}",
-    r"aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{40}",
+    concat!(
+        "aws_secret_access_key[",
+        ws!(),
+        "]*=[",
+        ws!(),
+        r"]*[A-Za-z0-9/+=]{40}"
+    ),
     // Generic API keys
-    r"api[_-]?key\s*[:=]\s*[a-zA-Z0-9_-]{32,}",
+    concat!(
+        "api[_-]?key[",
+        ws!(),
+        "]*[:=][",
+        ws!(),
+        "]*[a-zA-Z0-9_-]{32,}"
+    ),
     // Generic secrets
-    r"secret\s*[:=]\s*[a-zA-Z0-9_-]{16,}",
+    concat!("secret[", ws!(), "]*[:=][", ws!(), "]*[a-zA-Z0-9_-]{16,}"),
     // Passwords
-    r"password\s*[:=]\s*\S{8,}",
+    concat!("password[", ws!(), "]*[:=][", ws!(), "]*[^", ws!(), "]{8,}"),
     // Private keys
     r"-----BEGIN [A-Z]+ PRIVATE KEY-----",
     // JWT tokens
@@ -701,6 +722,48 @@ mod tests {
 
         assert!(!out.contains("s3cr3t"), "{out}");
         assert_eq!(out, scrubber.scrub(&format!("{first} end\n")));
+    }
+
+    #[test]
+    fn white_space_class_is_unicode_white_space() {
+        let class = regex::Regex::new(concat!("^[", ws!(), "]$")).unwrap();
+        let other = regex::Regex::new(concat!("^[^", ws!(), "]$")).unwrap();
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            let text = c.to_string();
+            assert_eq!(class.is_match(&text), c.is_whitespace(), "{:?}", c);
+            assert_eq!(other.is_match(&text), !c.is_whitespace(), "{:?}", c);
+        }
+    }
+
+    /// regex is built without Unicode tables (only tests get them, through
+    /// wiremock): a pattern needing them would only fail in the release binary
+    #[test]
+    fn patterns_do_not_need_unicode_tables() {
+        for pattern in DEFAULT_PATTERNS {
+            for needs_tables in [
+                r"\s", r"\S", r"\w", r"\W", r"\d", r"\D", r"\b", r"\B", r"\p", r"\P", "(?i",
+            ] {
+                assert!(
+                    !pattern.contains(needs_tables),
+                    "{pattern} uses {needs_tables}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn patterns_treat_unicode_white_space_as_white_space() {
+        let scrubber = SecretScrubber::new(vec![]);
+        // U+00A0 and U+3000 count as white space, as with `\s`
+        assert_eq!(
+            scrubber.scrub("password:\u{a0}MyP@ssw0rd123 ok"),
+            "[MASKED] ok"
+        );
+        assert_eq!(
+            scrubber.scrub("x password=ab\u{3000}cdefghij"),
+            "x password=ab\u{3000}cdefghij"
+        );
+        assert_eq!(scrubber.scrub("password=pässwört1"), "[MASKED]");
     }
 
     #[test]
