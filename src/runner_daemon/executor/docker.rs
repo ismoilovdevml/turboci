@@ -3704,13 +3704,14 @@ mod tests {
         let executor = with_pipeline_images().await;
         let job_id = 914_000_000 + u64::from(std::process::id());
         // Run one after the other, the hook and the service delay would
-        // take at least 12s
+        // take at least 20s; overlapped about 10s plus setup, which a busy CI
+        // host can stretch by several seconds
         let j = pipelined_job(
             &executor,
             job_id,
             "redis:7-alpine",
-            6,
-            serde_json::json!([{"name": "pre_get_sources_script", "script": ["sleep 6"]}]),
+            10,
+            serde_json::json!([{"name": "pre_get_sources_script", "script": ["sleep 10"]}]),
             &["cat file.txt", "echo \"ping=$(redis-cli -h cache ping)\""],
         );
         let scrubber = SecretScrubber::new(vec![]);
@@ -3725,7 +3726,7 @@ mod tests {
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
         assert!(log.contains("hello from git"), "{}", log);
         assert!(log.contains("ping=PONG"), "{}", log);
-        assert!(took < Duration::from_secs(12), "took {:?}\n{}", took, log);
+        assert!(took < Duration::from_secs(18), "took {:?}\n{}", took, log);
         // The services' progress follows the checkout's section
         let sources_end = log.find("section_end:").expect("get_sources section");
         let service = log.find("Starting service").expect("service started");
