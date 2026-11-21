@@ -273,6 +273,11 @@ and every container of the job is removed. Concurrent jobs that need the same im
 login wait for one pull of it; a job never shares the pull of a job that
 logged in differently.
 
+The runner talks to dockerd over `/var/run/docker.sock`, or over the
+`unix://` socket that the service's `DOCKER_HOST` names. A `DOCKER_HOST`
+that is not a unix socket (`tcp://`, `ssh://`) stops the runner at startup
+instead of quietly using the default socket.
+
 | Key | Default | Description |
 |---|---|---|
 | `builds_dir` | `<state_dir>/builds` | Host directory of the job workspaces, mounted as `/builds` |

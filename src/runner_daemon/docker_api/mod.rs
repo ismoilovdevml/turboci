@@ -2,8 +2,9 @@
 //! over dockerd's unix socket (HTTP/1.1, one connection per request).
 //!
 //! It speaks to dockerd exactly as bollard 0.19 did before it:
-//! - the socket is `DOCKER_HOST` when that is a `unix://` address, else
-//!   /var/run/docker.sock, and it must exist when the client is created;
+//! - the socket is `DOCKER_HOST`, which must be a `unix://` address when
+//!   set (TCP and TLS are not supported), else /var/run/docker.sock, and it
+//!   must exist when the client is created;
 //! - paths carry no `/v1.xx` prefix, so dockerd answers with its own current
 //!   API version (bollard's prefix was dropped by `Url::join`);
 //! - every request has `Content-Type: application/json`, and waiting for a
@@ -67,6 +68,8 @@ pub enum Error {
     Timeout,
     /// The socket does not exist
     SocketNotFound(String),
+    /// DOCKER_HOST names something other than a unix socket
+    UnsupportedHost(String),
     Json(serde_json::Error),
     Io(std::io::Error),
     Http(hyper::http::Error),
@@ -104,6 +107,11 @@ impl std::fmt::Display for Error {
             }
             Error::Timeout => write!(f, "Timeout error"),
             Error::SocketNotFound(path) => write!(f, "Socket not found: {}", path),
+            Error::UnsupportedHost(host) => write!(
+                f,
+                "DOCKER_HOST={} is not supported; use a unix socket (unix:///path/to/docker.sock)",
+                host
+            ),
             Error::Json(e) => e.fmt(f),
             Error::Io(e) => e.fmt(f),
             Error::Http(e) => e.fmt(f),
@@ -151,16 +159,11 @@ pub struct Docker {
 }
 
 impl Docker {
-    /// Connect to `DOCKER_HOST` when it is a `unix://` address, else to
-    /// /var/run/docker.sock; fails when the socket does not exist
+    /// Connect to the `unix://` socket `DOCKER_HOST` names, or to
+    /// /var/run/docker.sock when it is unset or empty; fails when the socket
+    /// does not exist or DOCKER_HOST is not a unix socket
     pub fn connect_with_local_defaults() -> Result<Self> {
-        let host = std::env::var("DOCKER_HOST")
-            .ok()
-            .filter(|host| host.starts_with("unix://"));
-        let path = host
-            .as_deref()
-            .unwrap_or(DEFAULT_SOCKET)
-            .replacen("unix://", "", 1);
+        let path = socket_path(std::env::var("DOCKER_HOST").ok().as_deref())?;
         if !std::path::Path::new(&path).exists() {
             return Err(Error::SocketNotFound(path));
         }
@@ -571,6 +574,20 @@ impl Docker {
 }
 
 /// The X-Registry-Auth header for `credentials`: their JSON, base64-encoded
+/// Path of the socket `docker_host` (DOCKER_HOST's value) names. Anything
+/// but a `unix://` address is an error rather than silently using the
+/// default socket: jobs would run on another daemon than intended.
+fn socket_path(docker_host: Option<&str>) -> Result<String> {
+    let host = docker_host
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or(DEFAULT_SOCKET);
+    match host.strip_prefix("unix://") {
+        Some(path) if !path.is_empty() => Ok(path.to_string()),
+        _ => Err(Error::UnsupportedHost(host.to_string())),
+    }
+}
+
 fn registry_auth(credentials: &DockerCredentials) -> Result<(HeaderName, HeaderValue)> {
     use base64::Engine;
 
@@ -816,6 +833,34 @@ mod tests {
         assert_eq!(endpoint.gateway.as_deref(), Some("172.18.0.1"));
         assert_eq!(endpoint.ip_address.as_deref(), Some("172.18.0.2"));
         assert_eq!(info.host_config.unwrap().cpu_shares, Some(512));
+    }
+
+    #[test]
+    fn docker_host_must_be_a_unix_socket() {
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(socket_path(unset).unwrap(), "/var/run/docker.sock");
+        }
+        assert_eq!(
+            socket_path(Some("unix:///run/user/1000/docker.sock")).unwrap(),
+            "/run/user/1000/docker.sock"
+        );
+        for unsupported in [
+            "tcp://127.0.0.1:2375",
+            "ssh://user@host",
+            "npipe:////./pipe/docker_engine",
+            "/var/run/docker.sock",
+            "unix://",
+        ] {
+            let error = socket_path(Some(unsupported)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "DOCKER_HOST={} is not supported; use a unix socket \
+                     (unix:///path/to/docker.sock)",
+                    unsupported
+                )
+            );
+        }
     }
 
     #[tokio::test]
