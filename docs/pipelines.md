@@ -78,6 +78,17 @@ symlinks pointing outside).
 
 All CI/CD variables GitLab sends, including file-type variables (written to a
 file whose path is the variable's value) and `$VAR` / `${VAR}` expansion.
+
+Expansion works as in gitlab-runner. GitLab itself expands variables used in
+other variables (`A: $B`, `B: $C`) before it sends the job; the runner then
+expands once more, for the variables it defines (`$CI_BUILDS_DIR`,
+`$CI_PROJECT_DIR`, ...) and file variables, which give the path of their file
+(`KUBECONFIG: $KUBE_FILE` points to the file, never its content). Variables
+marked *Expand variable reference* off (`raw`) are not expanded. Like
+gitlab-runner, `$1`–`$9`, `$*`, `$@`, `$#`, `$?`, `$!` and `$-` expand to
+nothing, so write `$$1` in a variable meant for `awk '{print $1}'`;
+`${NAME:-default}` is not a shell default and expands to nothing.
+
 Masked variables, the job token and dependency tokens are replaced by
 `[MASKED]` in the job log, also when a value is split across output chunks.
 

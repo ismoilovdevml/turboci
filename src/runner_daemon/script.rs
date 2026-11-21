@@ -247,9 +247,18 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
             ok
         })
         .collect();
+    // What a reference to each variable expands to, as gitlab-runner's
+    // `Variables.Get`: the value as given, not itself expanded (one pass; GitLab
+    // already expanded nested references before sending the job), and for a
+    // file variable the path of its file, never its content
     let mut values: HashMap<String, String> = vars.iter().cloned().collect();
     for var in &valid {
-        values.insert(var.key.clone(), var.value.clone().unwrap_or_default());
+        let value = if var.file {
+            format!("{}/{}", tmp_dir, var.key)
+        } else {
+            var.value.clone().unwrap_or_default()
+        };
+        values.insert(var.key.clone(), value);
     }
 
     for var in valid {
@@ -276,18 +285,40 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
 
 /// Environment of a service container: like gitlab-runner, only public and
 /// internal job variables (never masked or protected secrets), plus the
-/// service's own `variables:`, which take precedence
+/// service's own `variables:`, which take precedence.
+///
+/// `values` is the job's environment (see `job_env`). Job variables keep the
+/// value the job container sees: they are not expanded a second time. Like
+/// gitlab-runner's `GetServiceVariables`, only the service's own variables are
+/// expanded, against the job's environment and each other. Visibility goes by
+/// the last definition of a name, so an earlier public value overridden by a
+/// hidden one never shows up.
 pub fn service_env(
     job: &Job,
     service_variables: &[crate::gitlab::Variable],
     values: &HashMap<String, String>,
 ) -> Vec<String> {
+    let mut hidden: HashMap<&str, bool> = HashMap::new();
+    for var in &job.variables {
+        hidden.insert(
+            &var.key,
+            !(var.public || var.internal) || var.masked || var.file,
+        );
+    }
     let mut vars = Vars::default();
-    let visible = job
-        .variables
-        .iter()
-        .filter(|v| (v.public || v.internal) && !v.masked && !v.file);
-    for var in visible.chain(service_variables) {
+    for var in &job.variables {
+        if !is_valid_key(&var.key) || hidden.get(var.key.as_str()) != Some(&false) {
+            continue;
+        }
+        if let Some(value) = values.get(&var.key) {
+            vars.set(&var.key, value.clone());
+        }
+    }
+    let mut source = values.clone();
+    for var in service_variables.iter().filter(|v| is_valid_key(&v.key)) {
+        source.insert(var.key.clone(), var.value.clone().unwrap_or_default());
+    }
+    for var in service_variables {
         if !is_valid_key(&var.key) {
             continue;
         }
@@ -295,7 +326,7 @@ pub fn service_env(
         let value = if var.raw {
             value
         } else {
-            expand(&value, values)
+            expand(&value, &source)
         };
         vars.set(&var.key, value);
     }
@@ -306,45 +337,81 @@ pub fn service_env(
     .to_docker()
 }
 
-/// Expand `$VAR` and `${VAR}` from `values` (unknown names expand to empty);
-/// `$$` is a literal `$`, as in GitLab.
+/// Expand `$VAR` and `${VAR}` from `values` exactly as gitlab-runner does
+/// (Go's `os.Expand` with `Variables.Get`). One pass: a value put in is not
+/// expanded again. Unknown names, `$0`-`$9`, `$*`, `$#`, `$@`, `$!`, `$?`
+/// and `$-` give nothing; `$$` gives `$`; a `$` followed by anything else
+/// stays; a `${` without `}` and `${}` are dropped; `${NAME:-x}` looks up the
+/// whole text between the braces (no shell defaults), so it gives nothing.
 pub fn expand(value: &str, values: &HashMap<String, String>) -> String {
+    let bytes = value.as_bytes();
     let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(pos) = rest.find('$') {
-        out.push_str(&rest[..pos]);
-        let after = &rest[pos + 1..];
-        if let Some(stripped) = after.strip_prefix('$') {
-            out.push('$');
-            rest = stripped;
-        } else if let Some(braced) = after.strip_prefix('{') {
-            match braced.find('}') {
-                Some(end) if is_valid_key(&braced[..end]) => {
-                    out.push_str(values.get(&braced[..end]).map_or("", String::as_str));
-                    rest = &braced[end + 1..];
-                }
-                _ => {
-                    out.push('$');
-                    rest = after;
-                }
-            }
-        } else {
-            let len = after
-                .char_indices()
-                .find(|&(i, c)| {
-                    !(c.is_ascii_alphanumeric() || c == '_') || (i == 0 && c.is_ascii_digit())
-                })
-                .map_or(after.len(), |(i, _)| i);
-            if len == 0 {
-                out.push('$');
-            } else {
-                out.push_str(values.get(&after[..len]).map_or("", String::as_str));
-            }
-            rest = &after[len..];
+    // Start of the text not copied to `out` yet
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'$' || at + 1 == bytes.len() {
+            at += 1;
+            continue;
         }
+        out.push_str(&value[copied..at]);
+        let (name, width) = shell_name(&value[at + 1..]);
+        match name {
+            Some(name) => out.push_str(lookup(name, values)),
+            // Not followed by a name: the `$` stays
+            None if width == 0 => out.push('$'),
+            // Malformed `${`: dropped
+            None => {}
+        }
+        at += 1 + width;
+        copied = at;
     }
-    out.push_str(rest);
+    out.push_str(&value[copied..]);
     out
+}
+
+/// Characters that form a one-character shell parameter (Go's `isShellSpecialVar`)
+fn is_special(c: u8) -> bool {
+    matches!(
+        c,
+        b'*' | b'#' | b'$' | b'@' | b'!' | b'?' | b'-' | b'0'..=b'9'
+    )
+}
+
+/// The name after a `$` at the start of `text` and how many bytes it takes
+/// (Go's `getShellName`): `None` with a width means bad syntax to drop,
+/// `None` with width 0 that no name follows
+fn shell_name(text: &str) -> (Option<&str>, usize) {
+    let bytes = text.as_bytes();
+    if bytes[0] == b'{' {
+        if bytes.len() > 2 && is_special(bytes[1]) && bytes[2] == b'}' {
+            return (Some(&text[1..2]), 3);
+        }
+        return match bytes.iter().position(|&c| c == b'}') {
+            Some(1) => (None, 2),
+            Some(end) => (Some(&text[1..end]), end + 1),
+            None => (None, 1),
+        };
+    }
+    if is_special(bytes[0]) {
+        return (Some(&text[..1]), 1);
+    }
+    let len = bytes
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+        .count();
+    ((len > 0).then(|| &text[..len]), len)
+}
+
+/// What a name expands to (gitlab-runner's `Variables.value`)
+fn lookup<'a>(name: &str, values: &'a HashMap<String, String>) -> &'a str {
+    match name {
+        "$" => "$",
+        "*" | "#" | "@" | "!" | "?" | "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+            ""
+        }
+        _ => values.get(name).map_or("", String::as_str),
+    }
 }
 
 #[cfg(test)]
@@ -590,8 +657,125 @@ mod tests {
         let service: Vec<crate::gitlab::Variable> =
             serde_json::from_value(serde_json::json!([{"key": "A", "value": "service"}])).unwrap();
 
-        let env = service_env(&j, &service, &HashMap::new());
+        let values = job_env(&j, "/b", Path::new("/h"), &RunnerVars::default())
+            .vars
+            .into_iter()
+            .collect();
+
+        let env = service_env(&j, &service, &values);
 
         assert_eq!(env, ["B=job", "A=service"]);
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn expansion_is_one_pass_like_gitlab_runner() {
+        // gitlab-runner's Variables.Get returns the value as given: GitLab
+        // expands nested references itself before it sends the job, the
+        // runner adds one pass on top
+        let j = job(serde_json::json!([
+            {"key": "A", "value": "$B"},
+            {"key": "B", "value": "$C"},
+            {"key": "C", "value": "x"},
+            {"key": "D", "value": "${A}-$CI_BUILDS_DIR"}
+        ]));
+
+        let env = job_env(&j, "/b", Path::new("/h"), &RunnerVars::default());
+
+        assert_eq!(get(&env, "A"), Some("$C"));
+        assert_eq!(get(&env, "B"), Some("x"));
+        assert_eq!(get(&env, "D"), Some("$B-/b"));
+    }
+
+    #[test]
+    fn a_file_variable_expands_to_its_path_in_other_variables() {
+        let j = job(serde_json::json!([
+            {"key": "KUBECONFIG_FILE", "value": "apiVersion: v1 $HOME", "file": true},
+            {"key": "KUBECONFIG", "value": "$KUBECONFIG_FILE"},
+            {"key": "ARGS", "value": "--config=${KUBECONFIG_FILE}"},
+            {"key": "HOME", "value": "/root"}
+        ]));
+
+        let env = job_env(&j, "/builds", Path::new("/h"), &RunnerVars::default());
+
+        let path = "/builds/project.tmp/KUBECONFIG_FILE";
+        assert_eq!(get(&env, "KUBECONFIG_FILE"), Some(path));
+        assert_eq!(get(&env, "KUBECONFIG"), Some(path));
+        assert_eq!(get(&env, "ARGS"), Some(&*format!("--config={}", path)));
+        // The file's own content is expanded once, like any other value
+        assert_eq!(
+            env.files,
+            vec![(
+                PathBuf::from("/h/project.tmp/KUBECONFIG_FILE"),
+                "apiVersion: v1 /root".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn expands_like_go_os_expand() {
+        let vars = values(&[("A", "a"), ("B_1", "b")]);
+        for (input, expected) in [
+            ("$A/${A}/$B_1.x", "a/a/b.x"),
+            ("$UNSET|${UNSET}", "|"),
+            ("$$A and $${A}", "$A and ${A}"),
+            ("${$}", "$"),
+            // Positional and special shell parameters give nothing
+            ("awk '{print $1}'", "awk '{print }'"),
+            ("$12", "2"),
+            ("$* $# $@ $! $? $- ${*}", "      "),
+            // A `$` not followed by a name stays
+            ("$ $/ $. 100$", "$ $/ $. 100$"),
+            ("$é", "$é"),
+            // No shell operators: the whole text in braces is the name
+            ("${A:-default}", ""),
+            ("${A-x}y", "y"),
+            // Malformed braces are dropped
+            ("x${}y", "xy"),
+            ("x${A", "xA"),
+            ("${", ""),
+            ("é${A}é", "éaé"),
+        ] {
+            assert_eq!(expand(input, &vars), expected, "{:?}", input);
+        }
+    }
+
+    #[test]
+    fn service_variables_are_not_expanded_twice() {
+        let j = job(serde_json::json!([
+            {"key": "A", "value": "$B", "public": true},
+            {"key": "B", "value": "$C", "public": true},
+            {"key": "C", "value": "x", "public": true},
+            {"key": "TOKEN", "value": "secret", "masked": true},
+            {"key": "MODE", "value": "yaml", "public": true},
+            {"key": "MODE", "value": "project"}
+        ]));
+        let service: Vec<crate::gitlab::Variable> = serde_json::from_value(serde_json::json!([
+            {"key": "S1", "value": "$A"},
+            {"key": "S2", "value": "${S1}+$TOKEN"},
+            {"key": "S3", "value": "$C", "raw": true}
+        ]))
+        .unwrap();
+        let values = job_env(&j, "/b", Path::new("/h"), &RunnerVars::default())
+            .vars
+            .into_iter()
+            .collect();
+
+        let env = service_env(&j, &service, &values);
+
+        // A is what the job container sees ("$C"), not expanded again;
+        // service variables expand against the job's values and each other
+        // (a hidden one included, the service asked for it by name); the
+        // overridden public MODE does not resurface
+        assert_eq!(
+            env,
+            ["A=$C", "B=x", "C=x", "S1=$C", "S2=$A+secret", "S3=$C"]
+        );
     }
 }
