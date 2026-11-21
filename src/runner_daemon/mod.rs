@@ -311,6 +311,15 @@ impl RequestBackoff {
     }
 }
 
+/// How long to wait after a failed job request: the backoff, or longer when
+/// GitLab answered with a Retry-After
+fn retry_wait(error: &anyhow::Error, backoff: Duration) -> Duration {
+    match error.downcast_ref::<crate::gitlab::RetryAfter>() {
+        Some(after) => backoff.max(after.0),
+        None => backoff,
+    }
+}
+
 /// A random number in [0, 1)
 fn random_fraction() -> f64 {
     use std::hash::{BuildHasher, Hasher};
@@ -587,7 +596,8 @@ impl RunnerDaemon {
                 }
                 Err(e) => {
                     self.metrics.request(metrics::Request::Error);
-                    let wait = backoff.failed();
+                    // GitLab's own Retry-After (429/503) wins over a shorter backoff
+                    let wait = retry_wait(&e, backoff.failed());
                     warn!(
                         "Failed to request job: {:#} (retrying in {:.1}s)",
                         e,
@@ -2999,6 +3009,25 @@ mod tests {
         assert!(!daemon
             .render_metrics()
             .contains("turboci_workspaces_size_bytes"));
+    }
+
+    #[test]
+    fn retry_after_from_gitlab_lengthens_the_wait_but_never_shortens_it() {
+        let limited = anyhow::anyhow!("Job request failed: 429")
+            .context(crate::gitlab::RetryAfter(Duration::from_secs(60)));
+        assert_eq!(
+            retry_wait(&limited, Duration::from_secs(5)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            retry_wait(&limited, Duration::from_secs(90)),
+            Duration::from_secs(90)
+        );
+        let plain = anyhow::anyhow!("network down");
+        assert_eq!(
+            retry_wait(&plain, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

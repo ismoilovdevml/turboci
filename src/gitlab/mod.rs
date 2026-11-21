@@ -283,6 +283,18 @@ impl GitLabClient {
                 warn!("Authentication failed - invalid runner token");
                 Err(anyhow::anyhow!("Invalid runner token"))
             }
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                let after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| parse_retry_after(v, chrono::Utc::now()));
+                let error = anyhow::anyhow!("Job request failed: {}", status);
+                Err(match after {
+                    Some(after) => error.context(RetryAfter(after)),
+                    None => error,
+                })
+            }
             _ => {
                 let error_text = response.text().await.unwrap_or_default();
                 warn!("Unexpected response: {} - {}", status, error_text);
@@ -946,6 +958,36 @@ pub struct RetryConfig {
 
 /// Timeout of establishing a connection (TCP, proxy and TLS), for GitLab
 /// and the S3 cache alike
+/// Longest wait taken from a Retry-After header
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
+
+/// GitLab asked (429/503 with Retry-After) not to request jobs before this
+/// much time has passed; attached as context to the job request error
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryAfter(pub Duration);
+
+impl std::fmt::Display for RetryAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GitLab asked to retry after {}s", self.0.as_secs())
+    }
+}
+
+/// Parse a Retry-After value: delay seconds or an HTTP date; capped at
+/// `MAX_RETRY_AFTER`, None when unparseable
+fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let value = value.trim();
+    let after = match value.parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        Err(_) => {
+            let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+            (at.with_timezone(&chrono::Utc) - now)
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+        }
+    };
+    Some(after.min(MAX_RETRY_AFTER))
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout of API calls (the client default)
@@ -1284,6 +1326,51 @@ mod tests {
         assert_eq!(sent(&requests[0]), serde_json::Value::Null);
         assert_eq!(sent(&requests[1]), "q-42");
         assert_eq!(sent(&requests[2]), serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_job_request_carries_gitlabs_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "42"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = client(&server);
+
+        let limited = client.request_job("runner-token").await.unwrap_err();
+        assert_eq!(
+            limited.downcast_ref::<RetryAfter>(),
+            Some(&RetryAfter(Duration::from_secs(42)))
+        );
+        // Without the header there is nothing to honour
+        let unavailable = client.request_job("runner-token").await.unwrap_err();
+        assert_eq!(unavailable.downcast_ref::<RetryAfter>(), None);
+    }
+
+    #[test]
+    fn retry_after_takes_seconds_or_an_http_date_and_is_capped() {
+        let now = chrono::DateTime::parse_from_rfc2822("Sat, 21 Nov 2026 10:00:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let parse = |v| parse_retry_after(v, now);
+        assert_eq!(parse("120"), Some(Duration::from_secs(120)));
+        assert_eq!(parse(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse("Sat, 21 Nov 2026 10:01:30 GMT"),
+            Some(Duration::from_secs(90))
+        );
+        // A date already past means "now"
+        assert_eq!(parse("Sat, 21 Nov 2026 09:00:00 GMT"), Some(Duration::ZERO));
+        assert_eq!(parse("999999"), Some(MAX_RETRY_AFTER));
+        assert_eq!(parse("soon"), None);
+        assert_eq!(parse("-5"), None);
     }
 
     #[tokio::test]
