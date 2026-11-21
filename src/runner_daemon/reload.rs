@@ -5,7 +5,7 @@
 //! Settings the runner only reads at start are reported as needing a
 //! restart (see `pin_restart_only`). An invalid config changes nothing.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -76,6 +76,17 @@ impl Manager {
     pub fn reload(&self, path: &Path) -> Result<Reloaded> {
         let file = ConfigFile::load(path)?;
         let limits = admission::Limits::from_config(file.global())?;
+        // Everything that may fail before anything is applied
+        let mut prepared = Vec::new();
+        for runner in self.runners.iter() {
+            let name = &runner.config.name;
+            if let Some(new) = file.runners.iter().find(|new| &new.name == name) {
+                let ready = runner
+                    .prepare_runner(new)
+                    .with_context(|| format!("[[runners]] {}", name))?;
+                prepared.push((runner, ready));
+            }
+        }
         let mut reloaded = self.runners[0].reload_global(file.global(), limits);
         // Per runner reports name the runner once there are several
         let named = file.multi || self.runners.len() > 1;
@@ -86,21 +97,25 @@ impl Manager {
                 text
             }
         };
-        for runner in self.runners.iter() {
+        for (runner, ready) in prepared {
             let name = &runner.config.name;
-            match file.runners.iter().find(|new| &new.name == name) {
-                Some(new) => {
-                    let done = runner.reload_runner(new);
-                    reloaded
-                        .applied
-                        .extend(done.applied.into_iter().map(|text| prefix(name, text)));
-                    reloaded
-                        .restart_needed
-                        .extend(done.restart_needed.into_iter().map(|key| prefix(name, key)));
-                }
-                None => reloaded
+            let done = runner.commit_runner(ready);
+            reloaded
+                .applied
+                .extend(done.applied.into_iter().map(|text| prefix(name, text)));
+            reloaded
+                .restart_needed
+                .extend(done.restart_needed.into_iter().map(|key| prefix(name, key)));
+        }
+        for runner in self.runners.iter() {
+            if !file
+                .runners
+                .iter()
+                .any(|new| new.name == runner.config.name)
+            {
+                reloaded
                     .restart_needed
-                    .push(format!("[[runners]] {} (removed)", name)),
+                    .push(format!("[[runners]] {} (removed)", runner.config.name));
             }
         }
         for new in &file.runners {
@@ -179,44 +194,64 @@ impl RunnerDaemon {
         }
     }
 
-    /// Give the jobs that start from now on this runner's settings from
-    /// `new`; keys only read at start are reported instead
-    fn reload_runner(&self, new: &RunnerConfig) -> Reloaded {
+    /// Work out this runner's reload to `new` without applying anything:
+    /// what may fail (reading seccomp profiles) fails here
+    fn prepare_runner(&self, new: &RunnerConfig) -> Result<Prepared> {
         let current = self.settings();
         let mut applied = Vec::new();
-        if current.config.limit != new.limit {
-            self.capacity.set_limit(runner_limit(new.limit));
+        let limit = (current.config.limit != new.limit).then(|| {
             applied.push(format!("limit {} → {}", current.config.limit, new.limit));
-        }
+            new.limit
+        });
         let live = pin_restart_only(&current.config, new);
         let changed = changed_keys(&current.config, &live);
         let restart_needed = changed_keys(&live, new);
-        if changed.is_empty() {
-            if !applied.is_empty() {
-                // Keep the limit in the settings, which later reloads compare to
-                self.update_settings(|settings| settings.config = Arc::new(live));
+        let settings = if changed.is_empty() {
+            // Keep the limit in the settings, which later reloads compare to
+            limit.map(|_| Settings {
+                config: Arc::new(live),
+                ..current.clone()
+            })
+        } else {
+            let mut cache = local_cache(&live);
+            if let Some(bucket) = &self.remote_cache {
+                cache = cache.with_remote(bucket.clone());
             }
-            return Reloaded {
+            applied.push(format!("for new jobs: {}", changed.join(", ")));
+            Some(Settings {
+                executor: Arc::new(current.executor.reconfigured(&live.executor)?),
+                config: Arc::new(live),
+                cache,
+            })
+        };
+        Ok(Prepared {
+            limit,
+            settings,
+            report: Reloaded {
                 applied,
                 restart_needed,
-            };
-        }
-        let mut cache = local_cache(&live);
-        if let Some(bucket) = &self.remote_cache {
-            cache = cache.with_remote(bucket.clone());
-        }
-        let settings = Settings {
-            executor: Arc::new(current.executor.reconfigured(&live.executor)),
-            config: Arc::new(live),
-            cache,
-        };
-        self.update_settings(|current| *current = settings);
-        applied.push(format!("for new jobs: {}", changed.join(", ")));
-        Reloaded {
-            applied,
-            restart_needed,
-        }
+            },
+        })
     }
+
+    /// Apply a prepared reload: a new `limit` at once, the settings to the
+    /// jobs that start from now on
+    fn commit_runner(&self, prepared: Prepared) -> Reloaded {
+        if let Some(limit) = prepared.limit {
+            self.capacity.set_limit(runner_limit(limit));
+        }
+        if let Some(settings) = prepared.settings {
+            self.update_settings(|current| *current = settings);
+        }
+        prepared.report
+    }
+}
+
+/// A runner's reload, worked out but not applied yet
+struct Prepared {
+    limit: Option<u32>,
+    settings: Option<Settings>,
+    report: Reloaded,
 }
 
 /// `new` with the settings the runner only reads at start taken from `old`:

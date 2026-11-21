@@ -152,14 +152,14 @@ impl ExecutorType {
     /// The same executor with the settings of `config`, for jobs that start
     /// from now on. Its kind and builds directory stay: changing them needs a
     /// restart (see `reload`).
-    pub fn reconfigured(&self, config: &super::config::ExecutorConfig) -> Self {
-        match self {
+    pub fn reconfigured(&self, config: &super::config::ExecutorConfig) -> Result<Self> {
+        Ok(match self {
             ExecutorType::Docker(executor) => {
-                ExecutorType::Docker(executor.reconfigured(config.docker.clone()))
+                ExecutorType::Docker(executor.reconfigured(config.docker.clone())?)
             }
             // Its only setting, work_dir, is its builds directory
             ExecutorType::Shell(executor) => ExecutorType::Shell(executor.clone()),
-        }
+        })
     }
 
     /// Give jobs the custom CA the GitLab server's certificate is signed with

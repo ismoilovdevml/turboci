@@ -844,18 +844,9 @@ impl DockerExecutor {
     pub fn new(config: DockerConfig) -> Result<Self> {
         let docker =
             Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
-        config.validate()?;
-        let mut config = config;
-        // Seccomp profile files are read once, here
-        config.security_opt = config
-            .security_opt
-            .iter()
-            .map(|option| crate::runner_daemon::config::security_opt(option))
-            .collect::<Result<_>>()?;
-
         Ok(Self {
             docker: Arc::new(docker),
-            config,
+            config: Self::prepared(config)?,
             owner: "turboci".to_string(),
             ca_pem: None,
             pulls: Arc::default(),
@@ -882,11 +873,22 @@ impl DockerExecutor {
 
     /// The same executor (Docker connection, owner, image pulls in flight)
     /// with other settings, for jobs that start from now on
-    pub fn reconfigured(&self, config: DockerConfig) -> Self {
-        Self {
-            config,
+    pub fn reconfigured(&self, config: DockerConfig) -> Result<Self> {
+        Ok(Self {
+            config: Self::prepared(config)?,
             ..self.clone()
-        }
+        })
+    }
+
+    /// `config` checked, with its seccomp profile files read (once, here)
+    fn prepared(mut config: DockerConfig) -> Result<DockerConfig> {
+        config.validate()?;
+        config.security_opt = config
+            .security_opt
+            .iter()
+            .map(|option| crate::runner_daemon::config::security_opt(option))
+            .collect::<Result<_>>()?;
+        Ok(config)
     }
 
     fn labels(&self) -> std::collections::HashMap<String, String> {
@@ -4459,6 +4461,50 @@ mod tests {
             clean_workspaces: Arc::default(),
             images: Arc::default(),
         }
+    }
+
+    #[test]
+    fn a_reconfigured_executor_keeps_its_state_and_reads_seccomp_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("seccomp.json");
+        std::fs::write(&profile, r#"{"defaultAction": "SCMP_ACT_ALLOW"}"#).unwrap();
+        let running = offline(DockerConfig::default()).with_owner("s_owner");
+        let new = DockerConfig {
+            default_image: "debian:12".to_string(),
+            image_max_age_days: Some(3),
+            allowed_images: vec!["debian:*".to_string()],
+            security_opt: vec![format!("seccomp={}", profile.display())],
+            ..DockerConfig::default()
+        };
+
+        let next = running.reconfigured(new.clone()).unwrap();
+
+        assert_eq!(next.config.default_image, "debian:12");
+        assert_eq!(next.config.image_max_age_days, Some(3));
+        assert_eq!(next.config.allowed_images, ["debian:*"]);
+        // The profile is read, as at start
+        assert_eq!(
+            next.config.security_opt,
+            [r#"seccomp={"defaultAction":"SCMP_ACT_ALLOW"}"#]
+        );
+        // Pulls in flight, image usage and workspace checks stay shared
+        assert_eq!(next.owner, "s_owner");
+        assert!(Arc::ptr_eq(&next.pulls, &running.pulls));
+        assert!(Arc::ptr_eq(&next.images, &running.images));
+        assert!(Arc::ptr_eq(
+            &next.clean_workspaces,
+            &running.clean_workspaces
+        ));
+        assert_eq!(
+            running.config.default_image,
+            DockerConfig::default().default_image
+        );
+
+        let missing = DockerConfig {
+            security_opt: vec!["seccomp=/nonexistent/profile.json".to_string()],
+            ..new
+        };
+        assert!(running.reconfigured(missing).is_err());
     }
 
     fn key(image: &str, login: &str) -> PullKey {
