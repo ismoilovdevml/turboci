@@ -28,6 +28,9 @@ const LEGACY_EXTENSION: &str = ".zip";
 /// Downloaded chunks queued for the extraction (backpressure on S3)
 const STREAM_QUEUE: usize = 32;
 
+/// Longest wait at shutdown for S3 to abort the uploads of canceled jobs
+const ABORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Whether `path` names a cache archive of either format
 fn is_archive(path: &Path) -> bool {
     path.file_name()
@@ -389,6 +392,14 @@ impl LocalCache {
     pub fn with_remote(mut self, bucket: super::s3::Bucket) -> Self {
         self.remote = Some(bucket);
         self
+    }
+
+    /// At shutdown: wait up to `ABORT_WAIT` for S3 to be told to discard
+    /// the uploads of canceled jobs (see `Bucket::finish_aborts`)
+    pub async fn finish_aborts(&self) {
+        if let Some(remote) = &self.remote {
+            remote.finish_aborts(ABORT_WAIT).await;
+        }
     }
 
     /// Delete archives not used for `days` days (0 keeps them forever)

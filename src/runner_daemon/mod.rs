@@ -735,6 +735,8 @@ impl RunnerDaemon {
 
         info!("⏳ Waiting for running jobs to finish...");
         self.capacity.idle().await;
+        // Canceled jobs leave multipart uploads for S3 to discard
+        self.cache.finish_aborts().await;
         // Let a token reset in flight be saved, or the new token would be lost
         let _rotating = self.rotating.lock().await;
         drop(rotation);

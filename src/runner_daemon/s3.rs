@@ -480,7 +480,13 @@ impl Drop for PendingUpload {
         };
         let (bucket, key) = (self.bucket.clone(), std::mem::take(&mut self.key));
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { bucket.abort_multipart(&key, &upload_id).await });
+            let task = runtime.spawn(async move { bucket.abort_multipart(&key, &upload_id).await });
+            // Waited for at shutdown (`Bucket::finish_aborts`): a runner that
+            // exits right after a canceled job would otherwise end the task
+            if let Ok(mut aborts) = self.bucket.aborts.lock() {
+                aborts.retain(|task| !task.is_finished());
+                aborts.push(task);
+            }
         }
     }
 }
@@ -621,6 +627,8 @@ pub struct Bucket {
     /// endpoints: TLS protects the body), or are read into memory once to
     /// be hashed, signed and sent (plain HTTP)
     unsigned_parts: bool,
+    /// Aborts of multipart uploads dropped with their job, shared by clones
+    aborts: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for Bucket {
@@ -651,7 +659,45 @@ impl Bucket {
             multipart_threshold: MULTIPART_THRESHOLD,
             part_size: MIN_PART_SIZE,
             unsigned_parts,
+            aborts: Arc::default(),
         })
+    }
+
+    /// Wait up to `limit` for the aborts of multipart uploads that were
+    /// dropped (jobs canceled while saving their cache), so a runner that
+    /// stops right after does not leave their parts in S3. Returns how many
+    /// were not done in time; they are logged.
+    pub async fn finish_aborts(&self, limit: Duration) -> usize {
+        let tasks: Vec<_> = match self.aborts.lock() {
+            Ok(mut aborts) => std::mem::take(&mut *aborts),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        let pending: Vec<_> = tasks.into_iter().filter(|t| !t.is_finished()).collect();
+        if pending.is_empty() {
+            return 0;
+        }
+        tracing::info!(
+            "Waiting up to {}s for {} canceled S3 uploads to be aborted",
+            limit.as_secs(),
+            pending.len()
+        );
+        let deadline = Instant::now() + limit;
+        let mut left = 0;
+        for task in pending {
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                left += 1;
+            }
+        }
+        if left > 0 {
+            tracing::warn!(
+                "{} canceled S3 multipart uploads were not aborted within {}s: their \
+                 parts stay until the bucket's AbortIncompleteMultipartUpload lifecycle \
+                 rule removes them",
+                left,
+                limit.as_secs()
+            );
+        }
+        left
     }
 
     /// Multipart uploads of smaller archives (tests)
@@ -2033,6 +2079,73 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(requests_with(&server, "POST", "uploadId=").await.is_empty());
+    }
+
+    /// Starts a multipart upload whose parts S3 holds for 10 s, and drops it
+    /// once a part was sent: the job saving it was canceled
+    async fn drop_an_upload(server: &MockServer, b: &Bucket) {
+        use wiremock::matchers::query_param;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "up/1+x"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .with_priority(1)
+            .mount(server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (file, body) = archive_of(dir.path(), 2500);
+        let key = b.object_key(1, "big.tar.zst");
+        let hash = hex(&Sha256::digest(&body));
+        let upload = b.put_file(&key, &file, &hash);
+        let parts_sent = async {
+            while requests_with(server, "PUT", "partNumber").await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            _ = upload => panic!("the upload finished"),
+            _ = parts_sent => {}
+        }
+    }
+
+    /// At shutdown the runner waits for the aborts of uploads its canceled
+    /// jobs dropped, instead of exiting before they reach S3
+    #[tokio::test]
+    async fn shutdown_waits_for_the_aborts_of_dropped_uploads() {
+        let server = multipart_server().await;
+        let b = bucket(&server, "").with_multipart(2000, 1000);
+        drop_an_upload(&server, &b).await;
+
+        let left = b.clone().finish_aborts(Duration::from_secs(5)).await;
+
+        assert_eq!(left, 0);
+        assert_eq!(requests_with(&server, "DELETE", "uploadId=").await.len(), 1);
+        // Nothing left to wait for
+        assert_eq!(b.finish_aborts(Duration::from_secs(5)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_wait_for_aborts_is_bounded() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "up/1+x"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(10)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_multipart(&server).await;
+        let b = bucket(&server, "").with_multipart(2000, 1000);
+        drop_an_upload(&server, &b).await;
+        let started = std::time::Instant::now();
+
+        let left = b.finish_aborts(Duration::from_millis(300)).await;
+
+        assert_eq!(left, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// Over HTTPS a part streams from the file once, its payload unsigned

@@ -271,7 +271,9 @@ archive's SHA-256 stored with the object is checked by every download. Over
 plain HTTP a part is read into memory, hashed, signed with its hash and sent
 from there, which holds at most 64 MiB per upload (four parts of 16 MiB, or
 one larger part at a time for archives above 156 GiB). A failed or canceled
-multipart upload is aborted, so S3 keeps no parts of it.
+multipart upload is aborted, so S3 keeps no parts of it; on SIGTERM or
+SIGINT the runner waits up to 10 seconds for the aborts of the uploads its
+canceled jobs leave before it exits, and logs those that did not finish.
 An archive is the same for the same files (entries in path order, fixed
 timestamps), so a `pull-push` cache the job did not change is not uploaded
 again: the runner stores the archive's SHA-256 with the object
@@ -303,9 +305,9 @@ The runner never deletes objects. Expire old archives with a bucket lifecycle
 rule, e.g. `mc ilm rule add --expire-days 14 minio/turboci-cache` or an S3
 lifecycle rule with `Expiration: {Days: 14}`. Add
 `AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}` to the rule as
-well: a runner that is killed during an upload, or loses S3 in the middle,
-cannot abort it, and S3 keeps (and bills) the parts until the rule removes
-them. Archives are stored as
+well: a runner that is killed during an upload, or loses S3 in the middle
+(or whose aborts take longer than those 10 seconds), cannot abort it, and S3
+keeps (and bills) the parts until the rule removes them. Archives are stored as
 `<prefix>/project-<id>/<encoded-key>.tar.zst` (`.zip` for versions up to
 0.10), the cache key percent-encoded (`feature/x` is `feature%2Fx.tar.zst`),
 and a key whose encoded name is longer than 200 characters as
