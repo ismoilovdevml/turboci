@@ -194,7 +194,8 @@ finished before the runner exits.
   again. If no file can be created there, the system's temporary directory is
   used, and failing that the log stays in memory.
 - Masked variables and tokens are replaced by `[MASKED]` before anything is
-  sent, including in runner messages.
+  sent, including in runner messages. Values that overlap or follow each
+  other directly become a single `[MASKED]`, so no part of any of them shows.
 
 ## System ID
 

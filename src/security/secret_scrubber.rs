@@ -1,6 +1,13 @@
-use aho_corasick::{AhoCorasick, MatchKind};
+//! Masks secrets in job output. Every occurrence of a secret (also where
+//! secrets overlap) and every match of the default patterns is found in the
+//! original text; the byte ranges are merged, and each merged range is replaced
+//! by one `[MASKED]`. So no byte any secret or pattern covers is shown, and
+//! secrets that overlap or touch come out as a single `[MASKED]`.
+
+use aho_corasick::{AhoCorasick, AhoCorasickKind, Input, MatchKind};
 use regex::{Regex, RegexSet};
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::OnceLock;
 
 use crate::gitlab::Job;
@@ -14,7 +21,10 @@ const MAX_PENDING: usize = 16 * 1024;
 const MIN_SECRET_LEN: usize = 5;
 const MASK: &str = "[MASKED]";
 
-/// Secrets that look like tokens, keys or passwords, masked in every job
+/// Secrets that look like tokens, keys or passwords, masked in every job. A
+/// match is masked as a whole, from its first byte to its last. No anchors,
+/// `\b` or other look-around: the stream scrubber relies on a match not
+/// depending on the text after it.
 const DEFAULT_PATTERNS: [&str; 12] = [
     // GitLab tokens
     r"glrt-[a-zA-Z0-9_-]{20,}",
@@ -81,9 +91,39 @@ fn suffix_prefix_len(text: &str, secret: &str) -> usize {
 #[derive(Clone)]
 pub struct SecretScrubber {
     secrets: Vec<String>,
-    /// Finds any maskable secret in one pass; `None` when there is none
-    /// (or the automaton could not be built)
-    finder: Option<AhoCorasick>,
+    /// Finds the maskable secrets; `None` when there is none (or the
+    /// automata could not be built)
+    finder: Option<Finder>,
+}
+
+/// Automata over the maskable secrets, each giving the longest secret that
+/// starts at the leftmost position (see `mask_ranges`)
+#[derive(Clone)]
+struct Finder {
+    /// Whether text holds a secret at all: its prefilter skips through text
+    /// without secrets at memchr speed
+    detect: AhoCorasick,
+    /// Where the secrets are, once text holds one: a prefilter would stop at
+    /// every byte a secret starts with and makes this slower, not faster
+    locate: AhoCorasick,
+}
+
+impl Finder {
+    fn new(secrets: &[&str]) -> Option<Self> {
+        let build = |prefilter, kind| {
+            AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .prefilter(prefilter)
+                .kind(kind)
+                .build(secrets)
+        };
+        Some(Self {
+            detect: build(true, None).ok()?,
+            locate: build(false, Some(AhoCorasickKind::DFA))
+                .or_else(|_| build(false, None))
+                .ok()?,
+        })
+    }
 }
 
 impl SecretScrubber {
@@ -102,14 +142,11 @@ impl SecretScrubber {
         self.finder = if maskable.is_empty() {
             None
         } else {
-            AhoCorasick::builder()
-                .match_kind(MatchKind::LeftmostLongest)
-                .build(maskable)
-                .ok()
+            Finder::new(&maskable)
         };
     }
 
-    /// Secrets in masking order, without those too short to mask
+    /// Secrets, without those too short to mask
     fn maskable_secrets(&self) -> impl Iterator<Item = &str> {
         self.secrets
             .iter()
@@ -120,7 +157,7 @@ impl SecretScrubber {
     /// Whether `text` contains any secret that is masked
     fn contains_secret(&self, text: &str) -> bool {
         match &self.finder {
-            Some(finder) => finder.is_match(text),
+            Some(finder) => finder.detect.is_match(text),
             // No automaton: check each secret (there is none in the common case)
             None => self.maskable_secrets().any(|s| text.contains(s)),
         }
@@ -129,28 +166,11 @@ impl SecretScrubber {
     /// Scrub secrets from text, replacing them with [MASKED]. Text with nothing
     /// to mask is returned as it is, without a copy.
     pub fn scrub<'t>(&self, text: &'t str) -> Cow<'t, str> {
-        let patterns = default_patterns();
-        if !self.contains_secret(text) && !patterns.set.is_match(text) {
+        let ranges = self.mask_ranges(text);
+        if ranges.is_empty() {
             return Cow::Borrowed(text);
         }
-
-        // Mask custom secrets (exact match), in order: longer ones first
-        let mut result = text.to_string();
-        for secret in self.maskable_secrets() {
-            if result.contains(secret) {
-                result = result.replace(secret, MASK);
-            }
-        }
-
-        // Mask pattern-based secrets one pattern after the other: a pattern can
-        // match text that includes what an earlier one masked
-        for pattern in &patterns.list {
-            if let Cow::Owned(masked) = pattern.replace_all(&result, MASK) {
-                result = masked;
-            }
-        }
-
-        Cow::Owned(result)
+        Cow::Owned(mask(text, &ranges))
     }
 
     /// `scrub` for an owned string, which is returned as it is when nothing is masked
@@ -195,35 +215,96 @@ impl SecretScrubber {
             }
             scrubber.push_secret(value);
         }
-        // Mask longer secrets first so a shorter one cannot break a longer match
-        scrubber.secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         scrubber.build_finder();
         scrubber
     }
 
-    /// Byte ranges of everything `scrub` would mask
-    fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+    /// Byte ranges `scrub` masks, sorted, merged where they overlap or touch:
+    /// every occurrence of every secret, overlapping ones included, and every
+    /// pattern match
+    fn mask_ranges(&self, text: &str) -> Vec<Range<usize>> {
         let mut ranges = Vec::new();
         if self.contains_secret(text) {
-            for secret in self.maskable_secrets() {
-                ranges.extend(
-                    text.match_indices(secret)
-                        .map(|(start, m)| (start, start + m.len())),
-                );
+            match &self.finder {
+                // The longest secret at every position where one starts: their
+                // union is the union of all occurrences. Each search starts one
+                // character after the previous match's start, so a secret that
+                // starts inside another is found too. (An overlapping search
+                // finds the same at half the speed.)
+                Some(finder) => {
+                    let mut at = 0;
+                    while let Some(found) = finder.locate.find(Input::new(text).range(at..)) {
+                        ranges.push(found.range());
+                        at = found.start() + next_char_len(text, found.start());
+                    }
+                }
+                None => {
+                    for secret in self.maskable_secrets() {
+                        ranges.extend(overlapping_occurrences(text, secret));
+                    }
+                }
             }
         }
         let patterns = default_patterns();
+        // One pass to skip text no pattern matches; the patterns' own literal
+        // prefilters then find their matches faster than the set can say which
+        // of them match
         if patterns.set.is_match(text) {
             for pattern in &patterns.list {
-                ranges.extend(pattern.find_iter(text).map(|m| (m.start(), m.end())));
+                ranges.extend(pattern.find_iter(text).map(|m| m.range()));
             }
         }
-        ranges
+        merge(ranges)
     }
 
     fn longest_secret(&self) -> usize {
         self.secrets.iter().map(String::len).max().unwrap_or(0)
     }
+}
+
+/// Every occurrence of `secret` in `text`, also those that overlap
+fn overlapping_occurrences<'t>(
+    text: &'t str,
+    secret: &'t str,
+) -> impl Iterator<Item = Range<usize>> + 't {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        let start = from + text.get(from..)?.find(secret)?;
+        // The next search starts one character on: occurrences may overlap
+        from = start + next_char_len(text, start);
+        Some(start..start + secret.len())
+    })
+}
+
+/// Length of the character at byte `at` of `text` (1 at the end)
+fn next_char_len(text: &str, at: usize) -> usize {
+    text[at..].chars().next().map_or(1, char::len_utf8)
+}
+
+/// `ranges` sorted, with ranges that overlap or touch merged into one
+fn merge(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// `text` with each of the sorted, disjoint `ranges` replaced by [MASKED]
+fn mask<'r>(text: &str, ranges: impl IntoIterator<Item = &'r Range<usize>>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for range in ranges {
+        out.push_str(&text[at..range.start]);
+        out.push_str(MASK);
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// Percent-encode everything except RFC 3986 unreserved characters
@@ -294,19 +375,15 @@ impl<'a> StreamScrubber<'a> {
         while !self.pending.is_char_boundary(boundary) {
             boundary -= 1;
         }
-        // Never cut through a match, and keep matches touching the end (they may
-        // grow). Moving the boundary back can put it inside another match, so
-        // repeat until no match is cut.
-        let matches = self.scrubber.match_ranges(&self.pending);
-        let mut moved = true;
-        while moved {
-            moved = false;
-            for &(start, end) in &matches {
-                if start < boundary && (end > boundary || end == len) {
-                    boundary = start;
-                    moved = true;
-                }
-            }
+        // Never cut through a masked range, and keep one touching the end (it
+        // may grow). The ranges are sorted and disjoint, so moving the boundary
+        // back to a range's start cannot put it inside an earlier one.
+        let matches = self.scrubber.mask_ranges(&self.pending);
+        if let Some(cut) = matches
+            .iter()
+            .find(|range| range.start < boundary && (range.end > boundary || range.end == len))
+        {
+            boundary = cut.start;
         }
         // ...unless that holds back too much. Exact secrets are never split (the
         // limit is longer than the longest one); a pattern match still growing at
@@ -314,10 +391,9 @@ impl<'a> StreamScrubber<'a> {
         let limit = MAX_PENDING.max(self.scrubber.longest_secret() + MAX_HOLDBACK);
         if len - boundary > limit {
             if let Some(start) = matches
-                .iter()
-                .filter(|&&(_, end)| end == len)
-                .map(|&(start, _)| start)
-                .min()
+                .last()
+                .filter(|range| range.end == len)
+                .map(|range| range.start)
             {
                 let head = self.pending[..start].to_string();
                 self.pending.clear();
@@ -332,13 +408,17 @@ impl<'a> StreamScrubber<'a> {
 
         let rest = self.pending.split_off(boundary);
         let ready = std::mem::replace(&mut self.pending, rest);
-        // Every secret or pattern match inside `ready` starts before the boundary
-        // (the search above reports the leftmost one), so without such a match
-        // there is nothing to mask
-        if matches.iter().all(|&(start, _)| start >= boundary) {
-            return ready;
+        // `ready` is masked with the ranges found above. They are what `scrub`
+        // finds in `ready` alone as long as none of them crosses the boundary
+        // (the patterns have no anchors or look-around, so a match that ends
+        // before the boundary does not depend on what follows it). Only the
+        // forced cut at the limit can cross one: then `ready` is searched again.
+        let before = matches.partition_point(|range| range.start < boundary);
+        match matches[..before].last() {
+            None => ready,
+            Some(last) if last.end > boundary => self.scrubber.scrub_owned(ready),
+            Some(_) => mask(&ready, &matches[..before]),
         }
-        self.scrubber.scrub_owned(ready)
     }
 
     /// Output held back until the next chunk
@@ -514,6 +594,84 @@ mod tests {
         assert_stream_matches_scrub_at_every_split(&scrubber, text);
     }
 
+    fn scrubber_masking(values: &[&str]) -> SecretScrubber {
+        let variables: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| serde_json::json!({"key": format!("V{i}"), "value": value, "masked": true}))
+            .collect();
+        let job: Job = serde_json::from_value(
+            serde_json::json!({"id": 1, "token": "job-token-abc123", "variables": variables}),
+        )
+        .unwrap();
+        SecretScrubber::new(vec![]).with_job_secrets(&job)
+    }
+
+    #[test]
+    fn overlapping_and_touching_secrets_are_masked_whole() {
+        let cases: [(&[&str], &str, &str); 5] = [
+            // Partly overlapping: no part of either is shown
+            (
+                &["abcdef1234", "1234xyz99"],
+                "key=abcdef1234xyz99 end\n",
+                "key=[MASKED] end\n",
+            ),
+            (
+                &["abcdef1234", "1234xyz99"],
+                "1234xyz99abcdef1234\n",
+                "[MASKED]\n",
+            ),
+            // Back to back: one mask
+            (
+                &["s3cr3t-aaaa", "s3cr3t-bbbb"],
+                "x=s3cr3t-aaaas3cr3t-bbbb y\n",
+                "x=[MASKED] y\n",
+            ),
+            // A secret overlapping itself
+            (&["ababa"], "ababababa! ababa\n", "[MASKED]! [MASKED]\n"),
+            // Multibyte secrets overlapping themselves
+            (&["äöäöä"], "x äöäöäöä y\n", "x [MASKED] y\n"),
+        ];
+        for (values, text, masked) in cases {
+            let scrubber = scrubber_masking(values);
+            assert_eq!(scrubber.scrub(text), masked, "{values:?} in {text:?}");
+            assert_stream_matches_scrub_at_every_split(&scrubber, text);
+        }
+    }
+
+    #[test]
+    fn a_pattern_match_holding_a_secret_is_masked_whole() {
+        let scrubber = scrubber_masking(&["s3cr3tpart"]);
+        let text = "token glrt-AAAAs3cr3tpartBBBBBBBBBBBB done\n";
+        assert_eq!(scrubber.scrub(text), "token [MASKED] done\n");
+        assert_stream_matches_scrub_at_every_split(&scrubber, text);
+
+        // A secret and a pattern match that overlap
+        let text = "password=s3cr3tpart\n";
+        assert_eq!(scrubber.scrub(text), "[MASKED]\n");
+        assert_stream_matches_scrub_at_every_split(&scrubber, text);
+
+        // A value too short for the pattern: only the secret is masked
+        let scrubber = scrubber_masking(&["pass1"]);
+        let text = "password=pass1 ok\n";
+        assert_eq!(scrubber.scrub(text), "password=[MASKED] ok\n");
+        assert_stream_matches_scrub_at_every_split(&scrubber, text);
+    }
+
+    #[test]
+    fn overlapping_occurrences_and_merged_ranges() {
+        assert_eq!(
+            overlapping_occurrences("aäaäa", "aäa").collect::<Vec<_>>(),
+            [0..4, 3..7]
+        );
+        assert_eq!(overlapping_occurrences("abc", "x").count(), 0);
+        assert_eq!(
+            merge(vec![5..7, 0..2, 1..3, 3..4, 9..10]),
+            [0..4, 5..7, 9..10]
+        );
+        assert_eq!(merge(vec![12..13, 0..10, 2..3]), [0..10, 12..13]);
+    }
+
     #[test]
     fn text_without_secrets_is_returned_as_is() {
         let scrubber = SecretScrubber::new(vec![]).with_job_secrets(&job_with_secrets());
@@ -556,9 +714,19 @@ mod tests {
     #[test]
     fn test_scrub_custom_secret() {
         let scrubber = SecretScrubber::new(vec!["my-super-secret-123".to_string()]);
-        let text = "Using secret: my-super-secret-123 for auth";
+        let text = "Using token my-super-secret-123 for auth";
         let scrubbed = scrubber.scrub(text);
-        assert_eq!(scrubbed, "Using secret: [MASKED] for auth");
+        assert_eq!(scrubbed, "Using token [MASKED] for auth");
+
+        // `secret: value` also matches a default pattern, which is masked whole:
+        // patterns are matched against the output, not against output in which
+        // the secrets were already replaced
+        let text = "Using secret: my-super-secret-123 for auth";
+        assert_eq!(scrubber.scrub(text), "Using [MASKED] for auth");
+        assert_eq!(
+            SecretScrubber::new(vec![]).scrub(text),
+            "Using [MASKED] for auth"
+        );
     }
 
     #[test]
