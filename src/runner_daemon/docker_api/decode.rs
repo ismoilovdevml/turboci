@@ -121,8 +121,11 @@ impl tokio_util::codec::Decoder for LogDecoder {
     }
 }
 
-/// Splits a body into JSON messages, one per line. A line that is not a
-/// whole message yet (`null`, blank, or cut short) is joined with the next.
+/// Splits a body into JSON messages. dockerd writes one per line, but a
+/// message is taken from wherever it ends: blank lines, `\r\n` and a
+/// message spread over several lines (pretty-printed) are all fine, and
+/// `null` is skipped. Every call returns the next whole message in the
+/// buffer if there is one, and asks for more bytes only when there is not.
 /// The last message may lack its newline.
 #[derive(Debug)]
 pub struct JsonLineDecoder<T> {
@@ -137,45 +140,39 @@ impl<T> Default for JsonLineDecoder<T> {
     }
 }
 
-/// `slice` as a message; `None` when it is not a whole one yet
-fn json_message<T: DeserializeOwned>(slice: &[u8]) -> Result<Option<T>, Error> {
-    match serde_json::from_slice::<Option<T>>(slice) {
-        Ok(message) => Ok(message),
-        Err(e) if e.is_data() => Err(Error::JsonData {
-            message: e.to_string(),
-        }),
-        Err(e) if e.is_eof() => Ok(None),
-        Err(e) => Err(Error::Json(e)),
-    }
-}
-
 impl<T: DeserializeOwned> tokio_util::codec::Decoder for JsonLineDecoder<T> {
     type Item = T;
     type Error = Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<T>, Error> {
-        if src.is_empty() {
-            return Ok(None);
-        }
-        let Some(newline) = src.iter().position(|b| *b == b'\n') else {
-            let message = json_message(src)?;
-            if message.is_some() {
-                src.clear();
-            }
-            return Ok(message);
-        };
-        let rest = src.split_off(newline + 1);
-        match json_message(&src[..newline])? {
-            Some(message) => {
-                src.unsplit(rest);
-                src.advance(newline + 1);
-                Ok(Some(message))
-            }
-            None => {
-                // Not a whole message: the newline was inside it
-                src.truncate(newline);
-                src.unsplit(rest);
-                Ok(None)
+        loop {
+            // The first value in the buffer and where it ends; whitespace
+            // before it (blank lines, a `\r`) is skipped
+            let (next, end) = {
+                let mut values = serde_json::Deserializer::from_slice(src).into_iter::<Option<T>>();
+                let next = values.next();
+                (next, values.byte_offset())
+            };
+            match next {
+                // Nothing but whitespace is left
+                None => {
+                    src.clear();
+                    return Ok(None);
+                }
+                Some(Ok(message)) => {
+                    src.advance(end);
+                    if let Some(message) = message {
+                        return Ok(Some(message));
+                    }
+                }
+                // Cut short: the rest of it has not arrived yet
+                Some(Err(e)) if e.is_eof() => return Ok(None),
+                Some(Err(e)) if e.is_data() => {
+                    return Err(Error::JsonData {
+                        message: e.to_string(),
+                    })
+                }
+                Some(Err(e)) => return Err(Error::Json(e)),
             }
         }
     }
@@ -366,6 +363,99 @@ mod tests {
         let decoded: Vec<Progress> = decode_chunks(
             JsonLineDecoder::default(),
             &[b"{\"status\":\n\"a\"}\n{\"status\":\"b\"}\n"],
+        )
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+
+        assert_eq!(decoded, vec![progress("a"), progress("b")]);
+    }
+
+    /// Every message `decode` gives for `body` without asking for more bytes
+    fn decode_buffered(body: &[u8]) -> Vec<Progress> {
+        use tokio_util::codec::Decoder;
+
+        let mut decoder = JsonLineDecoder::<Progress>::default();
+        let mut buffer = BytesMut::from(body);
+        let mut messages = Vec::new();
+        while let Some(message) = decoder.decode(&mut buffer).unwrap() {
+            messages.push(message);
+        }
+        messages
+    }
+
+    #[test]
+    fn whole_json_messages_in_the_buffer_never_wait_for_more_bytes() {
+        // Blank lines, whitespace-only lines and \r\n before a message
+        assert_eq!(
+            decode_buffered(b"\n\r\n  \t\n{\"status\":\"a\"}\r\n\r\n{\"status\":\"b\"}\n"),
+            vec![progress("a"), progress("b")]
+        );
+        // A message spread over lines, then another one in the same chunk
+        assert_eq!(
+            decode_buffered(b"{\n  \"status\": \"a\"\n}\n{\"status\":\"b\"}\n"),
+            vec![progress("a"), progress("b")]
+        );
+        // `null` is skipped
+        assert_eq!(
+            decode_buffered(b"null\n{\"status\":\"a\"}\n"),
+            vec![progress("a")]
+        );
+        // A message cut short waits for the rest
+        assert_eq!(
+            decode_buffered(b"{\"status\":\"a\"}\n{\"stat"),
+            vec![progress("a")]
+        );
+    }
+
+    #[tokio::test]
+    async fn json_messages_arrive_while_the_body_is_still_open() {
+        // dockerd keeps the body open after these (a pull still running)
+        let body: &[u8] =
+            b"{\"status\":\"a\"}\n\n\n{\n\"status\":\n\"b\"\n}\r\n{\"status\":\"c\"}\n";
+        let chunks =
+            futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(body))])
+                .chain(futures_util::stream::pending());
+        let reader = tokio_util::io::StreamReader::new(chunks);
+        let mut messages = FramedRead::new(reader, JsonLineDecoder::<Progress>::default());
+
+        let mut decoded = Vec::new();
+        for _ in 0..3 {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), messages.next())
+                .await
+                .expect("a message in the buffer waited for more bytes");
+            decoded.push(next.unwrap().unwrap());
+        }
+
+        assert_eq!(decoded, vec![progress("a"), progress("b"), progress("c")]);
+    }
+
+    #[tokio::test]
+    async fn blank_and_multi_line_json_split_anywhere_across_chunks() {
+        let body: &[u8] =
+            b"\r\n{\"status\":\"a\"}\r\n\r\n{\n  \"status\": \"b\"\n}\n\n{\"status\":\"c\"}\n\n  \n";
+        for size in 1..=body.len() {
+            let chunks: Vec<&[u8]> = body.chunks(size).collect();
+            let decoded: Vec<Progress> = decode_chunks(JsonLineDecoder::default(), &chunks)
+                .await
+                .into_iter()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                decoded,
+                vec![progress("a"), progress("b"), progress("c")],
+                "chunks of {}",
+                size
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_last_json_message_may_lack_its_newline_after_blank_lines() {
+        let decoded: Vec<Progress> = decode_chunks(
+            JsonLineDecoder::default(),
+            &[b"{\"status\":\"a\"}\n\n", b"\r\n{\"status\":", b"\"b\"}"],
         )
         .await
         .into_iter()
