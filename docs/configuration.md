@@ -63,6 +63,8 @@ work_dir = "/var/lib/turboci/builds"
 | `post_get_sources_script` | – | Script run after the checkout |
 | `pre_build_script` | – | Script run before `before_script`, in the same shell as the job's script |
 | `post_build_script` | – | Script run after `script`, in the same shell |
+| `name` | `default` | Name of the runner in logs and in the `runner` label of the [metrics](operations.md#metrics); letters, digits, `.`, `-`, `_` |
+| `limit` | `0` | Jobs this runner runs at the same time at most, within `concurrent`; `0`: only `concurrent` limits it. Mostly useful with [several runners](#several-runners) |
 
 These work as the settings of the same names in gitlab-runner's
 `[[runners]]`, so a gitlab-runner config can be carried over:
@@ -71,6 +73,55 @@ These work as the settings of the same names in gitlab-runner's
 environment = ["ANDROID_HOME=/home/ci/Android/Sdk", "GIT_STRATEGY=clone"]
 pre_get_sources_script = "export PATH=$PATH:/opt/flutter/bin"
 ```
+
+## Several runners
+
+One TurboCI process can run several runners, like gitlab-runner's
+`[[runners]]`: for different GitLab instances, projects or groups, or a Docker
+and a shell runner on one host. A file without `[[runners]]` is one runner,
+as before.
+
+```toml
+concurrent = 8              # jobs of all runners together
+check_interval = 3
+state_dir = "/var/lib/turboci"
+# metrics_listen, min_free_memory, min_free_disk and max_load_avg also go here
+
+[[runners]]
+name = "docker"
+runner_token = "glrt-AAAA"
+gitlab_url = "https://gitlab.example.com"
+limit = 6                   # at most 6 of the 8
+[runners.executor.docker]
+memory = "4g"
+
+[[runners]]
+name = "macos-builds"
+runner_token = "glrt-BBBB"
+gitlab_url = "https://gitlab.other.example"
+environment = ["ANDROID_HOME=/opt/android"]
+[runners.executor]
+executor_type = "shell"
+```
+
+- The top of the file holds only the settings of the whole process:
+  `concurrent`, `check_interval`, `metrics_listen`, the [admission
+  limits](#admission-control) and `state_dir`. Any other key there is an
+  error, as is one of these in a `[[runners]]` entry.
+- Each entry takes every runner setting of a file without `[[runners]]`
+  (written `[runners.executor.docker]` and so on), and needs a unique `name`.
+- Runners never share state: a runner's `state_dir` defaults to
+  `<state_dir>/runners/<name>`, its `cache_dir` to `<its state_dir>/cache`
+  and its workspaces (Docker `builds_dir`, shell `work_dir`) to
+  `<its state_dir>/builds`. Directories set by hand must not be shared or
+  nested between runners. Each runner has its own system ID, so one never
+  removes another's containers.
+- A job takes a slot of its runner (`limit`) and one of `concurrent`. Each
+  runner polls its GitLab every `check_interval`.
+- Runners with the same `proxy`, `no_proxy` and `tls_ca_file` share one HTTP
+  connection pool.
+- A reload applies each runner's settings as for a single runner; adding or
+  removing a runner needs a restart.
 
 ## Admission control
 

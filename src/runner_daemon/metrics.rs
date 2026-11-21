@@ -1,6 +1,7 @@
 //! Prometheus metrics (`metrics_listen`). The daemon counts with atomics,
 //! and a minimal HTTP/1.1 server answers `GET /metrics` with the text format;
-//! every other request gets 404.
+//! every other request gets 404. Each runner has its own counters, rendered
+//! with a `runner` label; a few belong to the whole process.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -67,12 +68,35 @@ pub enum ConfigReload {
 }
 const CONFIG_RELOADS: [&str; 2] = ["success", "failure"];
 
-/// Counters and states of the runner. Updates are single atomic operations:
+/// Counters of the whole process
+#[derive(Debug)]
+pub struct Process {
+    /// Seconds since the epoch the process started at
+    started: f64,
+    config_reloads: [AtomicU64; 2],
+}
+
+impl Default for Process {
+    fn default() -> Self {
+        Self {
+            started: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |since| since.as_secs_f64()),
+            config_reloads: Default::default(),
+        }
+    }
+}
+
+impl Process {
+    pub fn config_reload(&self, result: ConfigReload) {
+        self.config_reloads[result as usize].fetch_add(1, Relaxed);
+    }
+}
+
+/// Counters and states of a runner. Updates are single atomic operations:
 /// nothing on a job's path waits for a lock.
 #[derive(Debug)]
 pub struct Metrics {
-    /// Seconds since the epoch the process started at
-    started: f64,
     jobs_finished: [AtomicU64; 3],
     jobs_failed: [AtomicU64; 5],
     job_requests: [AtomicU64; 4],
@@ -80,7 +104,6 @@ pub struct Metrics {
     cache_restores: [AtomicU64; 3],
     cache_uploads: [AtomicU64; 3],
     cache_s3_errors: AtomicU64,
-    config_reloads: [AtomicU64; 2],
     /// Size of the kept workspaces at the last sweep; `u64::MAX` before the
     /// first one, or without `workspace_max_size` (they are not measured)
     workspaces_size: AtomicU64,
@@ -90,9 +113,6 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
-            started: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0.0, |since| since.as_secs_f64()),
             jobs_finished: Default::default(),
             jobs_failed: Default::default(),
             job_requests: Default::default(),
@@ -100,21 +120,26 @@ impl Default for Metrics {
             cache_restores: Default::default(),
             cache_uploads: Default::default(),
             cache_s3_errors: AtomicU64::new(0),
-            config_reloads: Default::default(),
             workspaces_size: AtomicU64::new(u64::MAX),
             workspaces_evicted: AtomicU64::new(0),
         }
     }
 }
 
-/// Values the daemon reads when the metrics are scraped
+/// Values the daemon reads of a runner when the metrics are scraped
 #[derive(Debug, Clone, Default)]
 pub struct Gauges {
     /// Jobs running now
     pub running: u64,
-    /// Jobs that may run at the same time (`concurrent`)
-    pub concurrent: u64,
     pub executor: String,
+}
+
+/// A runner's metrics, as rendered
+pub struct Runner<'a> {
+    /// Its name, the `runner` label
+    pub name: &'a str,
+    pub metrics: &'a Metrics,
+    pub gauges: Gauges,
 }
 
 impl Metrics {
@@ -156,162 +181,187 @@ impl Metrics {
         self.cache_s3_errors.fetch_add(count, Relaxed);
     }
 
-    pub fn config_reload(&self, result: ConfigReload) {
-        self.config_reloads[result as usize].fetch_add(1, Relaxed);
-    }
-
     /// A sweep measured the workspaces and evicted `evicted` of them
     pub fn workspaces_swept(&self, size: u64, evicted: u64) {
         self.workspaces_size.store(size, Relaxed);
         self.workspaces_evicted.fetch_add(evicted, Relaxed);
     }
+}
 
-    /// The metrics in Prometheus text format (version 0.0.4)
-    pub fn render(&self, gauges: &Gauges) -> String {
-        let mut out = String::with_capacity(4096);
-        let labeled = |name: &str, labels: &[&str], values: &[AtomicU64]| {
-            labels
-                .iter()
-                .zip(values)
-                .map(|(label, value)| {
-                    (
-                        format!("{}=\"{}\"", name, label),
-                        value.load(Relaxed).to_string(),
-                    )
+/// The metrics of the process and its runners (`concurrent` slots in all) in
+/// Prometheus text format (version 0.0.4)
+pub fn render(process: &Process, concurrent: u64, runners: &[Runner]) -> String {
+    let mut out = String::with_capacity(4096);
+    let labeled = |name: &str, labels: &[&str], values: &[AtomicU64]| {
+        labels
+            .iter()
+            .zip(values)
+            .map(|(label, value)| {
+                (
+                    format!("{}=\"{}\"", name, label),
+                    value.load(Relaxed).to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // The samples `of` gives for each runner, labeled with its name
+    let per_runner = |of: &dyn Fn(&Runner) -> Vec<(String, String)>| {
+        runners
+            .iter()
+            .flat_map(|runner| {
+                let name = format!("runner=\"{}\"", escape(runner.name));
+                of(runner).into_iter().map(move |(labels, value)| {
+                    if labels.is_empty() {
+                        (name.clone(), value)
+                    } else {
+                        (format!("{},{}", name, labels), value)
+                    }
                 })
-                .collect::<Vec<_>>()
-        };
-        family(
-            &mut out,
-            "turboci_runner_info",
-            "gauge",
-            "Version and executor of this runner",
-            [(
+            })
+            .collect::<Vec<_>>()
+    };
+    let single = |value: String| vec![(String::new(), value)];
+    family(
+        &mut out,
+        "turboci_runner_info",
+        "gauge",
+        "Version and executor of each runner",
+        per_runner(&|runner| {
+            vec![(
                 format!(
                     "version=\"{}\",revision=\"{}\",executor=\"{}\"",
                     escape(env!("CARGO_PKG_VERSION")),
                     escape(&super::revision()),
-                    escape(&gauges.executor)
+                    escape(&runner.gauges.executor)
                 ),
                 "1".to_string(),
-            )],
-        );
-        family(
-            &mut out,
-            "turboci_jobs_running",
-            "gauge",
-            "Jobs running now",
-            [(String::new(), gauges.running.to_string())],
-        );
-        family(
-            &mut out,
-            "turboci_concurrent_jobs",
-            "gauge",
-            "Jobs that may run at the same time (concurrent)",
-            [(String::new(), gauges.concurrent.to_string())],
-        );
-        family(
-            &mut out,
-            "turboci_jobs_finished_total",
-            "counter",
-            "Jobs that ended, by result",
-            labeled("result", &JOB_ENDS, &self.jobs_finished),
-        );
-        family(
-            &mut out,
-            "turboci_jobs_failed_total",
-            "counter",
-            "Jobs reported failed to GitLab, by failure reason",
-            labeled("reason", &FAILURE_REASONS, &self.jobs_failed),
-        );
-        family(
-            &mut out,
-            "turboci_job_requests_total",
-            "counter",
-            "Job requests to GitLab, by what they returned",
-            labeled("result", &REQUESTS, &self.job_requests),
-        );
-        family(
-            &mut out,
-            "turboci_admission_blocked",
-            "gauge",
-            "1 while no job is requested because the host is short of this resource",
-            Resource::ALL.iter().map(|resource| {
-                (
-                    format!("resource=\"{}\"", resource.name()),
-                    u8::from(self.admission_blocked[*resource as usize].load(Relaxed)).to_string(),
-                )
-            }),
-        );
-        family(
-            &mut out,
-            "turboci_cache_restores_total",
-            "counter",
-            "Cache entries jobs restored, by result",
-            labeled("result", &CACHE_RESTORES, &self.cache_restores),
-        );
-        family(
-            &mut out,
-            "turboci_cache_uploads_total",
-            "counter",
-            "Saved cache archives and their S3 upload, by result",
-            labeled("result", &CACHE_UPLOADS, &self.cache_uploads),
-        );
-        family(
-            &mut out,
-            "turboci_cache_s3_errors_total",
-            "counter",
-            "Cache downloads and uploads that S3 failed (the job used the local cache)",
-            [(
-                String::new(),
-                self.cache_s3_errors.load(Relaxed).to_string(),
-            )],
-        );
-        family(
-            &mut out,
-            "turboci_config_reloads_total",
-            "counter",
-            "Config reloads (SIGHUP), by result; a failed one keeps the running config",
-            labeled("result", &CONFIG_RELOADS, &self.config_reloads),
-        );
-        family(
-            &mut out,
-            "turboci_workspaces_evicted_total",
-            "counter",
-            "Workspaces deleted to stay within workspace_max_size",
-            [(
-                String::new(),
-                self.workspaces_evicted.load(Relaxed).to_string(),
-            )],
-        );
-        let size = self.workspaces_size.load(Relaxed);
-        if size != u64::MAX {
-            family(
-                &mut out,
-                "turboci_workspaces_size_bytes",
-                "gauge",
-                "Size of the kept workspaces at the last hourly sweep",
-                [(String::new(), size.to_string())],
-            );
+            )]
+        }),
+    );
+    family(
+        &mut out,
+        "turboci_jobs_running",
+        "gauge",
+        "Jobs running now",
+        per_runner(&|runner| single(runner.gauges.running.to_string())),
+    );
+    family(
+        &mut out,
+        "turboci_concurrent_jobs",
+        "gauge",
+        "Jobs that may run at the same time (concurrent)",
+        single(concurrent.to_string()),
+    );
+    family(
+        &mut out,
+        "turboci_jobs_finished_total",
+        "counter",
+        "Jobs that ended, by result",
+        per_runner(&|runner| labeled("result", &JOB_ENDS, &runner.metrics.jobs_finished)),
+    );
+    family(
+        &mut out,
+        "turboci_jobs_failed_total",
+        "counter",
+        "Jobs reported failed to GitLab, by failure reason",
+        per_runner(&|runner| labeled("reason", &FAILURE_REASONS, &runner.metrics.jobs_failed)),
+    );
+    family(
+        &mut out,
+        "turboci_job_requests_total",
+        "counter",
+        "Job requests to GitLab, by what they returned",
+        per_runner(&|runner| labeled("result", &REQUESTS, &runner.metrics.job_requests)),
+    );
+    family(
+        &mut out,
+        "turboci_admission_blocked",
+        "gauge",
+        "1 while no job is requested because the host is short of this resource",
+        per_runner(&|runner| {
+            Resource::ALL
+                .iter()
+                .map(|resource| {
+                    (
+                        format!("resource=\"{}\"", resource.name()),
+                        u8::from(
+                            runner.metrics.admission_blocked[*resource as usize].load(Relaxed),
+                        )
+                        .to_string(),
+                    )
+                })
+                .collect()
+        }),
+    );
+    family(
+        &mut out,
+        "turboci_cache_restores_total",
+        "counter",
+        "Cache entries jobs restored, by result",
+        per_runner(&|runner| labeled("result", &CACHE_RESTORES, &runner.metrics.cache_restores)),
+    );
+    family(
+        &mut out,
+        "turboci_cache_uploads_total",
+        "counter",
+        "Saved cache archives and their S3 upload, by result",
+        per_runner(&|runner| labeled("result", &CACHE_UPLOADS, &runner.metrics.cache_uploads)),
+    );
+    family(
+        &mut out,
+        "turboci_cache_s3_errors_total",
+        "counter",
+        "Cache downloads and uploads that S3 failed (the job used the local cache)",
+        per_runner(&|runner| single(runner.metrics.cache_s3_errors.load(Relaxed).to_string())),
+    );
+    family(
+        &mut out,
+        "turboci_config_reloads_total",
+        "counter",
+        "Config reloads (SIGHUP), by result; a failed one keeps the running config",
+        labeled("result", &CONFIG_RELOADS, &process.config_reloads),
+    );
+    family(
+        &mut out,
+        "turboci_workspaces_evicted_total",
+        "counter",
+        "Workspaces deleted to stay within workspace_max_size",
+        per_runner(&|runner| single(runner.metrics.workspaces_evicted.load(Relaxed).to_string())),
+    );
+    let sizes = per_runner(&|runner| {
+        let size = runner.metrics.workspaces_size.load(Relaxed);
+        if size == u64::MAX {
+            Vec::new()
+        } else {
+            single(size.to_string())
         }
+    });
+    if !sizes.is_empty() {
         family(
             &mut out,
-            "process_start_time_seconds",
+            "turboci_workspaces_size_bytes",
             "gauge",
-            "Start time of the process since the epoch, in seconds",
-            [(String::new(), format!("{:.3}", self.started))],
+            "Size of the kept workspaces at the last hourly sweep",
+            sizes,
         );
-        if let Some(bytes) = resident_memory() {
-            family(
-                &mut out,
-                "process_resident_memory_bytes",
-                "gauge",
-                "Resident memory size in bytes",
-                [(String::new(), bytes.to_string())],
-            );
-        }
-        out
     }
+    family(
+        &mut out,
+        "process_start_time_seconds",
+        "gauge",
+        "Start time of the process since the epoch, in seconds",
+        single(format!("{:.3}", process.started)),
+    );
+    if let Some(bytes) = resident_memory() {
+        family(
+            &mut out,
+            "process_resident_memory_bytes",
+            "gauge",
+            "Resident memory size in bytes",
+            single(bytes.to_string()),
+        );
+    }
+    out
 }
 
 /// Append one metric family: its HELP and TYPE lines, then a line per
@@ -454,14 +504,27 @@ mod tests {
     fn gauges() -> Gauges {
         Gauges {
             running: 2,
-            concurrent: 4,
             executor: "docker".to_string(),
         }
+    }
+
+    /// The metrics of a process with the single runner `metrics`
+    fn render_one(process: &Process, metrics: &Metrics) -> String {
+        render(
+            process,
+            4,
+            &[Runner {
+                name: "default",
+                metrics,
+                gauges: gauges(),
+            }],
+        )
     }
 
     #[test]
     fn renders_every_counter_in_the_text_format() {
         let metrics = Metrics::default();
+        let process = Process::default();
         metrics.job_finished(JobEnd::Success);
         metrics.job_finished(JobEnd::Success);
         metrics.job_failed(&FailureReason::ScriptFailure);
@@ -473,34 +536,32 @@ mod tests {
         metrics.cache_restore(CacheRestore::Miss);
         metrics.cache_upload(CacheUpload::Unchanged);
         metrics.cache_s3_errors(3);
-        metrics.config_reload(ConfigReload::Failure);
-        assert!(!metrics
-            .render(&gauges())
-            .contains("turboci_workspaces_size_bytes"));
+        process.config_reload(ConfigReload::Failure);
+        assert!(!render_one(&process, &metrics).contains("turboci_workspaces_size_bytes"));
         metrics.workspaces_swept(4096, 2);
 
-        let text = metrics.render(&gauges());
+        let text = render_one(&process, &metrics);
         for line in [
             "# TYPE turboci_jobs_finished_total counter",
-            "turboci_jobs_finished_total{result=\"success\"} 2",
-            "turboci_jobs_finished_total{result=\"failed\"} 1",
-            "turboci_jobs_finished_total{result=\"canceled\"} 1",
-            "turboci_jobs_failed_total{reason=\"script_failure\"} 1",
-            "turboci_jobs_failed_total{reason=\"runner_system_failure\"} 0",
-            "turboci_job_requests_total{result=\"error\"} 1",
-            "turboci_job_requests_total{result=\"job\"} 0",
-            "turboci_jobs_running 2",
+            "turboci_jobs_finished_total{runner=\"default\",result=\"success\"} 2",
+            "turboci_jobs_finished_total{runner=\"default\",result=\"failed\"} 1",
+            "turboci_jobs_finished_total{runner=\"default\",result=\"canceled\"} 1",
+            "turboci_jobs_failed_total{runner=\"default\",reason=\"script_failure\"} 1",
+            "turboci_jobs_failed_total{runner=\"default\",reason=\"runner_system_failure\"} 0",
+            "turboci_job_requests_total{runner=\"default\",result=\"error\"} 1",
+            "turboci_job_requests_total{runner=\"default\",result=\"job\"} 0",
+            "turboci_jobs_running{runner=\"default\"} 2",
             "turboci_concurrent_jobs 4",
-            "turboci_admission_blocked{resource=\"disk\"} 1",
-            "turboci_admission_blocked{resource=\"memory\"} 0",
-            "turboci_cache_restores_total{result=\"hit\"} 1",
-            "turboci_cache_restores_total{result=\"miss\"} 1",
-            "turboci_cache_uploads_total{result=\"unchanged\"} 1",
-            "turboci_cache_s3_errors_total 3",
+            "turboci_admission_blocked{runner=\"default\",resource=\"disk\"} 1",
+            "turboci_admission_blocked{runner=\"default\",resource=\"memory\"} 0",
+            "turboci_cache_restores_total{runner=\"default\",result=\"hit\"} 1",
+            "turboci_cache_restores_total{runner=\"default\",result=\"miss\"} 1",
+            "turboci_cache_uploads_total{runner=\"default\",result=\"unchanged\"} 1",
+            "turboci_cache_s3_errors_total{runner=\"default\"} 3",
             "turboci_config_reloads_total{result=\"success\"} 0",
             "turboci_config_reloads_total{result=\"failure\"} 1",
-            "turboci_workspaces_evicted_total 2",
-            "turboci_workspaces_size_bytes 4096",
+            "turboci_workspaces_evicted_total{runner=\"default\"} 2",
+            "turboci_workspaces_size_bytes{runner=\"default\"} 4096",
         ] {
             assert!(
                 text.lines().any(|l| l == line),
@@ -510,7 +571,7 @@ mod tests {
             );
         }
         assert!(text.contains(&format!(
-            "turboci_runner_info{{version=\"{}\",",
+            "turboci_runner_info{{runner=\"default\",version=\"{}\",",
             env!("CARGO_PKG_VERSION")
         )));
         assert!(text.contains("executor=\"docker\"} 1\n"));
@@ -526,6 +587,56 @@ mod tests {
             let name = line.split(['{', ' ']).next().unwrap();
             assert!(text.contains(&format!("# HELP {} ", name)), "{}", name);
             assert!(text.contains(&format!("# TYPE {} ", name)), "{}", name);
+        }
+    }
+
+    #[test]
+    fn every_runner_has_its_own_samples_under_one_family() {
+        let process = Process::default();
+        let (a, b) = (Metrics::default(), Metrics::default());
+        a.job_finished(JobEnd::Success);
+        b.workspaces_swept(10, 0);
+        let text = render(
+            &process,
+            6,
+            &[
+                Runner {
+                    name: "a",
+                    metrics: &a,
+                    gauges: gauges(),
+                },
+                Runner {
+                    name: "b",
+                    metrics: &b,
+                    gauges: Gauges {
+                        running: 0,
+                        executor: "shell".to_string(),
+                    },
+                },
+            ],
+        );
+
+        for line in [
+            "turboci_jobs_finished_total{runner=\"a\",result=\"success\"} 1",
+            "turboci_jobs_finished_total{runner=\"b\",result=\"success\"} 0",
+            "turboci_jobs_running{runner=\"a\"} 2",
+            "turboci_jobs_running{runner=\"b\"} 0",
+            "turboci_concurrent_jobs 6",
+            "turboci_workspaces_size_bytes{runner=\"b\"} 10",
+        ] {
+            assert!(
+                text.lines().any(|l| l == line),
+                "missing {:?} in\n{}",
+                line,
+                text
+            );
+        }
+        // Only the runner whose workspaces were measured has a size
+        assert!(!text.contains("turboci_workspaces_size_bytes{runner=\"a\"}"));
+        assert!(text.contains("runner=\"b\",version="));
+        assert!(text.contains("executor=\"shell\"} 1"));
+        for name in ["turboci_jobs_running", "turboci_concurrent_jobs"] {
+            assert_eq!(text.matches(&format!("# TYPE {} ", name)).count(), 1);
         }
     }
 
@@ -575,7 +686,7 @@ mod tests {
         metrics.job_finished(JobEnd::Success);
         let render: Render = {
             let metrics = metrics.clone();
-            Arc::new(move || metrics.render(&gauges()))
+            Arc::new(move || render_one(&Process::default(), &metrics))
         };
         let server = tokio::spawn(serve(listener, render));
 
@@ -584,7 +695,9 @@ mod tests {
         assert!(ok.contains("Content-Type: text/plain; version=0.0.4"));
         let (head, body) = ok.split_once("\r\n\r\n").unwrap();
         assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
-        assert!(body.contains("turboci_jobs_finished_total{result=\"success\"} 1\n"));
+        assert!(
+            body.contains("turboci_jobs_finished_total{runner=\"default\",result=\"success\"} 1\n")
+        );
 
         for request in [
             "GET / HTTP/1.1\r\n\r\n",
@@ -610,7 +723,7 @@ mod tests {
             .text()
             .await
             .unwrap()
-            .contains("turboci_jobs_running 2"));
+            .contains("turboci_jobs_running{runner=\"default\"} 2"));
         let missing = client
             .get(format!("http://{}/", addr))
             .send()

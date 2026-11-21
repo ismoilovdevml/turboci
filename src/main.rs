@@ -89,102 +89,17 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Commands::RunnerStart { config } => {
-            use gitlab::GitLabClient;
-            use runner_daemon::executor::{DockerExecutor, ExecutorType, ShellExecutor};
-            use runner_daemon::RunnerDaemon;
-
             info!("🚀 Starting TurboCI Runner Daemon...");
-            let runner_config = runner_daemon::config::RunnerConfig::load(&config)?;
-
-            // Initialize GitLab client with a system ID that survives restarts
-            // Kept in the state directory (the service can not write next to
-            // its config in /etc). Runners installed side by side get their
-            // own ID, so one never removes the other's containers.
-            let instance = if config == "/etc/turboci-runner.toml" {
-                ""
-            } else {
-                config.as_str()
-            };
-            let system_id = runner_daemon::system_id::load_or_create(
-                &std::path::Path::new(&runner_config.state_dir).join(".runner_system_id"),
-                instance,
-            );
-            info!("   System ID: {}", system_id);
-            let network = runner_config.network()?;
-            let gitlab = GitLabClient::with_network(
-                runner_config.gitlab_url.clone(),
-                runner_config.runner_token.clone(),
-                &network,
-            )?
-            .with_system_id(system_id.clone())
-            .with_executor(&runner_config.executor.executor_type);
-            if let Some(proxy) = &network.proxy {
-                // Only the host: the URL may hold a password
-                let host = reqwest::Url::parse(proxy)
-                    .ok()
-                    .and_then(|url| url.host_str().map(str::to_string))
-                    .unwrap_or_default();
-                info!("   Proxy: {}", host);
+            let file = runner_daemon::config::ConfigFile::load(&config)?;
+            let multi = file.multi;
+            let mut clients = Vec::new();
+            let mut runners = Vec::new();
+            for runner_config in file.runners {
+                runners.push(build_runner(&config, multi, runner_config, &mut clients)?);
             }
-
-            // Initialize executor based on config
-            let executor = match runner_config.executor.executor_type.as_str() {
-                "shell" => {
-                    info!("⚡ Using Shell executor (direct execution, super fast!)");
-                    tracing::warn!(
-                        "Shell executor runs job scripts directly on this host with the \
-                         runner's privileges and no isolation. Use executor_type = \"docker\" \
-                         unless every project using this runner is trusted."
-                    );
-                    ExecutorType::Shell(ShellExecutor::new(Some(
-                        runner_config.executor.shell.work_dir.clone(),
-                    )))
-                }
-                "docker" => {
-                    info!("🐳 Using Docker executor (isolated containers)");
-                    let docker = DockerExecutor::new(runner_config.executor.docker.clone())?
-                        .with_owner(&system_id);
-                    // In the background: resolving registry names with a slow
-                    // DNS must not delay taking jobs
-                    let (check, proxy) = (docker.clone(), runner_config.proxy.is_some());
-                    tokio::spawn(async move {
-                        for warning in check.daemon_warnings(proxy).await {
-                            tracing::warn!("{}", warning);
-                        }
-                    });
-                    ExecutorType::Docker(docker)
-                }
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "Unknown executor type: {}. Use 'shell' or 'docker'",
-                        runner_config.executor.executor_type
-                    ));
-                }
-            };
-
-            let executor = executor.with_ca_pem(network.ca_pem.clone());
-            let cache_s3 = runner_config.s3_cache().cloned();
-            // S3 shares GitLab's HTTP client: one proxy and CA setup, one pool
-            let http = gitlab.http();
-            let mut daemon = RunnerDaemon::new(runner_config, gitlab, executor);
-            if let Some(s3) = &cache_s3 {
-                let bucket = runner_daemon::s3::Bucket::new(s3, http)?;
-                // In the background: a slow S3 must not delay taking jobs
-                let (probe, url) = (bucket.clone(), s3.url.clone());
-                tokio::spawn(async move {
-                    match probe.probe().await {
-                        Ok(()) => info!("   S3 cache: {}", url),
-                        Err(message) => tracing::warn!(
-                            "S3 cache {}: {} (jobs keep using the local cache)",
-                            url,
-                            message
-                        ),
-                    }
-                });
-                daemon = daemon.with_s3_cache(bucket);
-            }
-            spawn_signal_handler(daemon.shutdown_handle(), daemon.reloader(&config))?;
-            daemon.start().await?;
+            let manager = runner_daemon::runners::Manager::new(runners);
+            spawn_signal_handler(manager.shutdown_handle(), manager.reloader(&config))?;
+            manager.start().await?;
         }
         Commands::InitRunner { output } => {
             use runner_daemon::config::RunnerConfig;
@@ -198,19 +113,170 @@ async fn run() -> Result<()> {
             println!("  3. Run: turboci runner-start -c {}", output);
         }
         Commands::RunnerStats { config } => {
-            let runner_config = runner_daemon::config::RunnerConfig::load(&config)?;
-            let cache = runner_daemon::job_cache::LocalCache::new(&runner_config.cache_dir);
-            let (archives, bytes) = cache.stats();
-
+            let file = runner_daemon::config::ConfigFile::load(&config)?;
             println!("\n📊 TurboCI Runner Statistics:");
-            println!("  Cache directory: {}", runner_config.cache_dir);
-            println!("  Cache archives:  {}", archives);
-            println!("  Cache size:      {:.1} MB", bytes as f64 / 1_048_576.0);
+            for runner_config in &file.runners {
+                let cache = runner_daemon::job_cache::LocalCache::new(&runner_config.cache_dir);
+                let (archives, bytes) = cache.stats();
+                if file.multi {
+                    println!("  Runner {}:", runner_config.name);
+                }
+                println!("  Cache directory: {}", runner_config.cache_dir);
+                println!("  Cache archives:  {}", archives);
+                println!("  Cache size:      {:.1} MB", bytes as f64 / 1_048_576.0);
+            }
         }
         Commands::Upgrade => upgrade().await?,
     }
 
     Ok(())
+}
+
+/// GitLab clients built so far, by their network settings (proxy, no_proxy,
+/// CA): runners with the same settings share one HTTP client and pool
+type Clients = Vec<(
+    (Option<String>, Option<String>, Option<String>),
+    gitlab::GitLabClient,
+)>;
+
+/// A runner of the config file at `config_path`: its GitLab client, system
+/// ID, executor and S3 cache
+fn build_runner(
+    config_path: &str,
+    multi: bool,
+    runner_config: runner_daemon::config::RunnerConfig,
+    clients: &mut Clients,
+) -> Result<runner_daemon::RunnerDaemon> {
+    use gitlab::GitLabClient;
+    use runner_daemon::executor::{DockerExecutor, ExecutorType, ShellExecutor};
+    use tracing::Instrument;
+
+    let span = if multi {
+        tracing::info_span!("runner", name = %runner_config.name)
+    } else {
+        tracing::Span::none()
+    };
+    let _span = span.enter();
+    if multi {
+        // Its own state directory under the base one, which may be new
+        if let Err(e) = std::fs::create_dir_all(&runner_config.state_dir) {
+            tracing::warn!("Cannot create state_dir {}: {}", runner_config.state_dir, e);
+        }
+    }
+
+    // Initialize GitLab client with a system ID that survives restarts
+    // Kept in the state directory (the service can not write next to
+    // its config in /etc). Runners installed side by side, and the runners
+    // of one config, get their own ID, so one never removes the other's
+    // containers.
+    let mut instance = if config_path == "/etc/turboci-runner.toml" {
+        String::new()
+    } else {
+        config_path.to_string()
+    };
+    if multi {
+        instance = format!("{}#{}", instance, runner_config.name);
+    }
+    let system_id = runner_daemon::system_id::load_or_create(
+        &std::path::Path::new(&runner_config.state_dir).join(".runner_system_id"),
+        &instance,
+    );
+    info!("   System ID: {}", system_id);
+    let network = runner_config.network()?;
+    let key = (
+        network.proxy.clone(),
+        network.no_proxy.clone(),
+        network.ca_pem.clone(),
+    );
+    let gitlab = match clients.iter().find(|(known, _)| *known == key) {
+        Some((_, client)) => client.sharing_http(
+            runner_config.gitlab_url.clone(),
+            runner_config.runner_token.clone(),
+        ),
+        None => {
+            let client = GitLabClient::with_network(
+                runner_config.gitlab_url.clone(),
+                runner_config.runner_token.clone(),
+                &network,
+            )?;
+            clients.push((key, client.clone()));
+            client
+        }
+    }
+    .with_system_id(system_id.clone())
+    .with_executor(&runner_config.executor.executor_type);
+    if let Some(proxy) = &network.proxy {
+        // Only the host: the URL may hold a password
+        let host = reqwest::Url::parse(proxy)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default();
+        info!("   Proxy: {}", host);
+    }
+
+    // Initialize executor based on config
+    let executor = match runner_config.executor.executor_type.as_str() {
+        "shell" => {
+            info!("⚡ Using Shell executor (direct execution, super fast!)");
+            tracing::warn!(
+                "Shell executor runs job scripts directly on this host with the \
+                 runner's privileges and no isolation. Use executor_type = \"docker\" \
+                 unless every project using this runner is trusted."
+            );
+            ExecutorType::Shell(ShellExecutor::new(Some(
+                runner_config.executor.shell.work_dir.clone(),
+            )))
+        }
+        "docker" => {
+            info!("🐳 Using Docker executor (isolated containers)");
+            let docker =
+                DockerExecutor::new(runner_config.executor.docker.clone())?.with_owner(&system_id);
+            // In the background: resolving registry names with a slow
+            // DNS must not delay taking jobs
+            let (check, proxy) = (docker.clone(), runner_config.proxy.is_some());
+            tokio::spawn(
+                async move {
+                    for warning in check.daemon_warnings(proxy).await {
+                        tracing::warn!("{}", warning);
+                    }
+                }
+                .in_current_span(),
+            );
+            ExecutorType::Docker(docker)
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unknown executor type: {}. Use 'shell' or 'docker'",
+                runner_config.executor.executor_type
+            ));
+        }
+    };
+
+    let executor = executor.with_ca_pem(network.ca_pem.clone());
+    let cache_s3 = runner_config.s3_cache().cloned();
+    // S3 shares GitLab's HTTP client: one proxy and CA setup, one pool
+    let http = gitlab.http();
+    let mut daemon = runner_daemon::RunnerDaemon::new(runner_config, gitlab, executor);
+    if let Some(s3) = &cache_s3 {
+        let bucket = runner_daemon::s3::Bucket::new(s3, http)?;
+        // In the background: a slow S3 must not delay taking jobs
+        let (probe, url) = (bucket.clone(), s3.url.clone());
+        tokio::spawn(
+            async move {
+                match probe.probe().await {
+                    Ok(()) => info!("   S3 cache: {}", url),
+                    Err(message) => tracing::warn!(
+                        "S3 cache {}: {} (jobs keep using the local cache)",
+                        url,
+                        message
+                    ),
+                }
+            }
+            .in_current_span(),
+        );
+        daemon = daemon.with_s3_cache(bucket);
+    }
+    Ok(daemon)
 }
 
 /// SIGQUIT: finish running jobs, then exit. SIGTERM/SIGINT: stop running jobs,

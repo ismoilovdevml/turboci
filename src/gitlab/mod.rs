@@ -126,6 +126,19 @@ impl GitLabClient {
         })
     }
 
+    /// A client of another runner (GitLab URL and token) on the same HTTP
+    /// client: the same proxy and CA, one connection pool
+    pub fn sharing_http(&self, url: String, token: String) -> Self {
+        Self {
+            client: self.client.clone(),
+            url,
+            token,
+            system_id: format!("r_{}", &Uuid::new_v4().simple().to_string()[..12]),
+            info: self.info.clone(),
+            last_update: Arc::default(),
+        }
+    }
+
     /// The runner's HTTP client (proxy, CA, connection pool), shared with
     /// the S3 cache, whose requests set their own timeouts
     pub fn http(&self) -> reqwest::Client {

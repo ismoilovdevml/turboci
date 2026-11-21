@@ -9,6 +9,13 @@ concurrent = 4
 # Conflict the runner asks again within 0.25s, doubling up to this
 check_interval = 3
 
+# Several runners in one process (gitlab-runner's [[runners]]) are described
+# in docs/configuration.md#several-runners; this file is a single runner.
+# Its name in logs and in the `runner` label of the metrics
+# name = "default"
+# Jobs this runner runs at once at most, within concurrent (0 = no own limit)
+# limit = 0
+
 # GitLab runner token (get from GitLab CI/CD settings)
 runner_token = "glrt-YOUR_RUNNER_TOKEN_HERE"
 

@@ -19,6 +19,13 @@ pub const GLOBAL_KEYS: [&str; 6] = [
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RunnerConfig {
+    /// Name of the runner in logs and metrics (the `runner` label); every
+    /// `[[runners]]` entry needs its own
+    pub name: String,
+    /// Jobs this runner runs at the same time at most, within `concurrent`
+    /// (0 = only `concurrent` limits it), as gitlab-runner's `limit`
+    pub limit: u32,
+
     /// Number of concurrent jobs
     pub concurrent: u32,
 
@@ -894,7 +901,16 @@ fn default_cache_dir() -> String {
 }
 
 /// Dotted paths of keys in `content` that the parsed config does not have
+#[cfg(test)]
 fn unknown_keys(content: &str, config: &RunnerConfig) -> Vec<String> {
+    content
+        .parse::<toml::Table>()
+        .map(|given| unknown_table_keys(&given, config))
+        .unwrap_or_default()
+}
+
+/// Dotted paths of keys in `given` that the parsed config does not have
+fn unknown_table_keys(given: &toml::Table, config: &RunnerConfig) -> Vec<String> {
     fn walk(given: &toml::Table, known: &toml::Table, prefix: &str, out: &mut Vec<String>) {
         for (key, value) in given {
             let path = format!("{}{}", prefix, key);
@@ -908,14 +924,11 @@ fn unknown_keys(content: &str, config: &RunnerConfig) -> Vec<String> {
         }
     }
 
-    let (Ok(given), Ok(known)) = (
-        content.parse::<toml::Table>(),
-        toml::Table::try_from(config),
-    ) else {
+    let Ok(known) = toml::Table::try_from(config) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    walk(&given, &known, "", &mut out);
+    walk(given, &known, "", &mut out);
     out
 }
 
@@ -930,6 +943,8 @@ impl Default for ShellConfig {
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
+            name: "default".to_string(),
+            limit: 0,
             concurrent: 4,
             check_interval: 3,
             runner_token: String::new(),
@@ -1017,7 +1032,8 @@ impl Default for DockerConfig {
 }
 
 impl RunnerConfig {
-    /// Load configuration from TOML file
+    /// Load a config file without [[runners]] (see `ConfigFile::load`)
+    #[cfg(test)]
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path.as_ref())
             .with_context(|| format!("Failed to read config file: {:?}", path.as_ref()))?;
@@ -1030,25 +1046,57 @@ impl RunnerConfig {
 
     /// Parse TOML, warning about keys the runner does not know (they are ignored)
     pub fn parse(content: &str) -> Result<Self> {
-        let mut config: RunnerConfig = toml::from_str(content)?;
-        for key in unknown_keys(content, &config) {
-            tracing::warn!("Ignoring unknown config key `{}`", key);
+        let config: RunnerConfig = toml::from_str(content)?;
+        Ok(config.finish(&content.parse()?, ""))
+    }
+
+    /// A runner's config from its table of a `[[runners]]` file
+    fn from_table(given: toml::Table, name: &str) -> Result<Self> {
+        let config: RunnerConfig = toml::Value::Table(given.clone()).try_into()?;
+        Ok(config.finish(&given, &format!(" in [[runners]] {}", name)))
+    }
+
+    /// Warn about keys of `given` the runner does not know (`place` says
+    /// where they are) and fill in defaults that depend on other settings
+    fn finish(mut self, given: &toml::Table, place: &str) -> Self {
+        for key in unknown_table_keys(given, &self) {
+            tracing::warn!("Ignoring unknown config key `{}`{}", key, place);
         }
         // On disk with the runner's state: a /tmp cleaner (or tmpfs) must not
         // remove parts of workspaces kept between jobs
-        if config.executor.docker.builds_dir.is_none() {
-            config.executor.docker.builds_dir = Some(
-                Path::new(&config.state_dir)
+        if self.executor.docker.builds_dir.is_none() {
+            self.executor.docker.builds_dir = Some(
+                Path::new(&self.state_dir)
                     .join("builds")
                     .to_string_lossy()
                     .into_owned(),
             );
         }
-        Ok(config)
+        self
+    }
+
+    /// Host directory of the job workspaces of the configured executor
+    pub fn builds_root(&self) -> &str {
+        match self.executor.executor_type.as_str() {
+            "shell" => &self.executor.shell.work_dir,
+            // Always set by `finish`
+            _ => self
+                .executor
+                .docker
+                .builds_dir
+                .as_deref()
+                .unwrap_or_default(),
+        }
     }
 
     /// Reject values the runner cannot work with
     pub fn validate(&self) -> Result<()> {
+        if !valid_name(&self.name) {
+            anyhow::bail!(
+                "name must be letters, digits, '.', '-' or '_', got {:?}",
+                self.name
+            );
+        }
         if self.runner_token.trim().is_empty() {
             anyhow::bail!("runner_token is empty: set the runner authentication token (glrt-...)");
         }
@@ -1158,6 +1206,200 @@ impl RunnerConfig {
     pub fn create_example<P: AsRef<Path>>(path: P) -> Result<()> {
         let config = Self::default();
         config.save(path)
+    }
+}
+
+/// Whether `name` can name a runner: it ends up in directory names and
+/// metric labels
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// The config file: one runner, set at the top of the file as in every
+/// earlier version, or several in `[[runners]]` as in gitlab-runner. The
+/// runners of a file share the settings in `GLOBAL_KEYS`.
+#[derive(Debug, Clone)]
+pub struct ConfigFile {
+    /// Every runner of the file, each holding the global settings too
+    pub runners: Vec<RunnerConfig>,
+    /// The runners come from `[[runners]]`
+    pub multi: bool,
+}
+
+impl ConfigFile {
+    /// Load and check the config file at `path`
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let content = fs::read_to_string(path.as_ref())
+            .with_context(|| format!("Failed to read config file: {:?}", path.as_ref()))?;
+        let file = Self::parse(&content)
+            .with_context(|| format!("Invalid config file: {:?}", path.as_ref()))?;
+        file.validate()?;
+        Ok(file)
+    }
+
+    /// Parse a config file, with or without `[[runners]]`.
+    ///
+    /// With `[[runners]]` the top of the file holds the global settings and
+    /// `state_dir`, the base of the runners' own state directories. Each
+    /// entry is a runner config like a file without `[[runners]]` and needs a
+    /// `name`; its `state_dir` defaults to `<state_dir>/runners/<name>`, its
+    /// `cache_dir` to `<its state_dir>/cache` and its workspaces (Docker
+    /// `builds_dir`, shell `work_dir`) to `<its state_dir>/builds`, so
+    /// runners never share them by default.
+    pub fn parse(content: &str) -> Result<Self> {
+        let table: toml::Table = content.parse()?;
+        let Some(entries) = table.get("runners") else {
+            return Ok(Self {
+                runners: vec![RunnerConfig::parse(content)?],
+                multi: false,
+            });
+        };
+        let toml::Value::Array(entries) = entries else {
+            anyhow::bail!("runners must be a list of [[runners]] tables");
+        };
+        if entries.is_empty() {
+            anyhow::bail!("runners is empty: a config needs at least one runner");
+        }
+        let mut top = table.clone();
+        top.remove("runners");
+        let base = match top.remove("state_dir") {
+            Some(toml::Value::String(dir)) => dir,
+            Some(_) => anyhow::bail!("state_dir must be a string"),
+            None => RunnerConfig::default().state_dir,
+        };
+        if let Some(key) = top.keys().find(|key| !GLOBAL_KEYS.contains(&key.as_str())) {
+            anyhow::bail!(
+                "{} must be set in each [[runners]] entry: with [[runners]], only {} and state_dir go at the top of the file",
+                key,
+                GLOBAL_KEYS.join(", ")
+            );
+        }
+        let mut runners = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let toml::Value::Table(entry) = entry else {
+                anyhow::bail!("[[runners]] entry {} is not a table", index + 1);
+            };
+            let Some(toml::Value::String(name)) = entry.get("name") else {
+                anyhow::bail!("[[runners]] entry {} needs a name", index + 1);
+            };
+            if let Some(key) = entry.keys().find(|key| GLOBAL_KEYS.contains(&key.as_str())) {
+                anyhow::bail!(
+                    "[[runners]] {}: {} is a setting of the whole runner process: set it once at the top of the file",
+                    name,
+                    key
+                );
+            }
+            let mut merged = entry.clone();
+            merged.extend(top.clone());
+            let state_dir = match merged.get("state_dir") {
+                Some(toml::Value::String(dir)) => dir.clone(),
+                Some(_) => anyhow::bail!("[[runners]] {}: state_dir must be a string", name),
+                None => Path::new(&base)
+                    .join("runners")
+                    .join(name)
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            let under_state = |dir: &str| {
+                toml::Value::String(
+                    Path::new(&state_dir)
+                        .join(dir)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            };
+            merged
+                .entry("state_dir")
+                .or_insert_with(|| toml::Value::String(state_dir.clone()));
+            merged
+                .entry("cache_dir")
+                .or_insert_with(|| under_state("cache"));
+            let shell = table_in(table_in(&mut merged, "executor", name)?, "shell", name)?;
+            shell
+                .entry("work_dir")
+                .or_insert_with(|| under_state("builds"));
+            runners.push(
+                RunnerConfig::from_table(merged, name)
+                    .with_context(|| format!("[[runners]] {}", name))?,
+            );
+        }
+        Ok(Self {
+            runners,
+            multi: true,
+        })
+    }
+
+    /// Check every runner, and that no two runners share a name, state,
+    /// workspaces or cache
+    pub fn validate(&self) -> Result<()> {
+        for runner in &self.runners {
+            runner.validate().with_context(|| {
+                if self.multi {
+                    format!("[[runners]] {}", runner.name)
+                } else {
+                    "invalid config".to_string()
+                }
+            })?;
+        }
+        for (index, a) in self.runners.iter().enumerate() {
+            for b in &self.runners[index + 1..] {
+                if a.name == b.name {
+                    anyhow::bail!("two [[runners]] are named {:?}: names must differ", a.name);
+                }
+                if Path::new(&a.state_dir) == Path::new(&b.state_dir) {
+                    anyhow::bail!(
+                        "[[runners]] {} and {} share the state_dir {:?}",
+                        a.name,
+                        b.name,
+                        a.state_dir
+                    );
+                }
+                // One runner's cleanup would remove the other's workspaces or archives
+                for (what_a, dir_a) in
+                    [("workspaces", a.builds_root()), ("cache_dir", &a.cache_dir)]
+                {
+                    for (what_b, dir_b) in
+                        [("workspaces", b.builds_root()), ("cache_dir", &b.cache_dir)]
+                    {
+                        let (dir_a, dir_b) = (Path::new(dir_a), Path::new(dir_b));
+                        if dir_a.starts_with(dir_b) || dir_b.starts_with(dir_a) {
+                            anyhow::bail!(
+                                "[[runners]] {} ({} {:?}) and {} ({} {:?}) must not share directories",
+                                a.name,
+                                what_a,
+                                dir_a,
+                                b.name,
+                                what_b,
+                                dir_b
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The settings of the whole process (`GLOBAL_KEYS`), the same in every runner
+    pub fn global(&self) -> &RunnerConfig {
+        &self.runners[0]
+    }
+}
+
+/// The table under `key` in `table`, created when missing
+fn table_in<'a>(table: &'a mut toml::Table, key: &str, name: &str) -> Result<&'a mut toml::Table> {
+    match table
+        .entry(key)
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+    {
+        toml::Value::Table(inner) => Ok(inner),
+        _ => anyhow::bail!("[[runners]] {}: {} must be a table", name, key),
     }
 }
 
@@ -1912,5 +2154,132 @@ mod tests {
             let config = daemon_config(&format!("metrics_listen = {:?}", bad));
             assert!(config.validate().is_err(), "accepted {:?}", bad);
         }
+    }
+
+    #[test]
+    fn a_file_without_runners_is_one_runner_as_before() {
+        let content = "concurrent = 2\nrunner_token = \"t\"\nstate_dir = \"/srv/ci\"\ncache_dir = \"/srv/ci/cache\"";
+        let file = ConfigFile::parse(content).unwrap();
+        file.validate().unwrap();
+        assert!(!file.multi);
+        assert_eq!(file.runners.len(), 1);
+        let runner = &file.runners[0];
+        assert_eq!(runner.name, "default");
+        assert_eq!(runner.limit, 0);
+        assert_eq!(runner.concurrent, 2);
+        assert_eq!(runner.builds_root(), "/srv/ci/builds");
+        assert_eq!(
+            format!("{:?}", runner),
+            format!("{:?}", RunnerConfig::parse(content).unwrap())
+        );
+    }
+
+    const TWO_RUNNERS: &str = r#"
+concurrent = 6
+check_interval = 5
+metrics_listen = "127.0.0.1:9252"
+state_dir = "/srv/ci"
+
+[[runners]]
+name = "docker-a"
+runner_token = "glrt-a"
+gitlab_url = "https://a.example"
+limit = 4
+[runners.executor.docker]
+memory = "2g"
+
+[[runners]]
+name = "shell-b"
+runner_token = "glrt-b"
+gitlab_url = "https://b.example"
+environment = ["B=1"]
+[runners.executor]
+executor_type = "shell"
+"#;
+
+    #[test]
+    fn runners_share_the_global_settings_and_get_their_own_directories() {
+        let file = ConfigFile::parse(TWO_RUNNERS).unwrap();
+        file.validate().unwrap();
+        assert!(file.multi);
+        let [a, b] = &file.runners[..] else {
+            panic!("two runners expected")
+        };
+        for runner in [a, b] {
+            assert_eq!(runner.concurrent, 6);
+            assert_eq!(runner.check_interval, 5);
+            assert_eq!(runner.metrics_listen.as_deref(), Some("127.0.0.1:9252"));
+        }
+        assert_eq!((a.name.as_str(), a.limit), ("docker-a", 4));
+        assert_eq!((b.name.as_str(), b.limit), ("shell-b", 0));
+        assert_eq!(a.runner_token, "glrt-a");
+        assert_eq!(b.gitlab_url, "https://b.example");
+        assert_eq!(a.executor.docker.memory.as_deref(), Some("2g"));
+        assert_eq!(b.environment, ["B=1"]);
+        assert_eq!(a.state_dir, "/srv/ci/runners/docker-a");
+        assert_eq!(a.cache_dir, "/srv/ci/runners/docker-a/cache");
+        assert_eq!(a.builds_root(), "/srv/ci/runners/docker-a/builds");
+        assert_eq!(b.builds_root(), "/srv/ci/runners/shell-b/builds");
+        assert_eq!(b.cache_dir, "/srv/ci/runners/shell-b/cache");
+        assert_eq!(file.global().concurrent, 6);
+
+        // Directories set in an entry are kept
+        let own = TWO_RUNNERS.replace(
+            "limit = 4\n",
+            "limit = 4\nstate_dir = \"/data/a\"\ncache_dir = \"/cache/a\"\n",
+        );
+        let file = ConfigFile::parse(&own).unwrap();
+        file.validate().unwrap();
+        assert_eq!(file.runners[0].state_dir, "/data/a");
+        assert_eq!(file.runners[0].cache_dir, "/cache/a");
+        assert_eq!(file.runners[0].builds_root(), "/data/a/builds");
+
+        // The example in the docs
+        let docs = toml_block_after(
+            include_str!("../../docs/configuration.md"),
+            "## Several runners",
+        );
+        let file = ConfigFile::parse(&docs).unwrap();
+        file.validate().unwrap();
+        assert_eq!(file.runners.len(), 2);
+        assert_eq!(file.runners[0].limit, 6);
+        assert_eq!(file.runners[1].executor.executor_type, "shell");
+    }
+
+    #[test]
+    fn rejects_runners_that_would_clash() {
+        let check = |content: &str| ConfigFile::parse(content).and_then(|file| file.validate());
+        let error = |content: &str| format!("{:#}", check(content).unwrap_err());
+        check(TWO_RUNNERS).unwrap();
+
+        // A runner setting at the top, a global one in an entry
+        assert!(error(&format!("cache_enabled = false\n{}", TWO_RUNNERS))
+            .contains("cache_enabled must be set in each [[runners]] entry"));
+        assert!(error(&TWO_RUNNERS.replace("limit = 4", "concurrent = 4"))
+            .contains("docker-a: concurrent is a setting of the whole runner process"));
+        assert!(error(&TWO_RUNNERS.replace("name = \"shell-b\"\n", ""))
+            .contains("entry 2 needs a name"));
+        assert!(error(&TWO_RUNNERS.replace("shell-b", "docker-a")).contains("named \"docker-a\""));
+        assert!(error(&TWO_RUNNERS.replace("shell-b", "../x")).contains("name must be"));
+        assert!(error("runners = []").contains("at least one runner"));
+        assert!(error("[runners]\nname = \"x\"").contains("list of [[runners]]"));
+        // Each runner is checked like a single one
+        assert!(error(&TWO_RUNNERS.replace("glrt-b", " ")).contains("[[runners]] shell-b"));
+        // Shared state, workspaces or cache
+        assert!(error(&TWO_RUNNERS.replace(
+            "environment",
+            "state_dir = \"/srv/ci/runners/docker-a\"\nenvironment"
+        ))
+        .contains("share the state_dir"));
+        assert!(error(&TWO_RUNNERS.replace(
+            "environment",
+            "cache_dir = \"/srv/ci/runners/docker-a/builds/x\"\nenvironment"
+        ))
+        .contains("must not share directories"));
+        assert!(error(&TWO_RUNNERS.replace(
+            "environment",
+            "cache_dir = \"/srv/ci/runners/docker-a/cache\"\nenvironment"
+        ))
+        .contains("must not share directories"));
     }
 }

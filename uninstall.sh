@@ -169,36 +169,51 @@ remove_config() {
     done
 }
 
-# Remove job containers and networks left by a crash
-remove_job_containers() {
-    command -v docker > /dev/null 2>&1 || return 0
-    echo -e "\n${YELLOW}🐳 Removing leftover job containers...${NC}"
-
-    if [ -n "$OWNER" ]; then
-        FILTER="label=turboci.runner=$OWNER"
-    elif [ -z "$OTHER_RUNNERS" ]; then
-        FILTER="name=^turboci-job-"
-    else
-        echo -e "${YELLOW}⚠️  No system ID in $STATE_DIR; containers left alone (other runners are installed)${NC}"
-        return
-    fi
-    CONTAINERS=$(docker ps -aq --filter "$FILTER" 2>/dev/null || true)
+# Remove the containers, networks and (with a system ID) cache volumes
+# matching the docker filter $1
+remove_matching() {
+    CONTAINERS=$(docker ps -aq --filter "$1" 2>/dev/null || true)
     if [ -n "$CONTAINERS" ]; then
         echo "$CONTAINERS" | xargs docker rm -f > /dev/null
         echo -e "${GREEN}✓${NC} Removed $(echo "$CONTAINERS" | wc -l) container(s)"
     fi
-    NETWORKS=$(docker network ls -q --filter "$FILTER" 2>/dev/null || true)
+    NETWORKS=$(docker network ls -q --filter "$1" 2>/dev/null || true)
     if [ -n "$NETWORKS" ]; then
         echo "$NETWORKS" | xargs docker network rm > /dev/null
         echo -e "${GREEN}✓${NC} Removed $(echo "$NETWORKS" | wc -l) network(s)"
     fi
     # Persistent cache volumes (executor.docker.volumes) of this runner
-    if [ -n "$OWNER" ]; then
-        VOLUMES=$(docker volume ls -q --filter "$FILTER" 2>/dev/null || true)
-        if [ -n "$VOLUMES" ]; then
-            echo "$VOLUMES" | xargs docker volume rm > /dev/null
-            echo -e "${GREEN}✓${NC} Removed $(echo "$VOLUMES" | wc -l) cache volume(s)"
-        fi
+    case "$1" in
+        label=*)
+            VOLUMES=$(docker volume ls -q --filter "$1" 2>/dev/null || true)
+            if [ -n "$VOLUMES" ]; then
+                echo "$VOLUMES" | xargs docker volume rm > /dev/null
+                echo -e "${GREEN}✓${NC} Removed $(echo "$VOLUMES" | wc -l) cache volume(s)"
+            fi
+            ;;
+    esac
+}
+
+# Remove job containers and networks left by a crash
+remove_job_containers() {
+    command -v docker > /dev/null 2>&1 || return 0
+    echo -e "\n${YELLOW}🐳 Removing leftover job containers...${NC}"
+
+    # Runners of a config with [[runners]] have their own system IDs
+    RUNNER_OWNERS=""
+    if [ -n "$STATE_DIR" ]; then
+        for id_file in "$STATE_DIR"/runners/*/.runner_system_id; do
+            [ -f "$id_file" ] && RUNNER_OWNERS="$RUNNER_OWNERS $(cat "$id_file" 2>/dev/null)"
+        done
+    fi
+    if [ -n "$OWNER" ] || [ -n "$RUNNER_OWNERS" ]; then
+        for owner in $OWNER $RUNNER_OWNERS; do
+            remove_matching "label=turboci.runner=$owner"
+        done
+    elif [ -z "$OTHER_RUNNERS" ]; then
+        remove_matching "name=^turboci-job-"
+    else
+        echo -e "${YELLOW}⚠️  No system ID in $STATE_DIR; containers left alone (other runners are installed)${NC}"
     fi
 }
 

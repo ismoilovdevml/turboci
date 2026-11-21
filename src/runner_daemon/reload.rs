@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use super::config::{RunnerConfig, GLOBAL_KEYS};
-use super::{admission, local_cache, metrics, RunnerDaemon, Settings};
+use super::config::{ConfigFile, RunnerConfig, GLOBAL_KEYS};
+use super::runners::Manager;
+use super::{admission, local_cache, metrics, runner_limit, RunnerDaemon, Settings};
 
 /// What a reload did
 #[derive(Debug, Default, PartialEq)]
@@ -23,21 +24,20 @@ pub struct Reloaded {
     pub restart_needed: Vec<String>,
 }
 
-/// Reloads a daemon's config file (see `RunnerDaemon::reloader`)
+/// Reloads the config file of a manager's runners (see `Manager::reloader`)
 #[derive(Clone)]
 pub struct Reloader {
-    daemon: RunnerDaemon,
+    manager: Manager,
     path: PathBuf,
 }
 
 impl Reloader {
     /// Reload and log the outcome; on error the running config stays
     pub fn reload(&self) {
-        match self.daemon.reload(&self.path) {
+        let process = &self.manager.runners[0].process;
+        match self.manager.reload(&self.path) {
             Ok(reloaded) => {
-                self.daemon
-                    .metrics
-                    .config_reload(metrics::ConfigReload::Success);
+                process.config_reload(metrics::ConfigReload::Success);
                 if reloaded.applied.is_empty() {
                     info!("🔄 Config reloaded: no change to the live settings");
                 } else {
@@ -51,9 +51,7 @@ impl Reloader {
                 }
             }
             Err(e) => {
-                self.daemon
-                    .metrics
-                    .config_reload(metrics::ConfigReload::Failure);
+                process.config_reload(metrics::ConfigReload::Failure);
                 error!(
                     "❌ Config reload failed, the runner keeps its config: {:#}",
                     e
@@ -63,34 +61,80 @@ impl Reloader {
     }
 }
 
-impl RunnerDaemon {
-    /// A reloader of the config file at `path`, the one the daemon was started with
+impl Manager {
+    /// A reloader of the config file at `path`, the one the runners were started with
     pub fn reloader(&self, path: impl Into<PathBuf>) -> Reloader {
         Reloader {
-            daemon: self.clone(),
+            manager: self.clone(),
             path: path.into(),
         }
     }
 
     /// Re-read the config at `path` and apply its live settings. Nothing is
-    /// applied unless the whole file is valid.
+    /// applied unless the whole file is valid. Runners are matched by name;
+    /// adding or removing one needs a restart.
     pub fn reload(&self, path: &Path) -> Result<Reloaded> {
-        let new = RunnerConfig::load(path)?;
-        let limits = admission::Limits::from_config(&new)?;
-        let mut reloaded = self.reload_global(&new, limits);
-        let runner = self.reload_runner(&new);
-        reloaded.applied.extend(runner.applied);
-        reloaded.restart_needed.extend(runner.restart_needed);
+        let file = ConfigFile::load(path)?;
+        let limits = admission::Limits::from_config(file.global())?;
+        let mut reloaded = self.runners[0].reload_global(file.global(), limits);
+        // Per runner reports name the runner once there are several
+        let named = file.multi || self.runners.len() > 1;
+        let prefix = |name: &str, text: String| {
+            if named {
+                format!("{}: {}", name, text)
+            } else {
+                text
+            }
+        };
+        for runner in self.runners.iter() {
+            let name = &runner.config.name;
+            match file.runners.iter().find(|new| &new.name == name) {
+                Some(new) => {
+                    let done = runner.reload_runner(new);
+                    reloaded
+                        .applied
+                        .extend(done.applied.into_iter().map(|text| prefix(name, text)));
+                    reloaded
+                        .restart_needed
+                        .extend(done.restart_needed.into_iter().map(|key| prefix(name, key)));
+                }
+                None => reloaded
+                    .restart_needed
+                    .push(format!("[[runners]] {} (removed)", name)),
+            }
+        }
+        for new in &file.runners {
+            if !self.runners.iter().any(|r| r.config.name == new.name) {
+                reloaded
+                    .restart_needed
+                    .push(format!("[[runners]] {} (added)", new.name));
+            }
+        }
         Ok(reloaded)
+    }
+}
+
+impl RunnerDaemon {
+    /// A reloader of the config file at `path`, for this runner alone
+    #[cfg(test)]
+    pub fn reloader(&self, path: impl Into<PathBuf>) -> Reloader {
+        Manager::new(vec![self.clone()]).reloader(path)
+    }
+
+    /// Reload the config at `path` for this runner alone (see `Manager::reload`)
+    #[cfg(test)]
+    pub fn reload(&self, path: &Path) -> Result<Reloaded> {
+        Manager::new(vec![self.clone()]).reload(path)
     }
 
     /// Apply the settings of the whole process (`GLOBAL_KEYS`) from `new`
     fn reload_global(&self, new: &RunnerConfig, limits: admission::Limits) -> Reloaded {
         let mut applied = Vec::new();
-        let concurrent = self.capacity.set_limit(new.concurrent);
+        let shared = self.capacity.shared();
+        let concurrent = shared.set_limit(new.concurrent);
         if concurrent != new.concurrent {
             applied.push(format!("concurrent {} → {}", concurrent, new.concurrent));
-            let running = self.capacity.running();
+            let running = shared.running();
             if running > new.concurrent {
                 info!(
                     "   {} jobs are running: they finish, and new jobs start once fewer than {} run",
@@ -139,12 +183,21 @@ impl RunnerDaemon {
     /// `new`; keys only read at start are reported instead
     fn reload_runner(&self, new: &RunnerConfig) -> Reloaded {
         let current = self.settings();
+        let mut applied = Vec::new();
+        if current.config.limit != new.limit {
+            self.capacity.set_limit(runner_limit(new.limit));
+            applied.push(format!("limit {} → {}", current.config.limit, new.limit));
+        }
         let live = pin_restart_only(&current.config, new);
         let changed = changed_keys(&current.config, &live);
         let restart_needed = changed_keys(&live, new);
         if changed.is_empty() {
+            if !applied.is_empty() {
+                // Keep the limit in the settings, which later reloads compare to
+                self.update_settings(|settings| settings.config = Arc::new(live));
+            }
             return Reloaded {
-                applied: Vec::new(),
+                applied,
                 restart_needed,
             };
         }
@@ -158,8 +211,9 @@ impl RunnerDaemon {
             cache,
         };
         self.update_settings(|current| *current = settings);
+        applied.push(format!("for new jobs: {}", changed.join(", ")));
         Reloaded {
-            applied: vec![format!("for new jobs: {}", changed.join(", "))],
+            applied,
             restart_needed,
         }
     }
@@ -172,6 +226,7 @@ impl RunnerDaemon {
 /// read only at start must be added here.
 fn pin_restart_only(old: &RunnerConfig, new: &RunnerConfig) -> RunnerConfig {
     let mut live = new.clone();
+    live.name = old.name.clone();
     live.runner_token = old.runner_token.clone();
     live.gitlab_url = old.gitlab_url.clone();
     live.tls_ca_file = old.tls_ca_file.clone();
@@ -190,7 +245,8 @@ fn pin_restart_only(old: &RunnerConfig, new: &RunnerConfig) -> RunnerConfig {
 }
 
 /// Dotted keys whose values differ between `old` and `new`, apart from the
-/// settings of the whole process (`GLOBAL_KEYS`, applied on their own)
+/// settings of the whole process (`GLOBAL_KEYS`) and `limit`, applied on
+/// their own
 fn changed_keys(old: &RunnerConfig, new: &RunnerConfig) -> Vec<String> {
     fn walk(old: &toml::Table, new: &toml::Table, prefix: &str, out: &mut Vec<String>) {
         let keys: std::collections::BTreeSet<&String> = old.keys().chain(new.keys()).collect();
@@ -210,9 +266,10 @@ fn changed_keys(old: &RunnerConfig, new: &RunnerConfig) -> Vec<String> {
     else {
         return vec!["(unknown: the config could not be compared)".to_string()];
     };
-    for key in GLOBAL_KEYS {
-        old.remove(key);
-        new.remove(key);
+    // `limit` is applied on its own too
+    for key in GLOBAL_KEYS.iter().chain(&["limit"]) {
+        old.remove(*key);
+        new.remove(*key);
     }
     let mut out = Vec::new();
     walk(&old, &new, "", &mut out);

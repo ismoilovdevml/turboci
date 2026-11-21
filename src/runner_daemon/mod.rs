@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
 
 use crate::gitlab::{
     ArtifactUpload, FailureReason, GitLabClient, Job, JobState, Polled, RemoteState, Variable,
@@ -27,6 +27,7 @@ pub mod image;
 pub mod job_cache;
 pub mod metrics;
 pub mod reload;
+pub mod runners;
 pub mod s3;
 pub mod script;
 pub mod system_id;
@@ -425,6 +426,15 @@ struct Settings {
     cache: job_cache::LocalCache,
 }
 
+/// The jobs a runner may run at once from its `limit` (0: no limit of its own)
+fn runner_limit(limit: u32) -> u32 {
+    if limit == 0 {
+        u32::MAX
+    } else {
+        limit
+    }
+}
+
 /// The local job cache of `config` (without its S3 layer)
 fn local_cache(config: &config::RunnerConfig) -> job_cache::LocalCache {
     job_cache::LocalCache::new(&config.cache_dir)
@@ -445,7 +455,8 @@ pub struct RunnerDaemon {
     settings: Arc<std::sync::RwLock<Settings>>,
     /// The cache's S3 layer, kept when a reload rebuilds the cache
     remote_cache: Option<s3::Bucket>,
-    /// Job slots: `concurrent`, changed by a config reload
+    /// Job slots: this runner's `limit` within the shared `concurrent`,
+    /// both changed by a config reload
     capacity: Arc<capacity::Capacity>,
     /// Seconds between job requests, changed by a config reload
     check_interval: Arc<std::sync::atomic::AtomicU64>,
@@ -468,8 +479,10 @@ pub struct RunnerDaemon {
     evicting: Arc<tokio::sync::RwLock<()>>,
     /// Reads the host's free memory, disk space and load for admission control
     probe: Arc<dyn admission::Probe>,
-    /// Counters served on `metrics_listen`
+    /// This runner's counters served on `metrics_listen`
     metrics: Arc<metrics::Metrics>,
+    /// The process's counters, shared by its runners
+    process: Arc<metrics::Process>,
 }
 
 /// How often workspaces and cache archives past their limits are looked for
@@ -511,7 +524,10 @@ impl RunnerDaemon {
             executor: Arc::new(executor),
         };
         Self {
-            capacity: capacity::Capacity::new(settings.config.concurrent),
+            capacity: capacity::Capacity::within(
+                runner_limit(settings.config.limit),
+                capacity::Capacity::new(settings.config.concurrent),
+            ),
             check_interval: Arc::new(settings.config.check_interval.into()),
             limits: Arc::new(std::sync::RwLock::new(limits)),
             cache: settings.cache.clone(),
@@ -531,6 +547,7 @@ impl RunnerDaemon {
             evicting: Arc::default(),
             probe: Arc::new(admission::HostProbe),
             metrics: Arc::default(),
+            process: Arc::default(),
         }
     }
 
@@ -602,42 +619,31 @@ impl RunnerDaemon {
         let _ = rx.wait_for(|mode| *mode != Shutdown::Running).await;
     }
 
-    /// Start the runner daemon
+    /// Start the runner daemon with this runner alone (see `Manager::start`)
+    #[cfg(test)]
     pub async fn start(&self) -> Result<()> {
-        info!("🚀 TurboCI Runner Daemon starting...");
-        info!("   Concurrent jobs: {}", self.config.concurrent);
-        info!("   Check interval: {}s", self.config.check_interval);
-        info!("   Cache enabled: {}", self.config.cache_enabled);
-        let limits = self.current_limits();
-        if !limits.is_off() {
-            info!("   Admission limits: {}", limits.describe());
-        }
-        for key in limits.unsupported() {
-            warn!(
-                "{} is only checked on Linux: it is ignored on this host",
-                key
-            );
-        }
-        let mut gate = admission::Gate::default();
-        // Bound before anything else, so a taken port stops the runner at once
-        let _metrics = match self.config.metrics_addr()? {
-            Some(addr) => {
-                let listener = tokio::net::TcpListener::bind(addr)
-                    .await
-                    .with_context(|| format!("metrics_listen: cannot listen on {}", addr))?;
-                info!("   Metrics: http://{}/metrics", addr);
-                let daemon = self.clone();
-                Some(AbortOnDrop(tokio::spawn(metrics::serve(
-                    listener,
-                    Arc::new(move || daemon.render_metrics()),
-                ))))
-            }
-            None => None,
-        };
+        runners::Manager::new(vec![self.clone()]).start().await
+    }
 
+    /// Use the slots, check interval, admission limits, shutdown signal and
+    /// process metrics of `first`: the runners of one process share them
+    fn share_from(&mut self, first: &RunnerDaemon) {
+        self.capacity = capacity::Capacity::within(self.capacity.limit(), first.capacity.shared());
+        self.check_interval = first.check_interval.clone();
+        self.limits = first.limits.clone();
+        self.shutdown = first.shutdown.clone();
+        self.probe = first.probe.clone();
+        self.process = first.process.clone();
+    }
+
+    /// Take jobs from GitLab and run them until a shutdown, then wait for
+    /// this runner's jobs to end
+    async fn run(&self) {
+        info!("   Cache enabled: {}", self.config.cache_enabled);
+        let mut gate = admission::Gate::default();
         self.executor.sweep_orphans().await;
-        let rotation = AbortOnDrop(tokio::spawn(self.clone().rotate_token()));
-        let housekeeping = AbortOnDrop(tokio::spawn(self.clone().housekeeping()));
+        let rotation = AbortOnDrop(tokio::spawn(self.clone().rotate_token().in_current_span()));
+        let housekeeping = AbortOnDrop(tokio::spawn(self.clone().housekeeping().in_current_span()));
 
         let mut connected = false;
         let mut backoff = RequestBackoff::new(self.check_interval());
@@ -687,12 +693,15 @@ impl RunnerDaemon {
                     self.metrics.request(metrics::Request::Job);
                     // The job keeps the settings it starts with
                     let daemon = self.current();
-                    tokio::spawn(async move {
-                        let _slot = slot;
-                        if let Err(e) = daemon.execute_job(*job).await {
-                            error!("Job execution failed: {}", e);
+                    tokio::spawn(
+                        async move {
+                            let _slot = slot;
+                            if let Err(e) = daemon.execute_job(*job).await {
+                                error!("Job execution failed: {}", e);
+                            }
                         }
-                    });
+                        .in_current_span(),
+                    );
                     backoff.got_job();
                     None
                 }
@@ -730,21 +739,24 @@ impl RunnerDaemon {
         let _rotating = self.rotating.lock().await;
         drop(rotation);
         drop(housekeeping);
-        info!("✅ Runner stopped");
-        Ok(())
     }
 
-    /// The metrics as served on `metrics_listen`
+    /// The metrics as served on `metrics_listen`, of this runner alone
+    #[cfg(test)]
     fn render_metrics(&self) -> String {
-        self.metrics.render(&metrics::Gauges {
+        runners::Manager::new(vec![self.clone()]).render_metrics()
+    }
+
+    /// What the metrics show of this runner now
+    fn gauges(&self) -> metrics::Gauges {
+        metrics::Gauges {
             running: self.capacity.running().into(),
-            concurrent: self.capacity.limit().into(),
             executor: match self.executor.as_ref() {
                 executor::ExecutorType::Docker(_) => "docker",
                 executor::ExecutorType::Shell(_) => "shell",
             }
             .to_string(),
-        })
+        }
     }
 
     /// Whether the host meets the admission limits; changes are logged once
@@ -2881,15 +2893,15 @@ mod tests {
 
         let text = daemon.render_metrics();
         for line in [
-            "turboci_jobs_finished_total{result=\"success\"} 2",
-            "turboci_jobs_finished_total{result=\"failed\"} 1",
-            "turboci_jobs_failed_total{reason=\"script_failure\"} 1",
+            "turboci_jobs_finished_total{runner=\"default\",result=\"success\"} 2",
+            "turboci_jobs_finished_total{runner=\"default\",result=\"failed\"} 1",
+            "turboci_jobs_failed_total{runner=\"default\",reason=\"script_failure\"} 1",
             // The first job found no cache, the next two the first one's
-            "turboci_cache_restores_total{result=\"miss\"} 1",
-            "turboci_cache_restores_total{result=\"hit\"} 2",
-            "turboci_jobs_running 0",
+            "turboci_cache_restores_total{runner=\"default\",result=\"miss\"} 1",
+            "turboci_cache_restores_total{runner=\"default\",result=\"hit\"} 2",
+            "turboci_jobs_running{runner=\"default\"} 0",
             "turboci_concurrent_jobs 4",
-            "turboci_admission_blocked{resource=\"disk\"} 0",
+            "turboci_admission_blocked{runner=\"default\",resource=\"disk\"} 0",
         ] {
             assert!(
                 text.lines().any(|l| l == line),
@@ -2977,7 +2989,7 @@ mod tests {
             ]
         );
         assert_eq!(reloaded.restart_needed, ["metrics_listen", "cache_enabled"]);
-        assert_eq!(daemon.capacity.limit(), 1);
+        assert_eq!(daemon.capacity.shared().limit(), 1);
         assert_eq!(daemon.check_interval(), Duration::from_secs(7));
         assert_eq!(daemon.current_limits().min_free_disk, Some(1 << 30));
         // Jobs running above the new limit keep their slots
@@ -3096,7 +3108,7 @@ mod tests {
             write(bad);
             assert!(daemon.reload(&file).is_err(), "accepted {}", bad);
             reloader.reload();
-            assert_eq!(daemon.capacity.limit(), 2, "{}", bad);
+            assert_eq!(daemon.capacity.shared().limit(), 2, "{}", bad);
             assert_eq!(daemon.check_interval(), Duration::from_secs(5), "{}", bad);
             assert_eq!(daemon.current_limits().max_load_avg, Some(4.0), "{}", bad);
         }
@@ -3105,6 +3117,197 @@ mod tests {
         assert!(daemon
             .render_metrics()
             .contains("turboci_config_reloads_total{result=\"failure\"} 5\n"));
+    }
+
+    /// The runners of the config file `file` with shell executors, as
+    /// `runner-start` builds them
+    fn manager_from_file(file: &std::path::Path) -> runners::Manager {
+        let config = config::ConfigFile::load(file).unwrap();
+        runners::Manager::new(
+            config
+                .runners
+                .into_iter()
+                .map(|runner| {
+                    let executor = executor::ExecutorType::Shell(executor::ShellExecutor::new(
+                        Some(runner.executor.shell.work_dir.clone()),
+                    ));
+                    let gitlab =
+                        GitLabClient::new(runner.gitlab_url.clone(), runner.runner_token.clone());
+                    RunnerDaemon::new(runner, gitlab, executor)
+                })
+                .collect(),
+        )
+    }
+
+    /// A config with runners `a` and `b` of the GitLab servers `a` and `b`;
+    /// `b_settings` go into runner b's entry, `more` at the end of the file
+    fn two_runners(
+        dir: &std::path::Path,
+        a: &MockServer,
+        b: &MockServer,
+        global: &str,
+        b_settings: &str,
+        more: &str,
+    ) -> String {
+        format!(
+            "{global}\ncheck_interval = 1\nstate_dir = \"{dir}\"\n\n\
+             [[runners]]\nname = \"a\"\nrunner_token = \"glrt-a\"\ngitlab_url = \"{a}\"\n\
+             [runners.executor]\nexecutor_type = \"shell\"\n\n\
+             [[runners]]\nname = \"b\"\nrunner_token = \"glrt-b\"\ngitlab_url = \"{b}\"\n{b_settings}\n\
+             [runners.executor]\nexecutor_type = \"shell\"\n{more}",
+            dir = dir.display(),
+            a = a.uri(),
+            b = b.uri(),
+        )
+    }
+
+    #[tokio::test]
+    async fn several_runners_take_jobs_from_their_own_gitlab_in_one_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (MockServer::start().await, MockServer::start().await);
+        for (server, id) in [(&a, 71), (&b, 72)] {
+            job_routes(server).await;
+            let job = serde_json::json!({
+                "id": id, "token": format!("job-token-{}", id),
+                "job_info": {"name": "build", "stage": "test", "project_id": 5, "project_name": "app"},
+                "steps": [{"name": "script", "script": ["echo side=$SIDE."], "when": "on_success", "timeout": 60}]
+            });
+            Mock::given(method("POST"))
+                .and(path("/api/v4/jobs/request"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(job))
+                .up_to_n_times(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v4/jobs/request"))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(server)
+                .await;
+        }
+        let file = dir.path().join("runner.toml");
+        std::fs::write(
+            &file,
+            two_runners(
+                dir.path(),
+                &a,
+                &b,
+                "concurrent = 2",
+                "environment = [\"SIDE=b\"]",
+                "",
+            ),
+        )
+        .unwrap();
+        let manager = manager_from_file(&file);
+        let handle = manager.shutdown_handle();
+        let running = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.start().await }
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while requests(&a, "PUT", 71).await.is_empty() || requests(&b, "PUT", 72).await.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "jobs did not finish");
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(final_update(&a, 71).await["state"], "success");
+        assert_eq!(final_update(&b, 72).await["state"], "success");
+        // Each runner asks its own GitLab with its own token
+        for (server, token) in [(&a, "glrt-a"), (&b, "glrt-b")] {
+            for request in server.received_requests().await.unwrap() {
+                if request.url.path() == "/api/v4/jobs/request" {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["token"], token);
+                }
+            }
+        }
+        // Runner settings stay with their runner
+        assert!(trace_of(&a, 71).await.contains("side=."));
+        assert!(trace_of(&b, 72).await.contains("side=b."));
+        let text = manager.render_metrics();
+        for line in [
+            "turboci_jobs_finished_total{runner=\"a\",result=\"success\"} 1",
+            "turboci_jobs_finished_total{runner=\"b\",result=\"success\"} 1",
+            "turboci_concurrent_jobs 2",
+        ] {
+            assert!(
+                text.lines().any(|l| l == line),
+                "missing {:?} in\n{}",
+                line,
+                text
+            );
+        }
+
+        handle.request(Shutdown::Graceful);
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("every runner stopped")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reload_applies_each_runners_settings_and_reports_added_runners() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (MockServer::start().await, MockServer::start().await);
+        let file = dir.path().join("runner.toml");
+        let write = |global: &str, b_settings: &str, more: &str| {
+            std::fs::write(
+                &file,
+                two_runners(dir.path(), &a, &b, global, b_settings, more),
+            )
+            .unwrap()
+        };
+        write("concurrent = 2", "environment = [\"SIDE=b\"]", "");
+        let manager = manager_from_file(&file);
+        let [first, second] = &manager.runners[..] else {
+            panic!("two runners expected")
+        };
+        // The runners share the process's slots and shutdown signal
+        assert!(Arc::ptr_eq(
+            &first.capacity.shared(),
+            &second.capacity.shared()
+        ));
+        assert!(Arc::ptr_eq(&first.shutdown, &second.shutdown));
+        assert!(!Arc::ptr_eq(&first.capacity, &second.capacity));
+
+        write(
+            "concurrent = 3",
+            "limit = 1\nenvironment = [\"SIDE=new\"]",
+            &format!(
+                "\n[[runners]]\nname = \"c\"\nrunner_token = \"glrt-c\"\ngitlab_url = \"{}\"\n",
+                a.uri()
+            ),
+        );
+        let reloaded = manager.reload(&file).unwrap();
+        assert_eq!(
+            reloaded.applied,
+            [
+                "concurrent 2 → 3",
+                "b: limit 0 → 1",
+                "b: for new jobs: environment"
+            ]
+        );
+        assert_eq!(reloaded.restart_needed, ["[[runners]] c (added)"]);
+        assert_eq!(first.capacity.shared().limit(), 3);
+        assert_eq!(second.capacity.limit(), 1);
+        assert_eq!(first.capacity.limit(), u32::MAX);
+        assert_eq!(second.current().config.environment, ["SIDE=new"]);
+        assert_eq!(first.current().config.environment, Vec::<String>::new());
+
+        // Removing a runner needs a restart too; it keeps running until then
+        std::fs::write(
+            &file,
+            format!(
+                "concurrent = 3\ncheck_interval = 1\nstate_dir = \"{}\"\n[[runners]]\nname = \"a\"\nrunner_token = \"glrt-a\"\ngitlab_url = \"{}\"\n[runners.executor]\nexecutor_type = \"shell\"\n",
+                dir.path().display(),
+                a.uri()
+            ),
+        )
+        .unwrap();
+        let reloaded = manager.reload(&file).unwrap();
+        assert!(reloaded.applied.is_empty(), "{:?}", reloaded.applied);
+        assert_eq!(reloaded.restart_needed, ["[[runners]] b (removed)"]);
+        assert_eq!(second.current().config.environment, ["SIDE=new"]);
     }
 
     /// A workspace of `bytes` that a job last used `hours` ago
@@ -3171,11 +3374,14 @@ mod tests {
         );
         let metrics = daemon.render_metrics();
         assert!(
-            metrics.contains("turboci_workspaces_evicted_total 1\n"),
+            metrics.contains("turboci_workspaces_evicted_total{runner=\"default\"} 1\n"),
             "{}",
             metrics
         );
-        assert!(metrics.contains(&format!("turboci_workspaces_size_bytes {}\n", 3 * 8192)));
+        assert!(metrics.contains(&format!(
+            "turboci_workspaces_size_bytes{{runner=\"default\"}} {}\n",
+            3 * 8192
+        )));
 
         // A quota the job's own workspace exceeds: everything else goes, it stays
         let daemon = daemon_with(&server, dir.path(), |config| {
@@ -3356,7 +3562,7 @@ mod tests {
             .unwrap();
         assert!(daemon
             .render_metrics()
-            .contains("turboci_job_requests_total{result=\"conflict\"} 4\n"));
+            .contains("turboci_job_requests_total{runner=\"default\",result=\"conflict\"} 4\n"));
     }
 
     #[tokio::test]

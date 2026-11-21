@@ -1,6 +1,10 @@
 //! Job slots: how many jobs run, and how many may (`concurrent`). A config
 //! reload changes the limit while jobs run; lowering it never stops a running
 //! job, the runner just takes no new one until enough have ended.
+//!
+//! With several runners each has its own slots (its `limit`) within the
+//! process-wide ones (`concurrent`), as in gitlab-runner: a job needs a slot
+//! of both.
 
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -14,17 +18,24 @@ struct State {
 #[derive(Debug)]
 pub struct Capacity {
     state: watch::Sender<State>,
+    /// Slots shared with other runners, of which a job needs one as well
+    parent: Option<Arc<Capacity>>,
 }
 
 /// A taken job slot, given back when dropped
 #[derive(Debug)]
-pub struct Slot(Arc<Capacity>);
+pub struct Slot {
+    capacity: Arc<Capacity>,
+    /// Holds a slot of the capacity's parent too
+    with_parent: bool,
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0
-            .state
-            .send_modify(|state| state.running = state.running.saturating_sub(1));
+        self.capacity.release();
+        if let (true, Some(parent)) = (self.with_parent, &self.capacity.parent) {
+            parent.release();
+        }
     }
 }
 
@@ -32,29 +43,72 @@ impl Capacity {
     pub fn new(limit: u32) -> Arc<Self> {
         Arc::new(Self {
             state: watch::Sender::new(State { running: 0, limit }),
+            parent: None,
         })
     }
 
-    /// Wait for a free slot and take it. Cancel-safe: a slot is only taken
-    /// when this returns.
-    pub async fn acquire(self: &Arc<Self>) -> Slot {
-        let mut changes = self.state.subscribe();
-        loop {
-            let taken = self.state.send_if_modified(|state| {
-                let free = state.running < state.limit;
-                if free {
-                    state.running += 1;
-                }
-                free
-            });
-            if taken {
-                return Slot(self.clone());
+    /// `limit` slots of which each job also needs one of `parent`'s
+    pub fn within(limit: u32, parent: Arc<Capacity>) -> Arc<Self> {
+        Arc::new(Self {
+            state: watch::Sender::new(State { running: 0, limit }),
+            parent: Some(parent),
+        })
+    }
+
+    /// The slots shared with other runners; itself when there are none
+    pub fn shared(self: &Arc<Self>) -> Arc<Capacity> {
+        self.parent.clone().unwrap_or_else(|| self.clone())
+    }
+
+    fn try_take(&self) -> bool {
+        self.state.send_if_modified(|state| {
+            let free = state.running < state.limit;
+            if free {
+                state.running += 1;
             }
-            // `self` holds the sender, so this never fails
-            let _ = changes
-                .wait_for(|state| state.running < state.limit)
-                .await
-                .map(|_| ());
+            free
+        })
+    }
+
+    fn release(&self) {
+        self.state
+            .send_modify(|state| state.running = state.running.saturating_sub(1));
+    }
+
+    /// Wait until a slot is free (without taking it)
+    async fn free(&self) {
+        // `self` holds the sender, so this never fails
+        let _ = self
+            .state
+            .subscribe()
+            .wait_for(|state| state.running < state.limit)
+            .await
+            .map(|_| ());
+    }
+
+    /// Wait for a free slot (and one of the parent's) and take it.
+    /// Cancel-safe: a slot is only taken when this returns.
+    pub async fn acquire(self: &Arc<Self>) -> Slot {
+        loop {
+            if !self.try_take() {
+                self.free().await;
+                continue;
+            }
+            let Some(parent) = &self.parent else {
+                return Slot {
+                    capacity: self.clone(),
+                    with_parent: false,
+                };
+            };
+            if parent.try_take() {
+                return Slot {
+                    capacity: self.clone(),
+                    with_parent: true,
+                };
+            }
+            // Not held while waiting for the shared slots
+            self.release();
+            parent.free().await;
         }
     }
 
@@ -157,6 +211,52 @@ mod tests {
         let slot = can_take(&capacity).await.expect("free once all ended");
         assert_eq!(capacity.running(), 1);
         drop(slot);
+    }
+
+    #[tokio::test]
+    async fn runners_get_slots_within_their_limit_and_the_shared_one() {
+        let shared = Capacity::new(3);
+        let a = Capacity::within(2, shared.clone());
+        let b = Capacity::within(u32::MAX, shared.clone());
+        assert!(Arc::ptr_eq(&a.shared(), &shared));
+        assert!(Arc::ptr_eq(&shared.shared(), &shared));
+
+        let a1 = a.acquire().await;
+        let _a2 = a.acquire().await;
+        assert!(can_take(&a).await.is_none(), "runner limit 2");
+        let b1 = b.acquire().await;
+        assert_eq!((a.running(), b.running(), shared.running()), (2, 1, 3));
+        // concurrent = 3 is reached: no runner gets a slot, and a waiting
+        // runner holds none of its own meanwhile
+        assert!(can_take(&b).await.is_none(), "concurrent 3");
+        assert_eq!(b.running(), 1);
+
+        let waiting = tokio::spawn({
+            let b = b.clone();
+            async move { b.acquire().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        drop(a1);
+        let b2 = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("woken by a freed shared slot")
+            .unwrap();
+        assert_eq!((a.running(), b.running(), shared.running()), (1, 2, 3));
+
+        // A higher concurrent lets a waiting runner in
+        let waiting = tokio::spawn({
+            let b = b.clone();
+            async move { b.acquire().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shared.set_limit(4);
+        let b3 = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("woken by the new concurrent")
+            .unwrap();
+        drop((b1, b2, b3));
+        assert_eq!((b.running(), shared.running()), (0, 1));
     }
 
     #[tokio::test]

@@ -55,6 +55,11 @@ volumes, services, registries, ...), `workspace_max_age_days`,
 `workspace_max_size`, `cache_max_age_days` and `cache_max_size` (the hourly
 cleanup uses the new limits too).
 
+With [several runners](configuration.md#several-runners) each runner's
+`limit` changes at once too, and the log names the runner
+(`docker: for new jobs: environment`). Adding or removing a runner needs a
+restart.
+
 These need a restart: `runner_token`, `gitlab_url`, `tls_ca_file`, `proxy`,
 `no_proxy`, `state_dir`, `metrics_listen`, `cache_enabled`, `cache_dir`,
 `cache_s3`, `executor_type`, `executor.docker.builds_dir` and
@@ -121,11 +126,16 @@ scrape_configs:
       - targets: ["ci-runner-01:9252"]
 ```
 
+Every metric of a runner carries its `name` as the `runner` label
+(`runner="default"` without [`[[runners]]`](configuration.md#several-runners));
+`turboci_concurrent_jobs`, `turboci_config_reloads_total` and the `process_*`
+metrics belong to the whole process and have none.
+
 | Metric | Type | Meaning |
 |---|---|---|
 | `turboci_runner_info{version,revision,executor}` | gauge | Always 1; the labels say what runs |
 | `turboci_jobs_running` | gauge | Jobs running now |
-| `turboci_concurrent_jobs` | gauge | Job slots (`concurrent`) |
+| `turboci_concurrent_jobs` | gauge | Job slots of the process (`concurrent`) |
 | `turboci_jobs_finished_total{result}` | counter | Jobs that ended: `success`, `failed`, `canceled` (in GitLab) |
 | `turboci_jobs_failed_total{reason}` | counter | Failed jobs by failure reason: `script_failure`, `runner_system_failure`, `job_execution_timeout`, `image_pull_failure`, `job_canceled` |
 | `turboci_job_requests_total{result}` | counter | Job requests to GitLab: `job`, `no_job`, `error`, `conflict` (409: another request took the job GitLab picked; retried after 0.25 s, doubling up to `check_interval`) |
