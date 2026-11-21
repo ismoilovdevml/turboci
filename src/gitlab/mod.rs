@@ -891,6 +891,49 @@ pub struct Service {
     /// Service-level `variables:`
     #[serde(default)]
     pub variables: Vec<Variable>,
+    #[serde(default)]
+    pub executor_opts: Option<serde_json::Value>,
+}
+
+/// `image:docker:` and `services:docker:` of `.gitlab-ci.yml`, which GitLab
+/// sends as `executor_opts.docker`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockerOptions {
+    /// Platform to pull and run the image for, e.g. `linux/arm64`
+    pub platform: Option<String>,
+    /// User (name or UID, optionally `:group`) to run the container as
+    pub user: Option<String>,
+}
+
+impl DockerOptions {
+    fn of(executor_opts: Option<&serde_json::Value>) -> Self {
+        let docker = executor_opts.and_then(|opts| opts.get("docker"));
+        let field = |key: &str| -> Option<String> {
+            let value = match docker?.get(key)? {
+                serde_json::Value::String(value) => value.trim().to_string(),
+                // `user: 1000` arrives as a number
+                serde_json::Value::Number(value) => value.to_string(),
+                _ => return None,
+            };
+            (!value.is_empty()).then_some(value)
+        };
+        Self {
+            platform: field("platform"),
+            user: field("user"),
+        }
+    }
+}
+
+impl Image {
+    pub fn docker_options(&self) -> DockerOptions {
+        DockerOptions::of(self.executor_opts.as_ref())
+    }
+}
+
+impl Service {
+    pub fn docker_options(&self) -> DockerOptions {
+        DockerOptions::of(self.executor_opts.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1188,6 +1231,38 @@ mod tests {
         v["image"] = serde_json::Value::Null;
         v["services"] = serde_json::json!([{"name": "redis:7"}]);
         parse(v);
+
+        // image:docker: and services:docker:
+        let job = parse(upstream_job());
+        let platform = |p: &str| DockerOptions {
+            platform: Some(p.to_string()),
+            user: None,
+        };
+        assert_eq!(job.image.as_ref().unwrap().docker_options(), platform("x"));
+        assert_eq!(job.services[0].docker_options(), platform("x"));
+        assert_eq!(job.services[1].docker_options(), platform("arm"));
+        let mut v = upstream_job();
+        v["image"]["executor_opts"] =
+            serde_json::json!({"docker": {"platform": " linux/amd64 ", "user": 1000}});
+        v["services"][0]["executor_opts"] =
+            serde_json::json!({"docker": {"platform": "", "user": "postgres:999"}});
+        v["services"][1]["executor_opts"] = serde_json::json!({"kubernetes": {"user": "1"}});
+        let job = parse(v);
+        assert_eq!(
+            job.image.unwrap().docker_options(),
+            DockerOptions {
+                platform: Some("linux/amd64".to_string()),
+                user: Some("1000".to_string()),
+            }
+        );
+        assert_eq!(
+            job.services[0].docker_options(),
+            DockerOptions {
+                platform: None,
+                user: Some("postgres:999".to_string()),
+            }
+        );
+        assert_eq!(job.services[1].docker_options(), DockerOptions::default());
 
         let mut v = upstream_job();
         v["artifacts"] = serde_json::json!([{"artifact_type": "junit", "artifact_format": "gzip",

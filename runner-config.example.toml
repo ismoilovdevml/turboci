@@ -106,6 +106,8 @@ network_mode = "bridge"
 # A job may choose a policy with image:pull_policy only from
 # allowed_pull_policies (empty = only pull_policy), so a project cannot use
 # "never"/"if-not-present" to run another project's cached private image.
+# A job listing several (e.g. [always, if-not-present]) gets the allowed ones
+# tried in order: a failed pull falls back to the next.
 pull_policy = "always"
 allowed_pull_policies = []
 

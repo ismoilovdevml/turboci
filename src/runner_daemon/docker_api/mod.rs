@@ -296,11 +296,13 @@ impl Docker {
 
     // --- Images
 
-    /// `POST /images/create`: pull `from_image` with `credentials`; the
-    /// stream ends with an error when dockerd reports one
+    /// `POST /images/create`: pull `from_image` for `platform` (dockerd's
+    /// own when `None`) with `credentials`; the stream ends with an error
+    /// when dockerd reports one
     pub fn create_image<'a>(
         &'a self,
         from_image: &str,
+        platform: Option<&str>,
         credentials: Option<&DockerCredentials>,
     ) -> impl Stream<Item = Result<CreateImageInfo>> + Unpin + Send + 'a {
         let auth = credentials.map(registry_auth).transpose();
@@ -309,7 +311,7 @@ impl Docker {
             ("fromSrc", String::new()),
             ("repo", String::new()),
             ("tag", String::new()),
-            ("platform", String::new()),
+            ("platform", platform.unwrap_or_default().to_string()),
         ];
         let pull = match auth {
             Ok(auth) => self
@@ -330,11 +332,21 @@ impl Docker {
         }))
     }
 
-    /// `GET /images/{name}/json`, for whether the image is present
-    pub async fn inspect_image(&self, name: &str) -> Result<()> {
-        self.get::<serde::de::IgnoredAny>(&format!("/images/{}/json", name), None)
-            .await
-            .map(drop)
+    /// `GET /images/{name}/json`, for whether the image is present and
+    /// which platform it is for
+    pub async fn inspect_image(&self, name: &str) -> Result<ImageInspect> {
+        self.get(&format!("/images/{}/json", name), None).await
+    }
+
+    /// `POST /images/{name}/tag?repo=&tag=`
+    #[cfg(test)]
+    pub async fn tag_image(&self, name: &str, repo: &str, tag: &str) -> Result<()> {
+        self.call(
+            Method::POST,
+            &format!("/images/{}/tag", name),
+            Some(&[("repo", repo), ("tag", tag)]),
+        )
+        .await
     }
 
     /// `DELETE /images/{name}`
@@ -369,15 +381,17 @@ impl Docker {
         self.get("/containers/json", Some(&query)).await
     }
 
-    /// `POST /containers/create?name=`
+    /// `POST /containers/create?name=&platform=`: of the image's variant
+    /// for `platform`, or the default one when `None`
     pub async fn create_container(
         &self,
         name: &str,
+        platform: Option<&str>,
         config: &ContainerCreateBody,
     ) -> Result<ContainerCreateResponse> {
         self.send_json(
             "/containers/create",
-            Some(&[("name", name), ("platform", "")]),
+            Some(&[("name", name), ("platform", platform.unwrap_or_default())]),
             config,
         )
         .await

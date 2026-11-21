@@ -2,6 +2,7 @@
 //! checked out by a helper container, services on the job's own network
 
 use super::*;
+use crate::gitlab::DockerOptions;
 
 #[derive(Clone)]
 pub struct DockerExecutor {
@@ -14,6 +15,74 @@ pub struct DockerExecutor {
     owner: String,
     /// Image pulls in progress, shared by the jobs of this runner
     pulls: Arc<Flights<PullOutcome>>,
+    /// Workspaces found to belong wholly to their owner when their last job ended
+    clean_workspaces: Arc<CleanWorkspaces>,
+}
+
+/// A workspace directory as found on disk: a workspace that was removed
+/// and created again, or given to another user, does not match its stamp
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkspaceStamp {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+}
+
+impl WorkspaceStamp {
+    /// Whether the files the runner itself creates belong to the
+    /// workspace's owner (see `CleanWorkspaces`)
+    #[cfg(unix)]
+    fn owned_by_runner(self) -> bool {
+        rustix::process::geteuid().as_raw() == self.uid
+            && rustix::process::getegid().as_raw() == self.gid
+    }
+
+    #[cfg(unix)]
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+        }
+    }
+}
+
+/// Workspaces in which everything belonged to the workspace's owner once
+/// the last job in them ended and all its containers were gone. Between
+/// jobs only the runner writes to a workspace, and only workspaces the
+/// runner's own user and group own are marked, so its files belong to the
+/// owner too; only a job's containers give files to others. The next job in
+/// a marked workspace need not walk it again before its checkout (see
+/// `sources_user`). A mark is used once: every job that starts containers
+/// in a workspace has to earn it anew when it ends. Kept in memory only, so
+/// a restarted runner checks every workspace once more.
+#[derive(Default)]
+struct CleanWorkspaces(std::sync::Mutex<std::collections::HashMap<PathBuf, WorkspaceStamp>>);
+
+impl CleanWorkspaces {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<PathBuf, WorkspaceStamp>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn mark(&self, dir: &Path, stamp: WorkspaceStamp) {
+        self.lock().insert(dir.to_path_buf(), stamp);
+    }
+
+    fn forget(&self, dir: &Path) {
+        self.lock().remove(dir);
+    }
+
+    /// Whether `dir`, as `stamp` shows it now, was marked clean; the mark is gone after
+    fn take(&self, dir: &Path, stamp: WorkspaceStamp) -> bool {
+        self.lock().remove(dir) == Some(stamp)
+    }
 }
 
 /// How a pull ended, as every job waiting for it sees it
@@ -120,14 +189,115 @@ fn login_identity(credentials: Option<&docker_api::DockerCredentials>) -> String
     hasher.finalize().to_hex().to_string()
 }
 
-/// Pull `image` from its registry
+/// An image a job needs: its name, the platform to run it for (dockerd's
+/// own when `None`) and its pull policies (`None` for the runner's helper
+/// image, which is pulled only when missing)
+struct ImageNeed<'i> {
+    name: &'i str,
+    platform: Option<&'i str>,
+    policies: Option<&'i [String]>,
+}
+
+/// A pull a job needs: of `image` for `platform` by `policy`, which is
+/// attempt `attempt` of the image's policies, and the policies to fall back
+/// to, in order, when it fails
+#[derive(Debug, Clone)]
+struct PlannedPull<'i> {
+    image: &'i str,
+    platform: Option<&'i str>,
+    policy: PullPolicy,
+    attempt: usize,
+    fallback: Vec<PullPolicy>,
+}
+
+impl PlannedPull<'_> {
+    fn is_for(&self, need: &ImageNeed<'_>) -> bool {
+        self.platform == need.platform
+            && image::with_default_tag(self.image) == image::with_default_tag(need.name)
+    }
+
+    /// The image, and its platform when one is asked for
+    fn describe(&self) -> String {
+        match self.platform {
+            Some(platform) => format!("{} for {}", self.image, platform),
+            None => self.image.to_string(),
+        }
+    }
+}
+
+/// The log line of trying another pull policy, like gitlab-runner's
+fn attempt_note(attempt: usize, policy: PullPolicy) -> String {
+    format!(
+        "Attempt #{}: Trying \"{}\" pull policy\n",
+        attempt,
+        policy.name()
+    )
+}
+
+/// Operating system, architecture and variant of a platform such as
+/// `linux/arm64/v8`, lower-cased and with Docker's aliases resolved: e.g.
+/// `x86_64` is `amd64`, `aarch64` is `arm64` (whose `v8` is no variant) and
+/// `arm` without a variant is `arm/v7`. A lone part is an operating system
+/// when it names one, else an architecture. `None` stands for any.
+fn platform_parts(platform: &str) -> [Option<String>; 3] {
+    const SYSTEMS: [&str; 7] = [
+        "linux", "windows", "darwin", "freebsd", "netbsd", "openbsd", "solaris",
+    ];
+    let lower = platform.trim().to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split('/').filter(|part| !part.is_empty()).collect();
+    let (os, arch, variant) = match parts.as_slice() {
+        [] => (None, None, None),
+        [os] if SYSTEMS.contains(os) => (Some(*os), None, None),
+        [arch] => (None, Some(*arch), None),
+        [os, arch] => (Some(*os), Some(*arch), None),
+        [os, arch, variant, ..] => (Some(*os), Some(*arch), Some(*variant)),
+    };
+    let (arch, variant) = match (arch, variant) {
+        (Some("x86_64" | "x86-64"), variant) => (Some("amd64"), variant),
+        (Some("aarch64" | "arm64"), Some("v8") | None) => (Some("arm64"), None),
+        (Some("aarch64"), variant) => (Some("arm64"), variant),
+        (Some("armhf"), _) => (Some("arm"), Some("v7")),
+        (Some("armel"), _) => (Some("arm"), Some("v6")),
+        (Some("arm"), None) => (Some("arm"), Some("v7")),
+        (Some("i386" | "i686" | "x86"), variant) => (Some("386"), variant),
+        other => other,
+    };
+    [os, arch, variant].map(|part| part.map(str::to_string))
+}
+
+/// Whether an image found locally is for `wanted`, as far as dockerd tells
+/// (a part it leaves out matches)
+fn platform_matches(found: &docker_api::ImageInspect, wanted: &str) -> bool {
+    let wanted = platform_parts(wanted);
+    let [os, arch, variant] = platform_parts(&format!(
+        "{}/{}/{}",
+        found.os.as_deref().unwrap_or_default(),
+        found.architecture.as_deref().unwrap_or_default(),
+        found.variant.as_deref().unwrap_or_default()
+    ));
+    let found = match (&os, &arch) {
+        // Nothing to compare with: dockerd did not say
+        (None, None) => return true,
+        _ => [os, arch, variant],
+    };
+    wanted
+        .iter()
+        .zip(&found)
+        .all(|(wanted, found)| match (wanted, found) {
+            (Some(wanted), Some(found)) => wanted == found,
+            _ => true,
+        })
+}
+
+/// Pull `image` for `platform` (dockerd's own when `None`) from its registry
 async fn pull_image(
     docker: &Docker,
     image: &str,
+    platform: Option<&str>,
     credentials: Option<docker_api::DockerCredentials>,
 ) -> PullOutcome {
     let reference = image::with_default_tag(image);
-    let mut stream = docker.create_image(&reference, credentials.as_ref());
+    let mut stream = docker.create_image(&reference, platform, credentials.as_ref());
     while let Some(progress) = stream.next().await {
         if let Err(e) = progress {
             let error = e.to_string();
@@ -317,11 +487,12 @@ fn host_reachable_address(
 }
 
 /// `uid:gid` owning a host directory, to run a helper as that user
-fn workspace_owner(dir: &Path) -> Option<String> {
+async fn workspace_owner(dir: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(dir)
+        tokio::fs::metadata(dir)
+            .await
             .ok()
             .map(|meta| format!("{}:{}", meta.uid(), meta.gid()))
     }
@@ -337,30 +508,35 @@ fn workspace_owner(dir: &Path) -> Option<String> {
 /// the job's pre/post_get_sources_script hooks run in the helper (they may
 /// need root, e.g. to install packages), when the workspace belongs to root,
 /// or when anything in it belongs to someone else (an earlier job's files
-/// that could not be handed back), which only root may replace.
-async fn sources_user(job: &Job, job_dir: &Path) -> Option<String> {
+/// that could not be handed back), which only root may replace. That takes
+/// a walk of the whole workspace, unless the last job in it left it `clean`.
+async fn sources_user(job: &Job, job_dir: &Path, clean: &CleanWorkspaces) -> Option<String> {
     let hooks = ["pre_get_sources_script", "post_get_sources_script"];
     if hooks.iter().any(|hook| !hook_lines(job, hook).is_empty()) {
         return None;
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-
         let meta = tokio::fs::metadata(job_dir).await.ok()?;
-        let (uid, gid) = (meta.uid(), meta.gid());
+        let stamp = WorkspaceStamp::of(&meta);
+        let (uid, gid) = (stamp.uid, stamp.gid);
         if uid == 0 {
             return None;
         }
-        let dir = job_dir.to_path_buf();
-        let others = tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid))
-            .await
-            .unwrap_or(true);
-        (!others).then(|| format!("{}:{}", uid, gid))
+        if !clean.take(job_dir, stamp) {
+            let dir = job_dir.to_path_buf();
+            let others = tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid))
+                .await
+                .unwrap_or(true);
+            if others {
+                return None;
+            }
+        }
+        Some(format!("{}:{}", uid, gid))
     }
     #[cfg(not(unix))]
     {
-        let _ = job_dir;
+        let _ = (job_dir, clean);
         None
     }
 }
@@ -502,26 +678,55 @@ struct JobSetup<'a> {
     job: &'a Job,
     job_dir: &'a Path,
     image: &'a str,
+    /// `image:docker:` of the job (platform and user)
+    image_options: &'a DockerOptions,
     services: &'a [crate::gitlab::Service],
     service_images: &'a [String],
+    /// `docker:` of each service
+    service_options: &'a [DockerOptions],
     /// The job's variables, for service variables that refer to them
     values: &'a std::collections::HashMap<String, String>,
     env: &'a JobEnv,
 }
 
 /// Where starting the job's containers reports progress: straight to the
-/// job log, or into a buffer while the log shows the checkout that runs at
-/// the same time (the buffer is written to the log once both are done)
+/// job log, or to the branch that owns the log while it shows the checkout
+/// that runs at the same time (see `forward_setup_log`)
 enum SetupLog<'t, 'a> {
     Trace(&'t mut TraceWriter<'a>),
-    Buffer(String),
+    Channel(tokio::sync::mpsc::UnboundedSender<String>),
 }
 
 impl SetupLog<'_, '_> {
     async fn write(&mut self, text: &str) {
         match self {
             SetupLog::Trace(trace) => trace.write(text).await,
-            SetupLog::Buffer(buffer) => buffer.push_str(text),
+            // The receiver lives until the sender is dropped
+            SetupLog::Channel(sender) => {
+                let _ = sender.send(text.to_string());
+            }
+        }
+    }
+}
+
+/// Write what the services branch reported while the get_sources section
+/// was open, then the rest as it comes, until that branch is done (drops
+/// its sender). Output that sits in the log is sent to GitLab on time, so a
+/// long pull after a quick checkout does not hide the checkout's last lines.
+async fn forward_setup_log(
+    lines: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    trace: &mut TraceWriter<'_>,
+) {
+    let mut flush = FlushTimer::default();
+    loop {
+        tokio::select! {
+            line = lines.recv() => match line {
+                Some(line) => trace.write(&line).await,
+                None => return,
+            },
+            _ = flush.wait(trace.next_flush_at()) => {
+                trace.flush().await;
+            }
         }
     }
 }
@@ -538,6 +743,7 @@ impl DockerExecutor {
             owner: "turboci".to_string(),
             ca_pem: None,
             pulls: Arc::default(),
+            clean_workspaces: Arc::default(),
         })
     }
 
@@ -586,7 +792,7 @@ impl DockerExecutor {
             },
             true,
             // Not root: the workspace belongs to the runner again
-            workspace_owner(job_dir),
+            workspace_owner(job_dir).await,
             None,
         )
         .await
@@ -690,9 +896,17 @@ impl DockerExecutor {
         let values: std::collections::HashMap<String, String> = env.vars.iter().cloned().collect();
         let expand = |name: &str| script::expand(name, &values);
 
-        let (image, policies) = match &job.image {
-            Some(img) => (expand(&img.name), img.pull_policy.clone()),
-            None => (self.config.default_image.clone(), Vec::new()),
+        let (image, policies, image_options) = match &job.image {
+            Some(img) => (
+                expand(&img.name),
+                img.pull_policy.clone(),
+                img.docker_options(),
+            ),
+            None => (
+                self.config.default_image.clone(),
+                Vec::new(),
+                DockerOptions::default(),
+            ),
         };
         trace
             .write(&format!("Using Docker executor with image {} ...\n", image))
@@ -710,42 +924,57 @@ impl DockerExecutor {
                 command: s.command.clone(),
                 pull_policy: Vec::new(),
                 variables: Vec::new(),
+                executor_opts: None,
             })
             .chain(job.services.iter().cloned())
             .collect();
         let service_images: Vec<String> = services.iter().map(|s| expand(&s.name)).collect();
+        let service_options: Vec<DockerOptions> =
+            services.iter().map(|s| s.docker_options()).collect();
         let checkout = job.git_info.is_some()
             && git::strategy(&job.variables, job.allow_git_fetch) != GitStrategy::None;
 
         // Every image is checked against its pull policy first, so a job
         // fails before anything starts when one is not allowed
-        let mut images = vec![(image.as_str(), Some(policies.as_slice()))];
-        if checkout {
-            images.push((self.config.helper_image.as_str(), None));
-        }
-        images.extend(
+        let job_images: Vec<ImageNeed> = std::iter::once(ImageNeed {
+            name: &image,
+            platform: image_options.platform.as_deref(),
+            policies: Some(policies.as_slice()),
+        })
+        .chain(
             service_images
                 .iter()
                 .zip(&services)
-                .map(|(name, service)| (name.as_str(), Some(service.pull_policy.as_slice()))),
-        );
+                .zip(&service_options)
+                .map(|((name, service), options)| ImageNeed {
+                    name,
+                    platform: options.platform.as_deref(),
+                    policies: Some(service.pull_policy.as_slice()),
+                }),
+        )
+        .collect();
+        let helper = ImageNeed {
+            name: &self.config.helper_image,
+            platform: None,
+            policies: None,
+        };
+        let mut images: Vec<&ImageNeed> = job_images.iter().take(1).collect();
+        if checkout {
+            images.push(&helper);
+        }
+        images.extend(job_images.iter().skip(1));
         let pulls = self.plan_pulls(&images, trace).await?;
         // Pulled by the branch that needs them; an image both need is pulled
         // once (see `pull_shared`)
-        let needed_by = |wanted: &[&str]| -> Vec<&str> {
-            let wanted: Vec<String> = wanted.iter().map(|i| image::with_default_tag(i)).collect();
+        let needed_by = |wanted: &[&ImageNeed]| -> Vec<PlannedPull> {
             pulls
                 .iter()
-                .copied()
-                .filter(|pull| wanted.contains(&image::with_default_tag(pull)))
+                .filter(|pull| wanted.iter().any(|need| pull.is_for(need)))
+                .cloned()
                 .collect()
         };
-        let job_pulls = needed_by(
-            &std::iter::once(image.as_str())
-                .chain(service_images.iter().map(String::as_str))
-                .collect::<Vec<_>>(),
-        );
-        let helper_pulls = needed_by(&[self.config.helper_image.as_str()]);
+        let job_pulls = needed_by(&job_images.iter().collect::<Vec<_>>());
+        let helper_pulls = needed_by(&[&helper]);
 
         write_variable_files(&env)
             .await
@@ -762,8 +991,10 @@ impl DockerExecutor {
             job,
             job_dir,
             image: &image,
+            image_options: &image_options,
             services: &services,
             service_images: &service_images,
+            service_options: &service_options,
             values: &values,
             env: &env,
         };
@@ -812,14 +1043,21 @@ impl DockerExecutor {
             let _ = failed.set(failure);
             setup_stop.update(RemoteState::Canceling);
         };
+        // The services branch's lines wait while the get_sources section is
+        // open, and follow it live once it is closed
+        let (log_sender, mut log_lines) = tokio::sync::mpsc::unbounded_channel();
         let sources = async {
             let started = async {
+                let mut pull_log = SetupLog::Trace(&mut *trace);
+                // The workspace check runs while the helper image is pulled;
+                // a canceled job does not wait for it
                 let (pulled, user) = tokio::join!(
-                    self.pull_all(&helper_pulls, job, &limits),
-                    sources_user(job, job_dir)
+                    self.pull_all(&helper_pulls, job, &limits, &mut pull_log),
+                    limits.bound(sources_user(job, job_dir, &self.clean_workspaces))
                 );
                 pulled?;
                 limits.check(job)?;
+                let user = user.unwrap_or(None);
                 let id = self
                     .start_helper(job, job_dir, &env, user)
                     .await
@@ -828,7 +1066,7 @@ impl DockerExecutor {
                 Ok::<_, JobFailure>(id)
             }
             .await;
-            match started {
+            let sourced = match started {
                 Ok(id) => {
                     let runner = self.runner(&id, &env, true);
                     Ok(get_sources_section(job, &runner, trace, &dirs, &limits).await)
@@ -837,32 +1075,30 @@ impl DockerExecutor {
                     fail(failure.clone());
                     Err(failure)
                 }
-            }
+            };
+            forward_setup_log(&mut log_lines, trace).await;
+            sourced
         };
         let containers = async {
-            let mut log = SetupLog::Buffer(String::new());
+            // Dropped when this branch is done, which ends the forwarding
+            let mut log = SetupLog::Channel(log_sender);
             let started = self
                 .start_job_container(&setup, &job_pulls, &limits, &mut log, run)
                 .await;
             if let Err(failure) = &started {
                 fail(failure.clone());
             }
-            (started, log)
+            started
         };
         let forward_cancel = async {
             cancel.reached(RemoteState::Canceling).await;
             setup_stop.update(RemoteState::Canceling);
             std::future::pending::<()>().await
         };
-        let (sourced, (started, log)) = tokio::select! {
+        let (sourced, started) = tokio::select! {
             both = async { tokio::join!(sources, containers) } => both,
             () = forward_cancel => unreachable!("waits forever once forwarded"),
         };
-        if let SetupLog::Buffer(text) = log {
-            if !text.is_empty() {
-                trace.write(&text).await;
-            }
-        }
         if let Some(failure) = failed.into_inner() {
             return Err(failure);
         }
@@ -899,13 +1135,13 @@ impl DockerExecutor {
     async fn start_job_container(
         &self,
         setup: &JobSetup<'_>,
-        pulls: &[&str],
+        pulls: &[PlannedPull<'_>],
         limits: &Limits<'_>,
         log: &mut SetupLog<'_, '_>,
         run: &mut RunContainers,
     ) -> std::result::Result<String, JobFailure> {
         let job = setup.job;
-        self.pull_all(pulls, job, limits).await?;
+        self.pull_all(pulls, job, limits, log).await?;
         let volumes = self
             .job_volumes(job)
             .await
@@ -920,41 +1156,8 @@ impl DockerExecutor {
                 .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
             run.network = Some(network);
         }
-        for (index, (service, service_image)) in
-            setup.services.iter().zip(setup.service_images).enumerate()
-        {
-            log.write(&format!("Starting service {} ...\n", service_image))
-                .await;
-            limits.check(job)?;
-            let mut host_config = self.host_config(volumes.clone(), run.network.as_deref());
-            let mut service = service.clone();
-            if image::is_dind(service_image) {
-                service.command = image::dind_command(
-                    service.command.as_deref(),
-                    &self.config.insecure_registries,
-                );
-                let mounts = dind_ca_mounts(&self.config.registry_ca);
-                host_config.mounts = (!mounts.is_empty()).then_some(mounts);
-            }
-            let id = self
-                .create_service(
-                    job,
-                    &format!("turboci-job-{}-svc-{}", job.id, index),
-                    service_image,
-                    &service,
-                    setup.values,
-                    // Configured volumes too, e.g. /certs/client for docker:dind with TLS
-                    host_config,
-                )
-                .await
-                .map_err(|e| JobFailure::system(format!("service {}: {:#}", service.name, e)))?;
-            // Recorded before starting, so a service that fails to start is removed too
-            run.services.push(id.clone());
-            self.docker
-                .start_container(&id)
-                .await
-                .map_err(|e| JobFailure::system(format!("service {}: {}", service_image, e)))?;
-        }
+        self.start_services(setup, &volumes, limits, log, run)
+            .await?;
         if let Some(network) = run.network.clone() {
             self.wait_for_services(job.id, &network, &run.services, log, limits)
                 .await;
@@ -964,6 +1167,8 @@ impl DockerExecutor {
         let name = format!("turboci-job-{}", job.id);
         let config = ContainerCreateBody {
             image: Some(setup.image.to_string()),
+            // `image: {docker: {user: ...}}`; the image's own user otherwise
+            user: setup.image_options.user.clone(),
             working_dir: Some("/builds".to_string()),
             env: Some(setup.env.to_docker()),
             // `image: {entrypoint: [""]}` clears an entrypoint that is not a shell
@@ -985,7 +1190,7 @@ impl DockerExecutor {
             ..Default::default()
         };
         let id = self
-            .create_named(&name, config)
+            .create_named_for(&name, config, setup.image_options.platform.as_deref())
             .await
             .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
         run.job = Some(id.clone());
@@ -996,6 +1201,105 @@ impl DockerExecutor {
             .await
             .map_err(|e| JobFailure::system(format!("Failed to start container: {}", e)))?;
         Ok(id)
+    }
+
+    /// Create and start the job's services, all at the same time; each is
+    /// recorded in `run` (in the services' order) once it exists. A failing
+    /// service, a cancel or the job timeout stops the services that have
+    /// not been created or started yet, but no create or start call that is
+    /// under way: a dropped create could leave a container nobody removes.
+    async fn start_services(
+        &self,
+        setup: &JobSetup<'_>,
+        volumes: &[String],
+        limits: &Limits<'_>,
+        log: &mut SetupLog<'_, '_>,
+        run: &mut RunContainers,
+    ) -> JobOutcome {
+        let job = setup.job;
+        if setup.services.is_empty() {
+            return Ok(());
+        }
+        for service_image in setup.service_images {
+            log.write(&format!("Starting service {} ...\n", service_image))
+                .await;
+        }
+        limits.check(job)?;
+        let given_up = std::sync::atomic::AtomicBool::new(false);
+        let go_on = || {
+            if given_up.load(std::sync::atomic::Ordering::SeqCst) {
+                // Another service failed: its error is the job's
+                return Err(None);
+            }
+            limits.check(job).map_err(Some)
+        };
+        let network = run.network.as_deref();
+        let starts = setup
+            .services
+            .iter()
+            .zip(setup.service_images)
+            .zip(setup.service_options)
+            .enumerate()
+            .map(|(index, ((service, service_image), options))| {
+                let go_on = &go_on;
+                let given_up = &given_up;
+                async move {
+                    let mut host_config = self.host_config(volumes.to_vec(), network);
+                    let mut service = service.clone();
+                    if image::is_dind(service_image) {
+                        service.command = image::dind_command(
+                            service.command.as_deref(),
+                            &self.config.insecure_registries,
+                        );
+                        let mounts = dind_ca_mounts(&self.config.registry_ca);
+                        host_config.mounts = (!mounts.is_empty()).then_some(mounts);
+                    }
+                    if let Err(stop) = go_on() {
+                        return (None, stop);
+                    }
+                    let created = self
+                        .create_service(
+                            job,
+                            &format!("turboci-job-{}-svc-{}", job.id, index),
+                            service_image,
+                            &service,
+                            options,
+                            setup.values,
+                            // Configured volumes too, e.g. /certs/client for docker:dind with TLS
+                            host_config,
+                        )
+                        .await;
+                    let id = match created {
+                        Ok(id) => id,
+                        Err(e) => {
+                            given_up.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let message = format!("service {}: {:#}", service.name, e);
+                            return (None, Some(JobFailure::system(message)));
+                        }
+                    };
+                    if let Err(stop) = go_on() {
+                        return (Some(id), stop);
+                    }
+                    match self.docker.start_container(&id).await {
+                        Ok(()) => (Some(id), None),
+                        Err(e) => {
+                            given_up.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let message = format!("service {}: {}", service_image, e);
+                            (Some(id), Some(JobFailure::system(message)))
+                        }
+                    }
+                }
+            });
+        let started = futures_util::future::join_all(starts).await;
+        let mut failure = None;
+        for (id, failed) in started {
+            // Every service that exists is removed by `release`, started or not
+            run.services.extend(id);
+            if failure.is_none() {
+                failure = failed;
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Start the container that checks out sources as `user` (root when
@@ -1124,18 +1428,21 @@ impl DockerExecutor {
     }
 
     /// Which of `images` need a pull according to their pull policies (each
-    /// image once); fails when an image may not be pulled and is missing. A
-    /// `None` policy is for the runner's own helper image, which is pulled
-    /// only when missing.
+    /// image once per platform), and the policies to fall back to when that
+    /// pull fails. The policies are tried in order, like gitlab-runner: one
+    /// that is satisfied by an image already present ends the search, one
+    /// that pulls is planned, and `never` without the image moves on to the
+    /// next. Fails when an image may not be pulled and is missing.
     async fn plan_pulls<'i>(
         &self,
-        images: &[(&'i str, Option<&[String]>)],
+        images: &[&ImageNeed<'i>],
         trace: &mut TraceWriter<'_>,
-    ) -> std::result::Result<Vec<&'i str>, JobFailure> {
-        let mut pulls: Vec<&str> = Vec::new();
-        for &(image, job_policies) in images {
-            let policy = match job_policies {
-                None => PullPolicy::IfNotPresent,
+    ) -> std::result::Result<Vec<PlannedPull<'i>>, JobFailure> {
+        let mut pulls: Vec<PlannedPull> = Vec::new();
+        for need in images {
+            let policies = match need.policies {
+                // The runner's own helper image
+                None => vec![PullPolicy::IfNotPresent],
                 Some(policies) => PullPolicy::resolve(
                     policies,
                     &self.config.pull_policy,
@@ -1143,49 +1450,137 @@ impl DockerExecutor {
                 )
                 .map_err(pull_failure)?,
             };
-            let reference = image::with_default_tag(image);
-            // `always` pulls whether the image is present or not
-            let present =
-                policy != PullPolicy::Always && self.docker.inspect_image(&reference).await.is_ok();
-            match policy {
-                PullPolicy::Never if present => {}
-                PullPolicy::Never => {
-                    return Err(pull_failure(format!(
+            let mut notes = String::new();
+            let mut planned = None;
+            for (index, &policy) in policies.iter().enumerate() {
+                let attempt = index + 1;
+                if attempt > 1 {
+                    notes.push_str(&attempt_note(attempt, policy));
+                }
+                // `always` pulls whether the image is present or not
+                if policy != PullPolicy::Always && self.present(need.name, need.platform).await {
+                    notes.push_str(&format!("Using locally found image {}\n", need.name));
+                    break;
+                }
+                if policy == PullPolicy::Never {
+                    let error = format!(
                         "image {} is not present and pull_policy is never",
-                        image
-                    )))
+                        need.name
+                    );
+                    if attempt == policies.len() {
+                        trace.write(&notes).await;
+                        return Err(pull_failure(error));
+                    }
+                    notes.push_str(&format!(
+                        "WARNING: Failed to pull image with policy \"never\": {}\n",
+                        error
+                    ));
+                    continue;
                 }
-                PullPolicy::IfNotPresent if present => {
+                planned = Some(PlannedPull {
+                    image: need.name,
+                    platform: need.platform,
+                    policy,
+                    attempt,
+                    fallback: policies[attempt..].to_vec(),
+                });
+                break;
+            }
+            trace.write(&notes).await;
+            if let Some(pull) = planned {
+                if !pulls.iter().any(|planned| planned.is_for(need)) {
                     trace
-                        .write(&format!("Using locally found image {}\n", image))
+                        .write(&format!("Pulling image {} ...\n", pull.describe()))
                         .await;
-                }
-                _ if pulls
-                    .iter()
-                    .any(|pull| image::with_default_tag(pull) == reference) => {}
-                _ => {
-                    trace.write(&format!("Pulling image {} ...\n", image)).await;
-                    pulls.push(image);
+                    pulls.push(pull);
                 }
             }
         }
         Ok(pulls)
     }
 
-    /// Pull `images` at the same time, with the registry credentials of
-    /// `registry_login`, until `limits` stop it
-    async fn pull_all(&self, images: &[&str], job: &Job, limits: &Limits<'_>) -> JobOutcome {
-        let pulling =
-            futures_util::future::try_join_all(images.iter().map(|image| self.pull(image, job)));
+    /// Whether `image` is present, for `platform` when one is given
+    async fn present(&self, image: &str, platform: Option<&str>) -> bool {
+        match self
+            .docker
+            .inspect_image(&image::with_default_tag(image))
+            .await
+        {
+            Ok(found) => platform.is_none_or(|wanted| platform_matches(&found, wanted)),
+            Err(_) => false,
+        }
+    }
+
+    /// Make `pulls` at the same time, with the registry credentials of
+    /// `registry_login`, until `limits` stop them; what their fallbacks did
+    /// goes to `log` as each pull ends
+    async fn pull_all(
+        &self,
+        pulls: &[PlannedPull<'_>],
+        job: &Job,
+        limits: &Limits<'_>,
+        log: &mut SetupLog<'_, '_>,
+    ) -> JobOutcome {
+        let pulling = async {
+            let mut running: futures_util::stream::FuturesUnordered<_> = pulls
+                .iter()
+                .map(|pull| self.pull_with_fallback(pull, job))
+                .collect();
+            while let Some((outcome, notes)) = running.next().await {
+                if !notes.is_empty() {
+                    log.write(&notes).await;
+                }
+                outcome?;
+            }
+            Ok(())
+        };
         limits
             .bound(pulling)
             .await
             .map_err(|stop| stop.failure(job))?
-            .map(drop)
     }
 
-    /// Pull `image` from its registry with the job's login for it
-    async fn pull(&self, image: &str, job: &Job) -> JobOutcome {
+    /// Make `pull`; when it fails, try its fallback policies in order (like
+    /// gitlab-runner): `if-not-present` and `never` use the image when it is
+    /// present, `always` and `if-not-present` pull again. Returns how the
+    /// pull ended and what to log about the fallbacks.
+    async fn pull_with_fallback(&self, pull: &PlannedPull<'_>, job: &Job) -> (JobOutcome, String) {
+        let mut outcome = self.pull(pull.image, pull.platform, job).await;
+        let mut notes = String::new();
+        let mut tried = vec![pull.policy];
+        for (index, &policy) in pull.fallback.iter().enumerate() {
+            let Err(failure) = &outcome else {
+                break;
+            };
+            notes.push_str(&format!(
+                "WARNING: Failed to pull image with policy \"{}\": {}\n",
+                tried[tried.len() - 1].name(),
+                failure.message
+            ));
+            notes.push_str(&attempt_note(pull.attempt + index + 1, policy));
+            tried.push(policy);
+            if policy != PullPolicy::Always && self.present(pull.image, pull.platform).await {
+                notes.push_str(&format!("Using locally found image {}\n", pull.image));
+                outcome = Ok(());
+            } else if policy != PullPolicy::Never {
+                outcome = self.pull(pull.image, pull.platform, job).await;
+            }
+        }
+        if tried.len() > 1 {
+            outcome = outcome.map_err(|failure| {
+                let tried: Vec<&str> = tried.iter().map(|policy| policy.name()).collect();
+                pull_failure(format!(
+                    "{} (pull policies tried: {})",
+                    failure.message,
+                    tried.join(", ")
+                ))
+            });
+        }
+        (outcome, notes)
+    }
+
+    /// Pull `image` for `platform` from its registry with the job's login for it
+    async fn pull(&self, image: &str, platform: Option<&str>, job: &Job) -> JobOutcome {
         let credentials = self
             .registry_login(image, job)
             .await
@@ -1195,27 +1590,35 @@ impl DockerExecutor {
                 serveraddress: Some(image::registry(image).to_string()),
                 ..Default::default()
             });
-        self.pull_shared(image, credentials).await
+        self.pull_shared(image, platform, credentials).await
     }
 
-    /// Pull `image` with `credentials`, or wait for the pull of the same
-    /// image with the same login that another job already started
+    /// Pull `image` for `platform` with `credentials`, or wait for the pull
+    /// of the same image for the same platform with the same login that
+    /// another job already started
     async fn pull_shared(
         &self,
         image: &str,
+        platform: Option<&str>,
         credentials: Option<docker_api::DockerCredentials>,
     ) -> PullOutcome {
         use futures_util::FutureExt;
 
+        let reference = image::with_default_tag(image);
         let key = (
-            image::with_default_tag(image),
+            match platform {
+                Some(platform) => format!("{} {}", reference, platform),
+                None => reference,
+            },
             login_identity(credentials.as_ref()),
         );
         let docker = Arc::clone(&self.docker);
         let image = image.to_string();
+        let platform = platform.map(str::to_string);
         self.pulls
             .join(key, move || {
-                async move { pull_image(&docker, &image, credentials).await }.boxed()
+                async move { pull_image(&docker, &image, platform.as_deref(), credentials).await }
+                    .boxed()
             })
             .await
     }
@@ -1234,13 +1637,16 @@ impl DockerExecutor {
         Ok(())
     }
 
-    /// Create a service container reachable by its aliases on the job network
+    /// Create a service container reachable by its aliases on the job
+    /// network, for the platform and as the user of its `docker:` options
+    #[allow(clippy::too_many_arguments)]
     async fn create_service(
         &self,
         job: &Job,
         name: &str,
         image: &str,
         service: &crate::gitlab::Service,
+        options: &DockerOptions,
         values: &std::collections::HashMap<String, String>,
         host_config: HostConfig,
     ) -> Result<String> {
@@ -1261,6 +1667,7 @@ impl DockerExecutor {
             });
         let config = ContainerCreateBody {
             image: Some(image.to_string()),
+            user: options.user.clone(),
             env: Some(script::service_env(job, &service.variables, values)),
             entrypoint: service.entrypoint.clone(),
             cmd: service.command.clone(),
@@ -1268,7 +1675,8 @@ impl DockerExecutor {
             networking_config,
             ..Default::default()
         };
-        self.create_named(name, config).await
+        self.create_named_for(name, config, options.platform.as_deref())
+            .await
     }
 
     /// Wait until the services' exposed TCP ports accept connections, like
@@ -1435,14 +1843,25 @@ impl DockerExecutor {
     }
 
     /// Create a container under a fixed name, replacing a leftover one
-    async fn create_named(&self, name: &str, mut config: ContainerCreateBody) -> Result<String> {
+    async fn create_named(&self, name: &str, config: ContainerCreateBody) -> Result<String> {
+        self.create_named_for(name, config, None).await
+    }
+
+    /// `create_named` of the image's variant for `platform` (dockerd's
+    /// default when `None`)
+    async fn create_named_for(
+        &self,
+        name: &str,
+        mut config: ContainerCreateBody,
+        platform: Option<&str>,
+    ) -> Result<String> {
         config
             .labels
             .get_or_insert_with(Default::default)
             .extend(self.labels());
 
         // Usually the name is free; 409 Conflict when a container has it
-        match self.docker.create_container(name, &config).await {
+        match self.docker.create_container(name, platform, &config).await {
             Ok(response) => return Ok(response.id),
             Err(e) if e.status_code() == Some(409) => {}
             Err(e) => return Err(e).context("Failed to create container"),
@@ -1463,7 +1882,7 @@ impl DockerExecutor {
         let _ = self.docker.remove_container(name, true, true).await;
         let response = self
             .docker
-            .create_container(name, &config)
+            .create_container(name, platform, &config)
             .await
             .context("Failed to create container")?;
         Ok(response.id)
@@ -1483,11 +1902,20 @@ impl DockerExecutor {
             .chain(&containers.run.services)
             .map(|id| async move {
                 match self.force_remove(id).await {
-                    Ok(()) => info!("🗑️  Removed container: {}", id),
-                    Err(e) => warn!("Failed to remove container {}: {}", id, e),
+                    Ok(()) => {
+                        info!("🗑️  Removed container: {}", id);
+                        true
+                    }
+                    Err(e) => {
+                        warn!("Failed to remove container {}: {}", id, e);
+                        false
+                    }
                 }
             });
-        futures_util::future::join_all(removals).await;
+        let all_removed = futures_util::future::join_all(removals)
+            .await
+            .into_iter()
+            .all(|removed| removed);
         if let Some(network) = &containers.run.network {
             if let Err(e) = self.docker.remove_network(network).await {
                 warn!("Failed to remove network {}: {}", network, e);
@@ -1495,7 +1923,8 @@ impl DockerExecutor {
         }
 
         if containers.run.job.is_some() || containers.helper.is_some() {
-            if let Err(e) = self.reset_ownership(job_id, job_dir).await {
+            // A container that may still run can still change the workspace
+            if let Err(e) = self.reset_ownership(job_id, job_dir, all_removed).await {
                 warn!("Failed to reset workspace ownership: {:#}", e);
             }
         }
@@ -1503,11 +1932,10 @@ impl DockerExecutor {
 
     /// Pull a runner-internal image (no job credentials) when it is not present
     async fn pull_if_missing(&self, image: &str) -> Result<()> {
-        let reference = image::with_default_tag(image);
-        if self.docker.inspect_image(&reference).await.is_ok() {
+        if self.present(image, None).await {
             return Ok(());
         }
-        self.pull_shared(image, None)
+        self.pull_shared(image, None, None)
             .await
             .map_err(|failure| anyhow::anyhow!(failure.message))
     }
@@ -1519,18 +1947,25 @@ impl DockerExecutor {
     /// Give the workspace back to the runner's uid/gid (the owner of
     /// `job_dir`) from a fresh container of the (trusted) helper image, never
     /// from the job's own image. Skipped when everything already belongs to
-    /// it, e.g. jobs running as the runner's user, or Docker Desktop.
-    async fn reset_ownership(&self, job_id: u64, job_dir: &Path) -> Result<()> {
+    /// it, e.g. jobs running as the runner's user, or Docker Desktop. With
+    /// `may_mark`, a workspace that belongs wholly to its owner afterwards is
+    /// marked clean for the next job's checkout (see `CleanWorkspaces`).
+    async fn reset_ownership(&self, job_id: u64, job_dir: &Path, may_mark: bool) -> Result<()> {
+        // The job's containers may have changed anything
+        self.clean_workspaces.forget(job_dir);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
-
             let meta = tokio::fs::metadata(job_dir).await?;
-            let (uid, gid) = (meta.uid(), meta.gid());
+            let stamp = WorkspaceStamp::of(&meta);
+            let (uid, gid) = (stamp.uid, stamp.gid);
             let dir = job_dir.to_path_buf();
             let needed =
                 tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid)).await?;
+            let may_mark = may_mark && stamp.owned_by_runner();
             if !needed {
+                if may_mark {
+                    self.clean_workspaces.mark(job_dir, stamp);
+                }
                 return Ok(());
             }
             // Jobs without sources to check out never pulled the helper image
@@ -1565,7 +2000,13 @@ impl DockerExecutor {
             .await;
             let _ = self.force_remove(&id).await;
             result?;
+            // The script exited with 0: it gave everything to the owner
+            if may_mark {
+                self.clean_workspaces.mark(job_dir, stamp);
+            }
         }
+        #[cfg(not(unix))]
+        let _ = (job_id, may_mark);
         Ok(())
     }
 }
@@ -2272,6 +2713,16 @@ mod tests {
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
         assert!(log.contains(&format!("config-owner={}", owner)), "{}", log);
         assert!(log.contains("hello from git"), "{}", log);
+        // Left clean for the next checkout, when the runner's user owns the
+        // workspace (as root, uid 1000 only plays the owner)
+        let ExecutorType::Docker(docker_executor) = &executor else {
+            unreachable!()
+        };
+        let stamp = WorkspaceStamp::of(&std::fs::metadata(&workspace).unwrap());
+        assert_eq!(
+            docker_executor.clean_workspaces.lock().get(&workspace),
+            stamp.owned_by_runner().then_some(&stamp)
+        );
         let (outcome, log, _) = run(project + 1, serde_json::json!([])).await;
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
         assert!(
@@ -2467,8 +2918,8 @@ mod tests {
         let _ = executor.docker.remove_image(image).await;
 
         let (a, b) = tokio::join!(
-            executor.pull_shared(image, None),
-            executor.pull_shared(image, None)
+            executor.pull_shared(image, None, None),
+            executor.pull_shared(image, None, None)
         );
         assert!(a.is_ok() && b.is_ok(), "{:?} {:?}", a, b);
         assert!(executor.docker.inspect_image(image).await.is_ok());
@@ -2476,8 +2927,8 @@ mod tests {
 
         let missing = "turboci-missing.invalid/none:1";
         let (a, b) = tokio::join!(
-            executor.pull_shared(missing, None),
-            executor.pull_shared(missing, None)
+            executor.pull_shared(missing, None, None),
+            executor.pull_shared(missing, None, None)
         );
         let (a, b) = (a.unwrap_err(), b.unwrap_err());
         assert_eq!(a.reason, FailureReason::ImagePullFailure);
@@ -2514,6 +2965,7 @@ mod tests {
                         &format!("turboci-job-{}-svc-{}", job_id, index),
                         "redis:7-alpine",
                         &service,
+                        &DockerOptions::default(),
                         &std::collections::HashMap::new(),
                         executor.host_config(Vec::new(), Some(network.as_str())),
                     )
@@ -3060,6 +3512,167 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_job_and_services_run_for_their_platform_and_as_their_user() {
+        let executor = with_pipeline_images().await;
+        let host = match std::env::consts::ARCH {
+            "aarch64" => "linux/arm64",
+            _ => "linux/amd64",
+        };
+        let job_id = 962_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {
+                "name": "alpine:3.20",
+                "executor_opts": {"docker": {"platform": host, "user": "1000:1000"}}
+            },
+            "services": [{
+                "name": "redis:7-alpine", "alias": "cache",
+                "executor_opts": {"docker": {"platform": host, "user": "redis"}}
+            }],
+            "steps": steps(
+                &[
+                    "echo \"uid=$(id -u) gid=$(id -g)\"",
+                    "for i in $(seq 1 20); do nc -z cache 6379 && break; sleep 0.5; done",
+                    "nc -z cache 6379 && echo service-up",
+                ],
+                &[]
+            )
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("uid=1000 gid=1000"), "{}", log);
+        assert!(log.contains("service-up"), "{}", log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_failed_pull_falls_back_to_a_local_image() {
+        let executor = DockerExecutor::new(DockerConfig {
+            pull_policy: "always".to_string(),
+            allowed_pull_policies: vec!["always".to_string(), "if-not-present".to_string()],
+            ..DockerConfig::default()
+        })
+        .unwrap();
+        executor.pull_if_missing("alpine:3.20").await.unwrap();
+        // Present locally, but its registry does not exist
+        let local = "turboci-fallback.invalid/alpine";
+        executor
+            .docker
+            .tag_image("alpine:3.20", local, "1")
+            .await
+            .unwrap();
+        let executor = ExecutorType::Docker(executor);
+        let job_id = 963_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": format!("{}:1", local), "pull_policy": ["always", "if-not-present"]},
+            "steps": steps(&["echo ran-from-local-image"], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+        let ExecutorType::Docker(docker_executor) = &executor else {
+            unreachable!()
+        };
+        let _ = docker_executor
+            .docker
+            .remove_image(&format!("{}:1", local))
+            .await;
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(
+            log.contains("WARNING: Failed to pull image with policy \"always\": "),
+            "{}",
+            log
+        );
+        assert!(
+            log.contains(
+                "Attempt #2: Trying \"if-not-present\" pull policy\nUsing locally found image"
+            ),
+            "{}",
+            log
+        );
+        assert!(log.contains("ran-from-local-image"), "{}", log);
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_service_that_fails_to_start_fails_the_job_and_leaves_nothing() {
+        let executor = with_pipeline_images().await;
+        let job_id = 964_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "redis:7-alpine"},
+            "services": [
+                {"name": "redis:7-alpine", "alias": "one"},
+                {"name": "redis:7-alpine", "alias": "broken", "entrypoint": ["/nonexistent"]},
+                {"name": "redis:7-alpine", "alias": "three"}
+            ],
+            "steps": steps(&["echo script-ran"], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(
+            failure.reason,
+            FailureReason::RunnerSystemFailure,
+            "{}",
+            log
+        );
+        assert!(
+            failure.message.starts_with("service redis:7-alpine: "),
+            "{}",
+            failure.message
+        );
+        assert_eq!(log.matches("Starting service redis:7-alpine").count(), 3);
+        assert!(!log.contains("script-ran"), "{}", log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    async fn setup_lines_wait_for_the_log_and_then_follow_live() {
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, 1, "t", &scrubber);
+        let (sender, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let mut log = SetupLog::Channel(sender);
+        // Written while the log still showed the checkout
+        log.write("Starting service a ...\n").await;
+        trace.write("checkout done\n").await;
+
+        let services = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            log.write("Waiting for services ...\n").await;
+            // Dropping the sender ends the forwarding
+        };
+        tokio::join!(forward_setup_log(&mut lines, &mut trace), services);
+        trace.finish().await;
+
+        assert_eq!(
+            trace.text(),
+            "checkout done\nStarting service a ...\nWaiting for services ...\n"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_lists_untracked_files_with_the_helper() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
@@ -3130,10 +3743,11 @@ mod tests {
                 "hooks": [{"name": name, "script": ["apk add git-lfs"]}]
             }))
         };
+        let clean = CleanWorkspaces::default();
 
         for name in ["pre_get_sources_script", "post_get_sources_script"] {
             assert_eq!(
-                sources_user(&hooked(name), workspace).await,
+                sources_user(&hooked(name), workspace, &clean).await,
                 None,
                 "{}",
                 name
@@ -3142,24 +3756,91 @@ mod tests {
         let meta = std::fs::metadata(workspace).unwrap();
         if meta.uid() != 0 {
             assert_eq!(
-                sources_user(&plain, workspace).await,
+                sources_user(&plain, workspace, &clean).await,
                 Some(format!("{}:{}", meta.uid(), meta.gid()))
             );
             return;
         }
         // As root: a root-owned workspace keeps root
-        assert_eq!(sources_user(&plain, workspace).await, None);
+        assert_eq!(sources_user(&plain, workspace, &clean).await, None);
         for entry in walkdir::WalkDir::new(workspace) {
             std::os::unix::fs::chown(entry.unwrap().path(), Some(1000), Some(1000)).unwrap();
         }
         assert_eq!(
-            sources_user(&plain, workspace).await,
+            sources_user(&plain, workspace, &clean).await,
             Some("1000:1000".to_string())
         );
         // A leftover of someone else's that only root may remove
         std::fs::write(workspace.join("project/.git/index.lock"), "").unwrap();
-        assert_eq!(sources_user(&plain, workspace).await, None);
-        assert_eq!(sources_user(&plain, &workspace.join("missing")).await, None);
+        assert_eq!(sources_user(&plain, workspace, &clean).await, None);
+        assert_eq!(
+            sources_user(&plain, &workspace.join("missing"), &clean).await,
+            None
+        );
+    }
+
+    /// A workspace that is not wholly its owner's, so that only a skipped
+    /// walk lets the sources helper run as the owner: as root, a file of
+    /// another user; otherwise a directory the walk cannot read
+    fn unclean_workspace() -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        std::fs::create_dir_all(workspace.join("project/.git")).unwrap();
+        let mut meta = std::fs::metadata(workspace).unwrap();
+        if meta.uid() == 0 {
+            for entry in walkdir::WalkDir::new(workspace) {
+                std::os::unix::fs::chown(entry.unwrap().path(), Some(1000), Some(1000)).unwrap();
+            }
+            std::fs::write(workspace.join("project/.git/index.lock"), "").unwrap();
+            meta = std::fs::metadata(workspace).unwrap();
+        } else {
+            let locked = workspace.join("project/locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::create_dir(locked.join("inside")).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let owner = format!("{}:{}", meta.uid(), meta.gid());
+        (dir, owner)
+    }
+
+    #[tokio::test]
+    async fn a_workspace_left_clean_is_not_walked_again_before_the_next_checkout() {
+        let (dir, owner) = unclean_workspace();
+        let workspace = dir.path();
+        let plain = job(serde_json::json!({"id": 1, "token": "t"}));
+        let clean = CleanWorkspaces::default();
+        let stamp = || WorkspaceStamp::of(&std::fs::metadata(workspace).unwrap());
+
+        // Walked: the workspace is not wholly the owner's
+        assert_eq!(sources_user(&plain, workspace, &clean).await, None);
+        // Marked clean when the last job ended: not walked
+        clean.mark(workspace, stamp());
+        assert_eq!(sources_user(&plain, workspace, &clean).await, Some(owner));
+        // The mark is used up by that job
+        assert_eq!(sources_user(&plain, workspace, &clean).await, None);
+        // A mark of the workspace as it was before it was created anew, or
+        // before it changed hands, does not count
+        let mut old = stamp();
+        old.ino += 1;
+        clean.mark(workspace, old);
+        assert_eq!(sources_user(&plain, workspace, &clean).await, None);
+        let mut old = stamp();
+        old.uid += 1;
+        clean.mark(workspace, old);
+        assert_eq!(sources_user(&plain, workspace, &clean).await, None);
+        // Nor does a mark that was forgotten (a job started containers in it)
+        clean.mark(workspace, stamp());
+        clean.forget(workspace);
+        assert_eq!(sources_user(&plain, workspace, &clean).await, None);
+
+        // Readable again, so the temporary directory can be removed
+        let locked = workspace.join("project/locked");
+        if locked.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     #[test]
@@ -3206,6 +3887,7 @@ mod tests {
             ca_pem: None,
             owner: "turboci".to_string(),
             pulls: Arc::default(),
+            clean_workspaces: Arc::default(),
         }
     }
 
@@ -3361,6 +4043,220 @@ mod tests {
         // Length-prefixed parts: moving a character between them changes it
         assert_ne!(login_identity(Some(&login("cis", "ecret-one"))), a);
         assert!(!a.contains("secret-one"));
+    }
+
+    fn need<'i>(
+        name: &'i str,
+        platform: Option<&'i str>,
+        policies: Option<&'i [String]>,
+    ) -> ImageNeed<'i> {
+        ImageNeed {
+            name,
+            platform,
+            policies,
+        }
+    }
+
+    fn policies(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// An executor that finds no image locally and whose pulls all fail
+    fn without_images() -> DockerExecutor {
+        offline(DockerConfig {
+            pull_policy: "always".to_string(),
+            allowed_pull_policies: policies(&["always", "if-not-present", "never"]),
+            ..DockerConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn pull_policies_are_tried_in_order_until_one_pulls() {
+        let executor = without_images();
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, 1, "t", &scrubber);
+        let never_then_always = policies(&["never", "always"]);
+        let always_then_local = policies(&["always", "if-not-present"]);
+        let default = Vec::new();
+        let images = [
+            need("app:1", None, Some(never_then_always.as_slice())),
+            need("db:1", None, Some(always_then_local.as_slice())),
+            // The same image again, and for another platform
+            need("db:1", None, Some(default.as_slice())),
+            need("db:1", Some("linux/arm64"), Some(default.as_slice())),
+            need("alpine/git", None, None),
+        ];
+
+        let pulls = executor
+            .plan_pulls(&images.iter().collect::<Vec<_>>(), &mut trace)
+            .await
+            .unwrap();
+        trace.finish().await;
+        let log = trace.text();
+
+        let planned: Vec<_> = pulls
+            .iter()
+            .map(|p| (p.image, p.platform, p.policy, p.attempt, p.fallback.clone()))
+            .collect();
+        assert_eq!(
+            planned,
+            vec![
+                ("app:1", None, PullPolicy::Always, 2, vec![]),
+                (
+                    "db:1",
+                    None,
+                    PullPolicy::Always,
+                    1,
+                    vec![PullPolicy::IfNotPresent]
+                ),
+                ("db:1", Some("linux/arm64"), PullPolicy::Always, 1, vec![]),
+                ("alpine/git", None, PullPolicy::IfNotPresent, 1, vec![]),
+            ]
+        );
+        assert!(
+            log.contains(
+                "WARNING: Failed to pull image with policy \"never\": image app:1 is not \
+                 present and pull_policy is never\nAttempt #2: Trying \"always\" pull policy\n\
+                 Pulling image app:1 ...\n"
+            ),
+            "{}",
+            log
+        );
+        assert!(
+            log.contains("Pulling image db:1 for linux/arm64 ...\n"),
+            "{}",
+            log
+        );
+        assert_eq!(log.matches("Pulling image db:1 ...").count(), 1, "{}", log);
+    }
+
+    #[tokio::test]
+    async fn an_image_no_policy_can_get_fails_the_job_before_anything_starts() {
+        let executor = without_images();
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, 1, "t", &scrubber);
+        let never = policies(&["never"]);
+        let not_allowed = policies(&["sometimes"]);
+
+        let failure = executor
+            .plan_pulls(&[&need("app:1", None, Some(never.as_slice()))], &mut trace)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.reason, FailureReason::ImagePullFailure);
+        assert_eq!(
+            failure.message,
+            "image app:1 is not present and pull_policy is never"
+        );
+        let failure = executor
+            .plan_pulls(
+                &[&need("app:1", None, Some(not_allowed.as_slice()))],
+                &mut trace,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            failure.message.contains("not one of the runner's allowed"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_pull_falls_back_to_the_next_policies() {
+        let executor = without_images();
+        let j = job(serde_json::json!({"id": 1, "token": "t"}));
+        let pull = PlannedPull {
+            image: "app:1",
+            platform: None,
+            policy: PullPolicy::Always,
+            attempt: 1,
+            fallback: vec![PullPolicy::IfNotPresent, PullPolicy::Never],
+        };
+
+        let (outcome, notes) = executor.pull_with_fallback(&pull, &j).await;
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(failure.reason, FailureReason::ImagePullFailure);
+        assert!(
+            failure.message.starts_with("failed to pull image app:1: ")
+                && failure
+                    .message
+                    .ends_with(" (pull policies tried: always, if-not-present, never)"),
+            "{}",
+            failure.message
+        );
+        let lines: Vec<&str> = notes.lines().collect();
+        assert_eq!(lines.len(), 4, "{}", notes);
+        assert!(
+            lines[0].starts_with("WARNING: Failed to pull image with policy \"always\": "),
+            "{}",
+            notes
+        );
+        assert_eq!(
+            lines[1],
+            "Attempt #2: Trying \"if-not-present\" pull policy"
+        );
+        assert!(
+            lines[2].starts_with("WARNING: Failed to pull image with policy \"if-not-present\": "),
+            "{}",
+            notes
+        );
+        assert_eq!(lines[3], "Attempt #3: Trying \"never\" pull policy");
+
+        // Without fallbacks the pull's own error is the job's
+        let pull = PlannedPull {
+            fallback: Vec::new(),
+            ..pull
+        };
+        let (outcome, notes) = executor.pull_with_fallback(&pull, &j).await;
+        assert!(!outcome.unwrap_err().message.contains("pull policies tried"));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn local_images_match_the_platform_docker_would_run() {
+        let image = |os: &str, arch: &str, variant: Option<&str>| docker_api::ImageInspect {
+            os: Some(os.to_string()),
+            architecture: Some(arch.to_string()),
+            variant: variant.map(str::to_string),
+        };
+        let amd64 = image("linux", "amd64", None);
+        let arm64 = image("linux", "arm64", Some("v8"));
+        let armv6 = image("linux", "arm", Some("v6"));
+
+        for wanted in [
+            "linux/amd64",
+            "LINUX/X86_64",
+            "amd64",
+            "linux",
+            "linux/amd64/v3",
+        ] {
+            assert!(platform_matches(&amd64, wanted), "{}", wanted);
+        }
+        for wanted in [
+            "linux/arm64",
+            "linux/arm64/v8",
+            "linux/aarch64",
+            "windows/amd64",
+        ] {
+            assert!(!platform_matches(&amd64, wanted), "{}", wanted);
+        }
+        for wanted in ["linux/arm64", "linux/arm64/v8", "linux/aarch64", "arm64"] {
+            assert!(platform_matches(&arm64, wanted), "{}", wanted);
+        }
+        assert!(platform_matches(&armv6, "linux/arm/v6"));
+        assert!(platform_matches(&armv6, "linux/armel"));
+        // `arm` alone is arm/v7
+        assert!(!platform_matches(&armv6, "linux/arm"));
+        assert!(platform_matches(
+            &image("linux", "arm", None),
+            "linux/arm/v7"
+        ));
+        // dockerd that does not say matches anything
+        assert!(platform_matches(
+            &docker_api::ImageInspect::default(),
+            "linux/arm64"
+        ));
     }
 
     #[test]

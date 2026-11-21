@@ -24,8 +24,10 @@ lists what a runner has to do, and how TurboCI does it.
 | Feature | Notes |
 |---|---|
 | `image:name`, `entrypoint` | The job image needs no `git`: sources are checked out by a helper container |
-| `image:pull_policy` | Honoured when listed in [`allowed_pull_policies`](configuration.md#docker) |
-| `services` | Own network per job; reachable by name-derived aliases and `alias`; `variables`, `command`, `entrypoint` per service. The script starts once service ports accept connections (up to 30 s), checked from the runner's host when it reaches the job network (Linux with a local dockerd), otherwise from a short-lived helper container on that network |
+| `image:pull_policy` | Honoured when listed in [`allowed_pull_policies`](configuration.md#docker) (others in the list are dropped). Several policies are tried in order, like gitlab-runner: `[always, if-not-present]` uses the local image when the pull fails; the log says which policy applied. Also for `services:pull_policy` |
+| `image:docker:platform` | Pulls and runs the image for that platform (e.g. `linux/arm64`); a local image of another platform counts as missing. Also `services:docker:platform` |
+| `image:docker:user` | The job container, and so every script, runs as that user (name or UID, optionally `:group`); the image's own user otherwise. The user needs write access to the project directory to change files there. Also `services:docker:user` |
+| `services` | Own network per job; reachable by name-derived aliases and `alias`; `variables`, `command`, `entrypoint` per service. Services are created and started at the same time. The script starts once service ports accept connections (up to 30 s), checked from the runner's host when it reaches the job network (Linux with a local dockerd), otherwise from a short-lived helper container on that network |
 | Private images | `DOCKER_AUTH_CONFIG`, the runner's Docker `config.json`, or GitLab's registry credentials; see [private registries](configuration.md#private-registries) |
 | Runner services | Services from the runner config start for every job, e.g. Docker-in-Docker; see [services for every job](configuration.md#services-for-every-job) |
 

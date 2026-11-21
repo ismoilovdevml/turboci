@@ -196,35 +196,54 @@ impl PullPolicy {
         }
     }
 
-    /// The policy for a job image. Without a job policy the runner's default is
-    /// used; a job may only pick policies the runner allows (`allowed`, or just
-    /// the default when empty), like gitlab-runner's `allowed_pull_policies`.
-    /// Otherwise a job could, for example, use `never` to run another project's
-    /// private image from the local cache without registry credentials.
+    /// The name `.gitlab-ci.yml` and the config use
+    pub fn name(self) -> &'static str {
+        match self {
+            PullPolicy::Always => "always",
+            PullPolicy::IfNotPresent => "if-not-present",
+            PullPolicy::Never => "never",
+        }
+    }
+
+    /// The policies for a job image, in the order they are tried (a failed
+    /// pull falls back to the next one, like gitlab-runner). Without job
+    /// policies the runner's default is used; a job may only pick policies
+    /// the runner allows (`allowed`, or just the default when empty), like
+    /// gitlab-runner's `allowed_pull_policies`, and the others are dropped.
+    /// Otherwise a job could, for example, use `never` to run another
+    /// project's cached private image from the local cache without registry
+    /// credentials.
     pub fn resolve(
         job_policies: &[String],
         default: &str,
         allowed: &[String],
-    ) -> Result<Self, String> {
+    ) -> Result<Vec<Self>, String> {
         if job_policies.is_empty() {
-            return Ok(Self::parse(default).unwrap_or(PullPolicy::Always));
+            return Ok(vec![Self::parse(default).unwrap_or(PullPolicy::Always)]);
         }
         let allowed: Vec<&str> = if allowed.is_empty() {
             vec![default]
         } else {
             allowed.iter().map(String::as_str).collect()
         };
-        job_policies
+        let mut policies: Vec<Self> = Vec::new();
+        for policy in job_policies
             .iter()
             .map(String::as_str)
             .filter(|policy| allowed.contains(policy))
-            .find_map(Self::parse)
-            .ok_or_else(|| {
-                format!(
-                    "pull_policy {:?} is not one of the runner's allowed pull policies {:?}",
-                    job_policies, allowed
-                )
-            })
+            .filter_map(Self::parse)
+        {
+            if !policies.contains(&policy) {
+                policies.push(policy);
+            }
+        }
+        if policies.is_empty() {
+            return Err(format!(
+                "pull_policy {:?} is not one of the runner's allowed pull policies {:?}",
+                job_policies, allowed
+            ));
+        }
+        Ok(policies)
     }
 }
 
@@ -405,23 +424,33 @@ mod tests {
 
         assert_eq!(
             PullPolicy::resolve(&[], "if-not-present", &[]),
-            Ok(PullPolicy::IfNotPresent)
+            Ok(vec![PullPolicy::IfNotPresent])
         );
         // Only the runner's own policy is allowed by default
         assert!(PullPolicy::resolve(&s(&["never"]), "always", &[]).is_err());
         assert!(PullPolicy::resolve(&s(&["if-not-present"]), "always", &[]).is_err());
         assert_eq!(
             PullPolicy::resolve(&s(&["always"]), "always", &[]),
-            Ok(PullPolicy::Always)
+            Ok(vec![PullPolicy::Always])
         );
-        // The first job policy that is allowed wins
+        // Job policies the runner does not allow are dropped
         assert_eq!(
             PullPolicy::resolve(
                 &s(&["never", "if-not-present"]),
                 "always",
                 &s(&["always", "if-not-present"])
             ),
-            Ok(PullPolicy::IfNotPresent)
+            Ok(vec![PullPolicy::IfNotPresent])
         );
+        // The allowed ones are tried in the job's order, each once
+        assert_eq!(
+            PullPolicy::resolve(
+                &s(&["always", "never", "if-not-present", "always"]),
+                "always",
+                &s(&["always", "if-not-present"])
+            ),
+            Ok(vec![PullPolicy::Always, PullPolicy::IfNotPresent])
+        );
+        assert_eq!(PullPolicy::IfNotPresent.name(), "if-not-present");
     }
 }

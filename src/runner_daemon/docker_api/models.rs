@@ -98,6 +98,17 @@ pub struct EndpointConfig {
     pub aliases: Option<Vec<String>>,
 }
 
+/// `GET /images/{name}/json` response: the image's platform
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ImageInspect {
+    #[serde(rename = "Os")]
+    pub os: Option<String>,
+    #[serde(rename = "Architecture")]
+    pub architecture: Option<String>,
+    #[serde(rename = "Variant")]
+    pub variant: Option<String>,
+}
+
 /// `POST /containers/create` response
 #[derive(Debug, Deserialize)]
 pub struct ContainerCreateResponse {

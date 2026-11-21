@@ -264,10 +264,13 @@ helper runs as the owner of the workspace directory, so the checkout belongs
 to the runner's user; it runs as root when `pre_get_sources_script` or
 `post_get_sources_script` hooks are set (they may need root), when the
 workspace belongs to root, or when an earlier job left files in it that belong
-to another user. Jobs
+to another user. Checking that walks the workspace, except when the last job
+in it ended with everything handed back to the runner's user (remembered
+until the runner restarts). Jobs
 with `services` get their own network where each service is reachable by its
 aliases. The checkout runs while the job image is pulled and the services
-start; the log shows the services' progress after the `get_sources` section.
+start; the log shows the services' progress after the `get_sources` section,
+as it happens once that section is closed.
 If either fails, or the job times out or is canceled, the other is stopped
 and every container of the job is removed. Concurrent jobs that need the same image with the same registry
 login wait for one pull of it; a job never shares the pull of a job that
