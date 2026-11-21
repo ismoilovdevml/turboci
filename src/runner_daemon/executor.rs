@@ -2,15 +2,7 @@
 //! or shell (directly on the host). The step semantics are shared; executors only
 //! differ in how a script is run.
 
-// Bollard 0.19 has deprecated old API, but new API is complex
-// We'll migrate to new API in future version
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
-use bollard::container::LogOutput;
-use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::models::{ContainerCreateBody, HostConfig};
-use bollard::Docker;
 use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +14,7 @@ use tracing::{info, warn};
 
 use super::cancel::{CancelSignal, Stop};
 use super::config::DockerConfig;
+use super::docker_api::{self, ContainerCreateBody, Docker, ExecConfig, HostConfig, LogOutput};
 use super::git::{self, GitStrategy};
 use super::image::{self, PullPolicy};
 use super::script::{self, JobEnv};

@@ -100,7 +100,7 @@ impl<T: Clone> Drop for ForgetEnded<'_, T> {
 /// Identifies a registry login without holding its secret: concurrent pulls
 /// are only shared between jobs that use the same one, so no job gets an
 /// image through another job's login
-fn login_identity(credentials: Option<&bollard::auth::DockerCredentials>) -> String {
+fn login_identity(credentials: Option<&docker_api::DockerCredentials>) -> String {
     let Some(credentials) = credentials else {
         return "anonymous".to_string();
     };
@@ -124,16 +124,10 @@ fn login_identity(credentials: Option<&bollard::auth::DockerCredentials>) -> Str
 async fn pull_image(
     docker: &Docker,
     image: &str,
-    credentials: Option<bollard::auth::DockerCredentials>,
+    credentials: Option<docker_api::DockerCredentials>,
 ) -> PullOutcome {
-    use bollard::image::CreateImageOptions;
-
     let reference = image::with_default_tag(image);
-    let options = Some(CreateImageOptions {
-        from_image: reference.as_str(),
-        ..Default::default()
-    });
-    let mut stream = docker.create_image(options, None, credentials);
+    let mut stream = docker.create_image(&reference, credentials.as_ref());
     while let Some(progress) = stream.next().await {
         if let Err(e) = progress {
             let error = e.to_string();
@@ -162,7 +156,7 @@ impl std::fmt::Debug for DockerExecutor {
 
 /// TCP ports that show a service is up: its HEALTHCHECK_TCP_PORT, or its
 /// exposed TCP ports (lowest 20), as gitlab-runner checks them
-fn service_ports(config: Option<&bollard::models::ContainerConfig>) -> Vec<u16> {
+fn service_ports(config: Option<&docker_api::ContainerConfig>) -> Vec<u16> {
     let Some(config) = config else {
         return Vec::new();
     };
@@ -307,7 +301,7 @@ fn bridge_is_local(gateway: std::net::IpAddr) -> bool {
 
 /// The service's address on `network` when the runner's host reaches it
 fn host_reachable_address(
-    info: &bollard::models::ContainerInspectResponse,
+    info: &docker_api::ContainerInspectResponse,
     network: &str,
 ) -> Option<std::net::IpAddr> {
     let endpoint = info
@@ -397,7 +391,7 @@ async fn within<T>(
 /// dockerd's own configuration can provide; each entry says how to fix it.
 /// `resolve` returns a host name's addresses, none when it does not resolve.
 pub fn daemon_warnings(
-    info: &bollard::models::SystemInfo,
+    info: &docker_api::SystemInfo,
     config: &DockerConfig,
     proxy: bool,
     certs_dir: &Path,
@@ -475,15 +469,14 @@ fn registry_host(registry: &str) -> &str {
 /// binds: a registry port (`host:8443`) would break the `src:dst` bind syntax.
 pub fn dind_ca_mounts(
     registry_ca: &std::collections::BTreeMap<String, String>,
-) -> Vec<bollard::models::Mount> {
+) -> Vec<docker_api::Mount> {
     registry_ca
         .iter()
-        .map(|(registry, file)| bollard::models::Mount {
+        .map(|(registry, file)| docker_api::Mount {
             target: Some(format!("/etc/docker/certs.d/{}/ca.crt", registry)),
             source: Some(file.clone()),
-            typ: Some(bollard::models::MountTypeEnum::BIND),
+            typ: Some(docker_api::MountType::Bind),
             read_only: Some(true),
-            ..Default::default()
         })
         .collect()
 }
@@ -600,20 +593,13 @@ impl DockerExecutor {
     }
 
     pub async fn sweep_orphans(&self) {
-        use bollard::container::ListContainersOptions;
-        use bollard::network::ListNetworksOptions;
-
         let filter = std::collections::HashMap::from([(
             "label".to_string(),
             vec![format!("{}={}", OWNER_LABEL, self.owner)],
         )]);
         let containers = self
             .docker
-            .list_containers(Some(ListContainersOptions {
-                all: true,
-                filters: filter.clone(),
-                ..Default::default()
-            }))
+            .list_containers(true, &filter)
             .await
             .unwrap_or_default();
         for container in containers {
@@ -624,11 +610,7 @@ impl DockerExecutor {
                 }
             }
         }
-        let networks = self
-            .docker
-            .list_networks(Some(ListNetworksOptions { filters: filter }))
-            .await
-            .unwrap_or_default();
+        let networks = self.docker.list_networks(&filter).await.unwrap_or_default();
         for network in networks {
             if let Some(name) = network.name {
                 if self.docker.remove_network(&name).await.is_ok() {
@@ -968,9 +950,8 @@ impl DockerExecutor {
                 .map_err(|e| JobFailure::system(format!("service {}: {:#}", service.name, e)))?;
             // Recorded before starting, so a service that fails to start is removed too
             run.services.push(id.clone());
-            use bollard::container::StartContainerOptions;
             self.docker
-                .start_container(&id, None::<StartContainerOptions<String>>)
+                .start_container(&id)
                 .await
                 .map_err(|e| JobFailure::system(format!("service {}: {}", service_image, e)))?;
         }
@@ -1010,9 +991,8 @@ impl DockerExecutor {
         run.job = Some(id.clone());
         info!("📦 Created container: {}", id);
 
-        use bollard::container::StartContainerOptions;
         self.docker
-            .start_container(&id, None::<StartContainerOptions<String>>)
+            .start_container(&id)
             .await
             .map_err(|e| JobFailure::system(format!("Failed to start container: {}", e)))?;
         Ok(id)
@@ -1045,9 +1025,8 @@ impl DockerExecutor {
         let id = self
             .create_named(&format!("turboci-job-{}-sources", job.id), config)
             .await?;
-        use bollard::container::StartContainerOptions;
         self.docker
-            .start_container(&id, None::<StartContainerOptions<String>>)
+            .start_container(&id)
             .await
             .context("Failed to start helper container")?;
         Ok(id)
@@ -1107,10 +1086,9 @@ impl DockerExecutor {
                 let mut labels = self.labels();
                 labels.insert("turboci.volume".to_string(), volume.clone());
                 self.docker
-                    .create_volume(bollard::models::VolumeCreateOptions {
+                    .create_volume(&docker_api::VolumeCreateOptions {
                         name: Some(name.clone()),
                         labels: Some(labels),
-                        ..Default::default()
                     })
                     .await
                     .with_context(|| format!("Failed to create volume for {}", volume))?;
@@ -1211,7 +1189,7 @@ impl DockerExecutor {
         let credentials = self
             .registry_login(image, job)
             .await
-            .map(|(username, password)| bollard::auth::DockerCredentials {
+            .map(|(username, password)| docker_api::DockerCredentials {
                 username: Some(username),
                 password: Some(password),
                 serveraddress: Some(image::registry(image).to_string()),
@@ -1225,7 +1203,7 @@ impl DockerExecutor {
     async fn pull_shared(
         &self,
         image: &str,
-        credentials: Option<bollard::auth::DockerCredentials>,
+        credentials: Option<docker_api::DockerCredentials>,
     ) -> PullOutcome {
         use futures_util::FutureExt;
 
@@ -1246,11 +1224,10 @@ impl DockerExecutor {
     async fn create_network(&self, name: &str) -> Result<()> {
         let _ = self.docker.remove_network(name).await;
         self.docker
-            .create_network(bollard::models::NetworkCreateRequest {
+            .create_network(&docker_api::NetworkCreateRequest {
                 name: name.to_string(),
                 driver: Some("bridge".to_string()),
                 labels: Some(self.labels()),
-                ..Default::default()
             })
             .await
             .with_context(|| format!("Failed to create network {}", name))?;
@@ -1267,7 +1244,7 @@ impl DockerExecutor {
         values: &std::collections::HashMap<String, String>,
         host_config: HostConfig,
     ) -> Result<String> {
-        use bollard::models::{EndpointSettings, NetworkingConfig};
+        use docker_api::{EndpointConfig, NetworkingConfig};
 
         let aliases = image::service_aliases(image, service.alias.as_deref());
         // Services run on the job's network, reachable there by their aliases
@@ -1277,9 +1254,8 @@ impl DockerExecutor {
             .map(|network| NetworkingConfig {
                 endpoints_config: Some(std::collections::HashMap::from([(
                     network,
-                    EndpointSettings {
+                    EndpointConfig {
                         aliases: Some(aliases),
-                        ..Default::default()
                     },
                 )])),
             });
@@ -1311,14 +1287,7 @@ impl DockerExecutor {
     ) -> usize {
         let mut checks = Vec::new();
         for id in services {
-            let Ok(info) = self
-                .docker
-                .inspect_container(
-                    id,
-                    None::<bollard::query_parameters::InspectContainerOptions>,
-                )
-                .await
-            else {
+            let Ok(info) = self.docker.inspect_container(id).await else {
                 continue;
             };
             let ports = service_ports(info.config.as_ref());
@@ -1431,8 +1400,6 @@ impl DockerExecutor {
         user: Option<String>,
         limits: Option<&Limits<'_>>,
     ) -> Result<String> {
-        use bollard::container::{LogsOptions, StartContainerOptions, WaitContainerOptions};
-
         within(limits, self.pull_if_missing(&self.config.helper_image)).await?;
         let config = ContainerCreateBody {
             image: Some(self.config.helper_image.clone()),
@@ -1445,12 +1412,8 @@ impl DockerExecutor {
         let id = self.create_named(name, config).await?;
         // The container is removed below however this ends
         let result = within(limits, async {
-            self.docker
-                .start_container(&id, None::<StartContainerOptions<String>>)
-                .await?;
-            let mut wait = self
-                .docker
-                .wait_container(&id, None::<WaitContainerOptions<String>>);
+            self.docker.start_container(&id).await?;
+            let mut wait = self.docker.wait_container(&id);
             tokio::time::timeout(CLEANUP_TIMEOUT, async {
                 while let Some(status) = wait.next().await {
                     status?;
@@ -1459,14 +1422,7 @@ impl DockerExecutor {
             })
             .await
             .context("service check timed out")??;
-            let mut logs = self.docker.logs(
-                &id,
-                Some(LogsOptions::<String> {
-                    stdout: true,
-                    stderr: !stdout_only,
-                    ..Default::default()
-                }),
-            );
+            let mut logs = self.docker.logs(&id, true, !stdout_only);
             let mut output = String::new();
             while let Some(chunk) = logs.next().await {
                 output.push_str(&chunk?.to_string());
@@ -1480,41 +1436,21 @@ impl DockerExecutor {
 
     /// Create a container under a fixed name, replacing a leftover one
     async fn create_named(&self, name: &str, mut config: ContainerCreateBody) -> Result<String> {
-        use bollard::container::{CreateContainerOptions, RemoveContainerOptions};
-
         config
             .labels
             .get_or_insert_with(Default::default)
             .extend(self.labels());
-        let create = |config| {
-            self.docker.create_container(
-                Some(CreateContainerOptions {
-                    name: name.to_string(),
-                    ..Default::default()
-                }),
-                config,
-            )
-        };
 
         // Usually the name is free; 409 Conflict when a container has it
-        match create(config.clone()).await {
+        match self.docker.create_container(name, &config).await {
             Ok(response) => return Ok(response.id),
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 409, ..
-            }) => {}
+            Err(e) if e.status_code() == Some(409) => {}
             Err(e) => return Err(e).context("Failed to create container"),
         }
 
         // A container with this name from another runner on the same Docker host
         // (same job id, different GitLab) must not be killed
-        if let Ok(existing) = self
-            .docker
-            .inspect_container(
-                name,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await
-        {
+        if let Ok(existing) = self.docker.inspect_container(name).await {
             let owner = existing
                 .config
                 .and_then(|config| config.labels)
@@ -1524,18 +1460,12 @@ impl DockerExecutor {
             }
         }
 
-        let _ = self
+        let _ = self.docker.remove_container(name, true, true).await;
+        let response = self
             .docker
-            .remove_container(
-                name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        let response = create(config).await.context("Failed to create container")?;
+            .create_container(name, &config)
+            .await
+            .context("Failed to create container")?;
         Ok(response.id)
     }
 
@@ -1593,7 +1523,6 @@ impl DockerExecutor {
     async fn reset_ownership(&self, job_id: u64, job_dir: &Path) -> Result<()> {
         #[cfg(unix)]
         {
-            use bollard::container::{StartContainerOptions, WaitContainerOptions};
             use std::os::unix::fs::MetadataExt;
 
             let meta = tokio::fs::metadata(job_dir).await?;
@@ -1622,12 +1551,8 @@ impl DockerExecutor {
                 .create_named(&format!("turboci-job-{}-cleanup", job_id), config)
                 .await?;
             let result = async {
-                self.docker
-                    .start_container(&id, None::<StartContainerOptions<String>>)
-                    .await?;
-                let mut wait = self
-                    .docker
-                    .wait_container(&id, None::<WaitContainerOptions<String>>);
+                self.docker.start_container(&id).await?;
+                let mut wait = self.docker.wait_container(&id);
                 tokio::time::timeout(CLEANUP_TIMEOUT, async {
                     while let Some(status) = wait.next().await {
                         status?;
@@ -1672,23 +1597,9 @@ fn owned_by_others(dir: &Path, uid: u32, gid: u32) -> bool {
 /// Kill and remove a container with its anonymous volumes; one that is
 /// already gone counts as removed
 async fn force_remove(docker: &Docker, id: &str) -> Result<()> {
-    use bollard::container::RemoveContainerOptions;
-
-    match docker
-        .remove_container(
-            id,
-            Some(RemoveContainerOptions {
-                force: true,
-                v: true,
-                ..Default::default()
-            }),
-        )
-        .await
-    {
-        Ok(())
-        | Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => Ok(()),
+    match docker.remove_container(id, true, true).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.status_code() == Some(404) => Ok(()),
         Err(e) => Err(e.into()),
     }
 }
@@ -1727,7 +1638,7 @@ impl DockerRunner<'_> {
             .docker
             .create_exec(
                 self.container_id,
-                CreateExecOptions {
+                &ExecConfig {
                     cmd: Some(cmd.to_vec()),
                     user: Some("0"),
                     attach_stdout: Some(true),
@@ -1736,11 +1647,8 @@ impl DockerRunner<'_> {
                 },
             )
             .await?;
-        if let StartExecResults::Attached { mut output, .. } =
-            self.docker.start_exec(&exec.id, None).await?
-        {
-            while output.next().await.is_some() {}
-        }
+        let mut output = self.docker.start_exec(&exec.id).await?;
+        while output.next().await.is_some() {}
         let inspect = self.docker.inspect_exec(&exec.id).await?;
         Ok(inspect.exit_code.unwrap_or(-1))
     }
@@ -1766,7 +1674,7 @@ impl ScriptRunner for DockerRunner<'_> {
             .docker
             .create_exec(
                 self.container_id,
-                CreateExecOptions {
+                &ExecConfig {
                     cmd: Some(vec!["sh", "-c", SHELL_DETECT, "sh", script]),
                     env: Some(self.env.iter().map(String::as_str).collect()),
                     working_dir: Some(workdir),
@@ -1780,47 +1688,44 @@ impl ScriptRunner for DockerRunner<'_> {
 
         let mut stdout = Utf8Decoder::default();
         let mut stderr = Utf8Decoder::default();
-        if let StartExecResults::Attached { mut output, .. } =
-            self.docker.start_exec(&exec.id, None).await?
-        {
-            // Created once, not for every chunk of output
-            let deadline = tokio::time::sleep_until(limits.deadline);
-            let cancel = limits.cancel.reached(limits.stop_at);
-            tokio::pin!(deadline, cancel);
-            let mut flush = FlushTimer::default();
-            loop {
-                let next = tokio::select! {
-                    next = output.next() => next,
-                    _ = &mut deadline => {
-                        self.stop_scripts().await;
-                        return Ok(RunStatus::TimedOut);
-                    }
-                    _ = &mut cancel => {
-                        self.stop_scripts().await;
-                        return Ok(RunStatus::Canceled);
-                    }
-                    // A quiet script must not keep its last lines from GitLab
-                    _ = flush.wait(trace.next_flush_at()) => {
-                        trace.flush().await;
-                        continue;
-                    }
-                };
-                let Some(chunk) = next else { break };
-                let chunk = chunk?;
-                if trace.is_truncated() {
-                    // Past the log limit the output is dropped: drain it, skip decoding
-                    trace.flush_if_due().await;
+        let mut output = self.docker.start_exec(&exec.id).await?;
+        // Created once, not for every chunk of output
+        let deadline = tokio::time::sleep_until(limits.deadline);
+        let cancel = limits.cancel.reached(limits.stop_at);
+        tokio::pin!(deadline, cancel);
+        let mut flush = FlushTimer::default();
+        loop {
+            let next = tokio::select! {
+                next = output.next() => next,
+                _ = &mut deadline => {
+                    self.stop_scripts().await;
+                    return Ok(RunStatus::TimedOut);
+                }
+                _ = &mut cancel => {
+                    self.stop_scripts().await;
+                    return Ok(RunStatus::Canceled);
+                }
+                // A quiet script must not keep its last lines from GitLab
+                _ = flush.wait(trace.next_flush_at()) => {
+                    trace.flush().await;
                     continue;
                 }
-                let text = match chunk {
-                    LogOutput::StdErr { message } => stderr.decode(&message),
-                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                        stdout.decode(&message)
-                    }
-                    LogOutput::StdIn { .. } => continue,
-                };
-                trace.write(&text).await;
+            };
+            let Some(chunk) = next else { break };
+            let chunk = chunk?;
+            if trace.is_truncated() {
+                // Past the log limit the output is dropped: drain it, skip decoding
+                trace.flush_if_due().await;
+                continue;
             }
+            let text = match chunk {
+                LogOutput::StdErr { message } => stderr.decode(&message),
+                LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                    stdout.decode(&message)
+                }
+                LogOutput::StdIn { .. } => continue,
+            };
+            trace.write(&text).await;
         }
         trace.write(&stdout.finish()).await;
         trace.write(&stderr.finish()).await;
@@ -1892,10 +1797,7 @@ mod tests {
         // ...the container is gone...
         let docker = Docker::connect_with_local_defaults().unwrap();
         assert!(docker
-            .inspect_container(
-                &format!("turboci-job-{}", job_id),
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
+            .inspect_container(&format!("turboci-job-{}", job_id))
             .await
             .is_err());
         // ...and the runner's user can delete the workspace
@@ -1970,13 +1872,7 @@ mod tests {
             .await
             .unwrap();
 
-        let info = executor
-            .docker
-            .inspect_container(
-                &id,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await;
+        let info = executor.docker.inspect_container(&id).await;
         executor.force_remove(&id).await.unwrap();
 
         let shares = info
@@ -2033,19 +1929,10 @@ mod tests {
             format!("turboci-job-{}", job_id),
             format!("turboci-job-{}-svc-0", job_id),
         ] {
-            assert!(docker
-                .inspect_container(
-                    &name,
-                    None::<bollard::query_parameters::InspectContainerOptions>
-                )
-                .await
-                .is_err());
+            assert!(docker.inspect_container(&name).await.is_err());
         }
         assert!(docker
-            .inspect_network(
-                &format!("turboci-job-{}", job_id),
-                None::<bollard::query_parameters::InspectNetworkOptions>
-            )
+            .inspect_network(&format!("turboci-job-{}", job_id))
             .await
             .is_err());
         executor.cleanup(&j, false).await;
@@ -2111,25 +1998,17 @@ mod tests {
         // The volume is labelled with the runner, so it can be found and removed
         let docker = Docker::connect_with_local_defaults().unwrap();
         let volumes = docker
-            .list_volumes(Some(bollard::volume::ListVolumesOptions {
-                filters: std::collections::HashMap::from([(
-                    "label".to_string(),
-                    vec![format!("{}={}", OWNER_LABEL, owner)],
-                )]),
-            }))
+            .list_volumes(&std::collections::HashMap::from([(
+                "label".to_string(),
+                vec![format!("{}={}", OWNER_LABEL, owner)],
+            )]))
             .await
             .unwrap()
             .volumes
             .unwrap_or_default();
         assert_eq!(volumes.len(), 1, "{:?}", volumes);
         for volume in volumes {
-            docker
-                .remove_volume(
-                    &volume.name,
-                    None::<bollard::query_parameters::RemoveVolumeOptions>,
-                )
-                .await
-                .unwrap();
+            docker.remove_volume(&volume.name).await.unwrap();
         }
     }
 
@@ -2205,10 +2084,7 @@ mod tests {
         assert!(log.contains("no-git-in-job-image"), "{}", log);
         let docker = Docker::connect_with_local_defaults().unwrap();
         assert!(docker
-            .inspect_container(
-                &format!("turboci-job-{}-sources", job_id),
-                None::<bollard::query_parameters::InspectContainerOptions>
-            )
+            .inspect_container(&format!("turboci-job-{}-sources", job_id))
             .await
             .is_err());
         executor.cleanup(&j, false).await;
@@ -2571,25 +2447,10 @@ mod tests {
         mine.sweep_orphans().await;
 
         let docker = Docker::connect_with_local_defaults().unwrap();
-        let gone = docker
-            .inspect_container(
-                &leftover,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await
-            .is_err();
-        let kept = docker
-            .inspect_container(
-                &foreign,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await
-            .is_ok();
+        let gone = docker.inspect_container(&leftover).await.is_err();
+        let kept = docker.inspect_container(&foreign).await.is_ok();
         let net_gone = docker
-            .inspect_network(
-                &format!("{}-net", owner),
-                None::<bollard::query_parameters::InspectNetworkOptions>,
-            )
+            .inspect_network(&format!("{}-net", owner))
             .await
             .is_err();
         let _ = other.force_remove(&foreign).await;
@@ -2603,14 +2464,7 @@ mod tests {
     async fn docker_concurrent_pulls_of_one_image_share_the_pull_and_its_error() {
         let executor = DockerExecutor::new(DockerConfig::default()).unwrap();
         let image = "busybox:1.36";
-        let _ = executor
-            .docker
-            .remove_image(
-                image,
-                None::<bollard::query_parameters::RemoveImageOptions>,
-                None,
-            )
-            .await;
+        let _ = executor.docker.remove_image(image).await;
 
         let (a, b) = tokio::join!(
             executor.pull_shared(image, None),
@@ -2665,14 +2519,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                executor
-                    .docker
-                    .start_container(
-                        &id,
-                        None::<bollard::container::StartContainerOptions<String>>,
-                    )
-                    .await
-                    .unwrap();
+                executor.docker.start_container(&id).await.unwrap();
                 id
             }
         };
@@ -2739,14 +2586,13 @@ mod tests {
     async fn leftovers(job_id: u64) -> Vec<String> {
         let docker = Docker::connect_with_local_defaults().unwrap();
         docker
-            .list_containers(Some(bollard::container::ListContainersOptions::<String> {
-                all: true,
-                filters: std::collections::HashMap::from([(
+            .list_containers(
+                true,
+                &std::collections::HashMap::from([(
                     "name".to_string(),
                     vec![format!("turboci-job-{}", job_id)],
                 )]),
-                ..Default::default()
-            }))
+            )
             .await
             .unwrap()
             .into_iter()
@@ -3353,9 +3199,7 @@ mod tests {
 
     /// An executor whose Docker client is never used: it points nowhere
     fn offline(config: DockerConfig) -> DockerExecutor {
-        let docker =
-            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
-                .unwrap();
+        let docker = Docker::with_socket("/nonexistent/turboci-test/docker.sock");
         DockerExecutor {
             docker: Arc::new(docker),
             config,
@@ -3502,7 +3346,7 @@ mod tests {
 
     #[test]
     fn login_identities_differ_by_login_and_hide_the_secret() {
-        let login = |user: &str, password: &str| bollard::auth::DockerCredentials {
+        let login = |user: &str, password: &str| docker_api::DockerCredentials {
             username: Some(user.to_string()),
             password: Some(password.to_string()),
             serveraddress: Some("registry.corp".to_string()),
@@ -3647,17 +3491,15 @@ mod tests {
         );
         assert!(!bridge_is_local(std::net::IpAddr::from([192, 0, 2, 1])));
 
-        let inspected = |gateway: &str| bollard::models::ContainerInspectResponse {
-            network_settings: Some(bollard::models::NetworkSettings {
+        let inspected = |gateway: &str| docker_api::ContainerInspectResponse {
+            network_settings: Some(docker_api::NetworkSettings {
                 networks: Some(std::collections::HashMap::from([(
                     "turboci-job-1".to_string(),
-                    bollard::models::EndpointSettings {
+                    docker_api::EndpointSettings {
                         gateway: Some(gateway.to_string()),
                         ip_address: Some("127.0.0.2".to_string()),
-                        ..Default::default()
                     },
                 )])),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3692,12 +3534,12 @@ mod tests {
 
     #[test]
     fn service_ports_follow_gitlab_runner() {
-        let config = |env: Vec<&str>, ports: &[&str]| bollard::models::ContainerConfig {
+        let config = |env: Vec<&str>, ports: &[&str]| docker_api::ContainerConfig {
             env: Some(env.into_iter().map(str::to_string).collect()),
             exposed_ports: Some(
                 ports
                     .iter()
-                    .map(|p| (p.to_string(), std::collections::HashMap::new()))
+                    .map(|p| (p.to_string(), serde::de::IgnoredAny))
                     .collect(),
             ),
             ..Default::default()
@@ -3725,8 +3567,8 @@ mod tests {
     fn warns_when_dockerd_has_no_proxy() {
         let config = DockerConfig::default();
         let certs = std::path::Path::new("/nonexistent");
-        let bare = bollard::models::SystemInfo::default();
-        let with_proxy = bollard::models::SystemInfo {
+        let bare = docker_api::SystemInfo::default();
+        let with_proxy = docker_api::SystemInfo {
             https_proxy: Some("http://proxy.corp:3128".to_string()),
             ..Default::default()
         };
@@ -3739,9 +3581,9 @@ mod tests {
     }
 
     /// dockerd's registry settings with these insecure CIDRs and no index configs
-    fn with_insecure_cidrs(cidrs: &[&str]) -> bollard::models::SystemInfo {
-        bollard::models::SystemInfo {
-            registry_config: Some(bollard::models::RegistryServiceConfig {
+    fn with_insecure_cidrs(cidrs: &[&str]) -> docker_api::SystemInfo {
+        docker_api::SystemInfo {
+            registry_config: Some(docker_api::RegistryServiceConfig {
                 insecure_registry_cidrs: Some(cidrs.iter().map(|c| c.to_string()).collect()),
                 ..Default::default()
             }),
@@ -3775,7 +3617,7 @@ mod tests {
 
     #[test]
     fn registry_names_are_not_resolved_when_listed_or_without_cidrs() {
-        use bollard::models::IndexInfo;
+        use docker_api::IndexInfo;
 
         let never = |host: &str| -> Vec<std::net::IpAddr> { panic!("{host} was resolved") };
         let certs = Path::new("/nonexistent");
@@ -3789,7 +3631,6 @@ mod tests {
                 "listed.corp:5000".to_string(),
                 IndexInfo {
                     secure: Some(false),
-                    ..Default::default()
                 },
             )]));
         assert!(daemon_warnings(&info, &listed, false, certs, &never).is_empty());
@@ -3833,7 +3674,7 @@ mod tests {
 
     #[test]
     fn warns_about_registries_dockerd_does_not_trust() {
-        use bollard::models::{IndexInfo, RegistryServiceConfig, SystemInfo};
+        use docker_api::{IndexInfo, RegistryServiceConfig, SystemInfo};
 
         let certs = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(certs.path().join("harbor.ok")).unwrap();
@@ -3856,12 +3697,9 @@ mod tests {
                 index_configs: Some(std::collections::HashMap::from([(
                     "insecure.ok".to_string(),
                     IndexInfo {
-                        name: Some("insecure.ok".to_string()),
                         secure: Some(false),
-                        ..Default::default()
                     },
                 )])),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3892,6 +3730,6 @@ mod tests {
             Some("/etc/turboci-registry-ca/harbor.corp:8443.pem")
         );
         assert_eq!(mounts[0].read_only, Some(true));
-        assert_eq!(mounts[0].typ, Some(bollard::models::MountTypeEnum::BIND));
+        assert_eq!(mounts[0].typ, Some(docker_api::MountType::Bind));
     }
 }

@@ -53,7 +53,7 @@ enum Commands {
 }
 
 /// Log filter when RUST_LOG is unset: TurboCI's own info lines, only
-/// warnings and errors from libraries (hyper, bollard, rustls)
+/// warnings and errors from libraries (hyper, rustls)
 const DEFAULT_LOG_FILTER: &str = "warn,turboci=info";
 
 /// Blocking pool cap: archive building and extraction, file I/O and DNS

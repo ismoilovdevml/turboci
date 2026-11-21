@@ -29,7 +29,6 @@ aho-corasick = "1.1.5"
 # runtime_detection lets zlib-rs pick SSE/AVX2 code paths on x86_64.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
-bollard = "0.19"
 # Docker Engine API client (runner_daemon::docker_api) over dockerd's unix socket
 hyper = { version = "1.12", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
