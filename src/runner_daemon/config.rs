@@ -58,6 +58,11 @@ pub struct RunnerConfig {
     /// least recently used are deleted beyond it (unset or "0" = no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_max_size: Option<String>,
+    /// Restore the ZIP archives versions up to 0.10 saved (`<key>.zip`),
+    /// locally and from S3, for keys without a tar.zst archive. Each cache
+    /// miss then costs a second S3 request; set false once every runner
+    /// sharing the cache runs 0.11.0 or later.
+    pub cache_legacy_zip: bool,
     /// Where the runner keeps state it must write, like a rotated runner token
     pub state_dir: String,
 
@@ -956,6 +961,7 @@ impl Default for RunnerConfig {
             cache_dir: default_cache_dir(),
             cache_max_age_days: 14,
             cache_max_size: None,
+            cache_legacy_zip: true,
             state_dir: "/var/lib/turboci".to_string(),
             environment: Vec::new(),
             pre_get_sources_script: None,
@@ -1873,6 +1879,18 @@ mod tests {
             "1.dkr.ecr.eu-west-1.amazonaws.com"
         ));
         assert!(!glob_matches(&patterns(&["[bad"]), "[bad"));
+    }
+
+    #[test]
+    fn legacy_zip_caches_are_read_unless_turned_off() {
+        let parse = |line: &str| RunnerConfig::parse(&format!("runner_token = \"t\"\n{}", line));
+
+        assert!(parse("").unwrap().cache_legacy_zip);
+        let off = parse("cache_legacy_zip = false").unwrap();
+        assert!(!off.cache_legacy_zip);
+        assert!(off.validate().is_ok());
+        assert!(unknown_keys("cache_legacy_zip = false", &off).is_empty());
+        assert!(parse("cache_legacy_zip = \"no\"").is_err());
     }
 
     #[test]

@@ -7,9 +7,10 @@
 //! the same content is not uploaded again.
 //!
 //! Versions up to 0.10 wrote ZIPs, as `<encoded key>.zip`. They are still
-//! restored, locally and from S3, when a key has no tar.zst archive; the new
-//! format has its own name so that older runners sharing the bucket never
-//! read an archive they cannot extract.
+//! restored, locally and from S3, when a key has no tar.zst archive (unless
+//! `cache_legacy_zip = false`); the new format has its own name so that
+//! older runners sharing the bucket never read an archive they cannot
+//! extract.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -149,6 +150,9 @@ pub struct LocalCache {
     max_size: Option<u64>,
     /// S3 storage shared with other runners; the local directory is the first layer
     remote: Option<super::s3::Bucket>,
+    /// Whether the ZIPs of versions up to 0.10 are looked for, locally and
+    /// in S3, when a key has no tar.zst archive (`cache_legacy_zip`)
+    legacy_zip: bool,
 }
 
 /// Where a restored archive came from
@@ -385,7 +389,15 @@ impl LocalCache {
             max_age: None,
             max_size: None,
             remote: None,
+            legacy_zip: true,
         }
+    }
+
+    /// Look for the ZIPs of versions up to 0.10 (`true`, the default), or
+    /// only ever read and request tar.zst archives
+    pub fn with_legacy_zip(mut self, legacy_zip: bool) -> Self {
+        self.legacy_zip = legacy_zip;
+        self
     }
 
     /// Share archives with other runners through S3
@@ -487,13 +499,14 @@ impl LocalCache {
     }
 
     /// The local archive of `key`: of the two formats, the one written or
-    /// used last
+    /// used last (only the tar.zst archive without `legacy_zip`)
     async fn local_archive(&self, project_id: u64, key: &str) -> Result<Option<PathBuf>> {
         let mut found: Option<(std::time::SystemTime, PathBuf)> = None;
-        for path in [
-            self.archive_path(project_id, key),
-            self.legacy_path(project_id, key),
-        ] {
+        let mut paths = vec![self.archive_path(project_id, key)];
+        if self.legacy_zip {
+            paths.push(self.legacy_path(project_id, key));
+        }
+        for path in paths {
             match tokio::fs::metadata(&path).await {
                 Ok(meta) => {
                     let used = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -567,7 +580,8 @@ impl LocalCache {
     }
 
     /// Bring the local archive of `key` up to date with S3: the archive
-    /// (format 2), or else the ZIP an older version uploaded. A changed
+    /// (format 2), or else (with `legacy_zip`) the ZIP an older version
+    /// uploaded. A changed
     /// archive is extracted while it downloads. The inner error is an S3
     /// problem, after which the local copy is used; the outer one is an
     /// extraction that failed or was stopped.
@@ -596,6 +610,7 @@ impl LocalCache {
                     .download_and_extract(object, (&path, &legacy), workspace, stop)
                     .await
             }
+            Ok(Get::NotFound) if !self.legacy_zip => return Ok(Ok(Fetched::Missing)),
             Ok(Get::NotFound) => {}
             Err(e) => return Ok(Err(e)),
         }
@@ -1441,6 +1456,59 @@ mod tests {
                 "/ci/project-5/main.zip"
             ]
         );
+    }
+
+    /// With `cache_legacy_zip = false` a miss costs one request: no ZIP is
+    /// asked for in S3 or read from the local cache
+    #[tokio::test]
+    async fn legacy_zips_are_ignored_once_turned_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/main.tar.zst"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/main.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(legacy_archive("s3").await))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path())
+            .with_remote(remote(&server))
+            .with_legacy_zip(false);
+        let local_zip = cache.legacy_path(5, "main");
+        std::fs::create_dir_all(local_zip.parent().unwrap()).unwrap();
+        std::fs::write(&local_zip, legacy_archive("local").await).unwrap();
+        let job = tempdir().unwrap();
+
+        let restored = cache
+            .restore(
+                5,
+                &["main".to_string()],
+                job.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(restored.hit.is_none(), "{:?}", restored);
+        assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+        assert!(!job.path().join("vendor").exists());
+        // Without S3 too
+        let local_only = LocalCache::new(root.path()).with_legacy_zip(false);
+        let restored = local_only
+            .restore(
+                5,
+                &["main".to_string()],
+                job.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+        assert!(restored.hit.is_none(), "{:?}", restored);
     }
 
     /// A download is extracted as it arrives; one that breaks off midway is

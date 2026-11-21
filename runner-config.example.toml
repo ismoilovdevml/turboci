@@ -66,6 +66,10 @@ cache_max_age_days = 14
 # beyond it the least recently used archives are deleted, whatever their
 # project. Unset or "0": no limit (only cache_max_age_days applies)
 # cache_max_size = "50g"
+# Restore the ZIP caches of versions up to 0.10 for keys without a .tar.zst
+# archive (costs a second S3 request per miss). Set false once every runner
+# sharing the cache runs 0.11.0 or later
+# cache_legacy_zip = true
 # Share the cache between runner hosts through S3-compatible storage
 # (MinIO, AWS S3, Ceph, R2, ...); cache_dir stays the local first layer.
 # Expire old archives and incomplete multipart uploads with a bucket

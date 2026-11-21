@@ -441,6 +441,7 @@ fn local_cache(config: &config::RunnerConfig) -> job_cache::LocalCache {
         .with_max_age_days(config.cache_max_age_days)
         // Checked by `RunnerConfig::validate` when it was loaded
         .with_max_size(config.cache_max_size_bytes().unwrap_or(None))
+        .with_legacy_zip(config.cache_legacy_zip)
 }
 
 /// A runner. Clones share its state; `config`, `executor` and `cache` are the

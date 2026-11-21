@@ -203,6 +203,7 @@ writes the runner's side with `--proxy URL --no-proxy LIST`.
 | `cache_dir` | `/var/lib/turboci/cache` | Local cache, one directory per project |
 | `cache_max_age_days` | `14` | Archives not used for this many days are deleted (`0` keeps them forever) |
 | `cache_max_size` | unset | Total size of the archives of all projects, of both formats (`"512m"`, `"50g"`, bytes); after each save or download the least recently used archives are deleted until the cache fits, whatever their project. The archive just written is kept even if it is larger on its own. Unset or `"0"`: no limit |
+| `cache_legacy_zip` | `true` | Restore the ZIPs of versions up to 0.10 (`<key>.zip`), from the local cache and from S3, for keys without a `.tar.zst` archive. Each cache miss then costs a second S3 request (`.tar.zst`, then `.zip`). Set `false` once every runner that shares the cache runs 0.11.0 or later |
 
 Without `cache_s3` the cache is local to the runner host, like gitlab-runner
 without a distributed cache. Archives are written to a temporary file and
@@ -226,7 +227,10 @@ archive they cannot read: they keep reading and writing the ZIPs, and newer
 runners read those until they save the key themselves. While both run, a
 cache saved by a newer runner is not seen by older ones, and once a newer
 runner saved a key, a ZIP an older runner saves later is not seen by newer
-ones; upgrade every runner that shares an S3 cache to end that.
+ones; upgrade every runner that shares an S3 cache to end that. Once all
+run 0.11.0 or later, set `cache_legacy_zip = false`: a miss then asks S3
+for the `.tar.zst` archive only, and ZIPs are no longer read (keys that
+only have one start empty and are saved in the new format).
 
 ### Shared cache in S3
 
