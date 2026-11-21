@@ -219,6 +219,24 @@ archive is 17.1 MB, saved in 0.37 s and extracted in 0.62 s, against
 20.6 MB, 0.46 s and 0.70 s for the zstd ZIPs of versions up to 0.10. zstd
 level 3 was both larger (17.9 MB) and slower there, so level 1 is used.
 
+A `pull-push` cache the job leaves unchanged is not archived again. Right
+after restoring the job's own key (not a fallback key), the runner records
+the state of the files the cache's `paths` match: their paths and, for
+each file and symlink, size, mode, mtime and ctime to the nanosecond,
+inode and symlink target (no content is read). When it saves the key and
+that state is the same, the job log shows `Cache main unchanged since
+restore: not saved`, and neither the archive is written nor S3 asked.
+Writing to a file or replacing it always changes its ctime or inode, which
+no tool can set back, so a change that keeps size and mtime (npm extracts
+every package file with the same fixed mtime; `cp -p`, `rsync -t` and
+`tar -x` restore mtimes) is still seen; the runner waits 20 ms after the
+restore so that no write lands in the clock tick the state was taken in.
+The cache is saved as usual when the paths match files the archive did not
+hold (checked-in files, another cache under the same paths), when the
+local copy was used because S3 failed or lacked the key, for `untracked`
+caches, for a ZIP of version 0.10, and on file systems with whole-second
+timestamps.
+
 Versions up to 0.10 saved ZIPs, `<key>.zip`. They still restore, from the
 local cache and from S3, when a key has no `.tar.zst` archive; the next save
 writes the new format and deletes the local ZIP. The new format has its own

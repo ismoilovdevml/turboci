@@ -51,6 +51,148 @@ pub enum CacheFormat {
     TarZst,
 }
 
+/// The kinds of entries a cache archive holds
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Dir = 0,
+    File = 1,
+    Symlink = 2,
+}
+
+/// A workspace-relative path without `.` components or trailing slashes,
+/// as tar entries are extracted and as cached paths are found
+fn normalized(rel: &Path) -> PathBuf {
+    rel.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Feed a path, length first, so that no two sequences of fields hash alike
+fn hash_path(hasher: &mut blake3::Hasher, path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// The set of entries of a cache (workspace-relative paths and their kinds),
+/// as a hash: what an extraction wrote, or what the cache's paths match in
+/// the workspace. Equal sets mean the workspace holds no cached file the
+/// archive did not write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntrySet(blake3::Hash);
+
+impl EntrySet {
+    fn of<'a>(entries: impl Iterator<Item = (&'a PathBuf, &'a EntryKind)>) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        for (path, kind) in entries {
+            hasher.update(&[*kind as u8]);
+            hash_path(&mut hasher, path);
+        }
+        Self(hasher.finalize())
+    }
+}
+
+/// The state of a cache's files in the workspace: which there are
+/// (`entries`), and a hash of their metadata (`files`): kind, mode, and for
+/// files and symlinks size, mtime, ctime (to the nanosecond), inode and
+/// device, and a symlink's target. Content is not read.
+///
+/// Writing to a file, or replacing it, changes its ctime (which no system
+/// call sets back) or its inode, so a content change changes the state,
+/// unless it happens within the same tick of the file system's clock as the
+/// state was taken: see `LocalCache`, which lets that tick pass after a
+/// restore. mtime and size alone would miss changes that keep both, which
+/// tools that preserve timestamps make (npm extracts every package file with
+/// the same fixed mtime, `cp -p`, `rsync -t`, `tar -x`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheState {
+    pub entries: EntrySet,
+    files: blake3::Hash,
+}
+
+/// The state of the files `patterns` match in `workspace_path`, the ones a
+/// cache archive of them would hold, off the async runtime. `None` when the
+/// file system keeps whole seconds only (no file has a ctime with
+/// nanoseconds): a change within the same second would go unseen.
+pub async fn cache_state(workspace_path: &str, patterns: &[String]) -> Result<Option<CacheState>> {
+    let workspace = workspace_path.to_string();
+    let patterns = patterns.to_vec();
+    tokio::task::spawn_blocking(move || scan_cache_state(&workspace, &patterns))
+        .await
+        .context("Scanning task panicked")?
+}
+
+fn scan_cache_state(workspace_path: &str, patterns: &[String]) -> Result<Option<CacheState>> {
+    use std::collections::BTreeMap;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let root = Path::new(workspace_path);
+    let mut found: BTreeMap<PathBuf, (EntryKind, std::fs::Metadata, PathBuf)> = BTreeMap::new();
+    for path in collect_paths(workspace_path, patterns, &[], true)? {
+        let rel = normalized(path.strip_prefix(root).unwrap_or(&path));
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let kind = if meta.file_type().is_symlink() {
+            EntryKind::Symlink
+        } else if meta.is_dir() {
+            EntryKind::Dir
+        } else if meta.is_file() {
+            EntryKind::File
+        } else {
+            // Sockets, FIFOs and devices are not archived
+            continue;
+        };
+        found.insert(rel, (kind, meta, path));
+    }
+
+    let mut files = blake3::Hasher::new();
+    let (mut timed, mut fine) = (false, false);
+    for (rel, (kind, meta, path)) in &found {
+        files.update(&[*kind as u8]);
+        hash_path(&mut files, rel);
+        files.update(&meta.mode().to_le_bytes());
+        if *kind == EntryKind::Dir {
+            // Its entries are in the set; its times change with them
+            continue;
+        }
+        for value in [
+            meta.size(),
+            meta.mtime() as u64,
+            meta.mtime_nsec() as u64,
+            meta.ctime() as u64,
+            meta.ctime_nsec() as u64,
+            meta.ino(),
+            meta.dev(),
+        ] {
+            files.update(&value.to_le_bytes());
+        }
+        timed = true;
+        fine |= meta.ctime_nsec() != 0;
+        if *kind == EntryKind::Symlink {
+            let target = std::fs::read_link(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let target = target.as_os_str().as_bytes();
+            files.update(&(target.len() as u64).to_le_bytes());
+            files.update(target);
+        }
+    }
+    if timed && !fine {
+        return Ok(None);
+    }
+    Ok(Some(CacheState {
+        entries: EntrySet::of(found.iter().map(|(rel, (kind, _, _))| (rel, kind))),
+        files: files.finalize(),
+    }))
+}
+
 /// The format of an archive, from its first bytes
 pub fn cache_format(head: &[u8]) -> Option<CacheFormat> {
     if head.starts_with(&ZSTD_MAGIC) {
@@ -114,8 +256,13 @@ pub async fn extract_archive_file(path: &Path, workspace_path: &str, stop: &Stop
 }
 
 /// Extract an untrusted cache archive of either format (told by its first
-/// bytes) into the workspace, off the async runtime, until `stop`
-pub async fn extract_cache_file(path: &Path, workspace_path: &str, stop: &Stop) -> Result<()> {
+/// bytes) into the workspace, off the async runtime, until `stop`. Returns
+/// the entries a tar.zst archive wrote (`None` for a ZIP).
+pub async fn extract_cache_file(
+    path: &Path,
+    workspace_path: &str,
+    stop: &Stop,
+) -> Result<Option<EntrySet>> {
     let path = path.to_path_buf();
     let workspace = workspace_path.to_string();
     let stop = stop.clone();
@@ -133,13 +280,15 @@ pub async fn extract_cache_file(path: &Path, workspace_path: &str, stop: &Stop) 
                 &workspace,
                 ExtractLimits::default(),
                 &stop,
-            ),
+            )
+            .map(Some),
             Some(CacheFormat::Zip) => extract_zip_reader(
                 SeekBufReader::new(file)?,
                 &workspace,
                 ExtractLimits::default(),
                 &stop,
-            ),
+            )
+            .map(|()| None),
             None => anyhow::bail!("{} is not a cache archive", path.display()),
         }
     })
@@ -373,17 +522,18 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
 /// Extract an untrusted tar.zst cache archive read from `reader` (a file,
 /// or a download as it arrives) into `workspace_path`, until `stop`. The
 /// zstd stream is read to its end, which checks its checksum: a truncated
-/// or corrupted archive is an error, even after its last entry.
+/// or corrupted archive is an error, even after its last entry. Returns the
+/// entries written.
 pub fn extract_tar_zst<R: Read>(
     reader: R,
     workspace_path: &str,
     limits: ExtractLimits,
     stop: &Stop,
-) -> Result<()> {
+) -> Result<EntrySet> {
     let mut decoder =
         zstd::stream::read::Decoder::new(reader).context("Failed to read the cache archive")?;
     decoder.window_log_max(CACHE_ZSTD_WINDOW_LOG_MAX)?;
-    extract_tar_reader(&mut decoder, workspace_path, limits, stop)?;
+    let written = extract_tar_reader(&mut decoder, workspace_path, limits, stop)?;
     let rest = std::io::copy(
         &mut StopReader {
             inner: (&mut decoder).take(MAX_TAR_TRAILER + 1),
@@ -395,7 +545,7 @@ pub fn extract_tar_zst<R: Read>(
     if rest > MAX_TAR_TRAILER {
         anyhow::bail!("Unexpected data after the end of the cache archive");
     }
-    Ok(())
+    Ok(written)
 }
 
 /// The workspace-relative path of a tar entry. Absolute names and `..`
@@ -431,12 +581,13 @@ fn tar_entry_path(name: &[u8]) -> Result<PathBuf> {
 /// are dropped, and the entry count and total size are limited. Hard links,
 /// devices, FIFOs and other entry types reject the archive: the runner
 /// never writes them. Directories get the default mode, as with ZIP.
+/// Returns the entries written: of two entries with one path, the later.
 fn extract_tar_reader<R: Read>(
     reader: R,
     workspace_path: &str,
     limits: ExtractLimits,
     stop: &Stop,
-) -> Result<()> {
+) -> Result<EntrySet> {
     use std::os::unix::ffi::OsStrExt;
     use tar::EntryType;
 
@@ -447,6 +598,8 @@ fn extract_tar_reader<R: Read>(
     let mut buf = vec![0u8; IO_BUF];
     let mut total_bytes: u64 = 0;
     let mut count: usize = 0;
+    // At most `limits.max_entries` paths
+    let mut extracted: std::collections::BTreeMap<PathBuf, EntryKind> = Default::default();
     // GNU long names and link targets, for the next entry
     let mut long_name: Option<Vec<u8>> = None;
     let mut long_link: Option<Vec<u8>> = None;
@@ -503,6 +656,7 @@ fn extract_tar_reader<R: Read>(
                     continue;
                 }
                 dirs.open(&root_dir, &rel_path)?;
+                extracted.insert(rel_path, EntryKind::Dir);
             }
             EntryType::Symlink => {
                 let target =
@@ -512,6 +666,7 @@ fn extract_tar_reader<R: Read>(
                 if symlink_stays_inside(&rel_path, target) {
                     let dir = dirs.open(&root_dir, parent)?;
                     safe_fs::create_symlink(&dir, file_name, target)?;
+                    extracted.insert(rel_path, EntryKind::Symlink);
                 } else {
                     warn!(
                         "Skipping symlink {:?} -> {:?}: points outside workspace",
@@ -541,6 +696,7 @@ fn extract_tar_reader<R: Read>(
                 total_bytes += written;
                 // Without setuid/setgid/sticky bits
                 safe_fs::set_mode(&out_file, entry.header().mode()? & 0o777)?;
+                extracted.insert(rel_path, EntryKind::File);
             }
             other => anyhow::bail!(
                 "Unsupported entry {:?} in cache archive ({:?})",
@@ -549,7 +705,7 @@ fn extract_tar_reader<R: Read>(
             ),
         }
     }
-    Ok(())
+    Ok(EntrySet::of(extracted.iter()))
 }
 
 /// Filesystem operations relative to directory handles that never follow a
@@ -1959,7 +2115,7 @@ mod tests {
         workspace_path: &str,
         limits: ExtractLimits,
     ) -> Result<()> {
-        extract_tar_zst(data, workspace_path, limits, &Stop::default())
+        extract_tar_zst(data, workspace_path, limits, &Stop::default()).map(|_| ())
     }
 
     /// An entry of a tar.zst archive, for assertions
@@ -2120,6 +2276,113 @@ mod tests {
         );
         assert!(q("empty/nested").is_dir());
         assert_eq!(std::fs::read_dir(q("empty/nested")).unwrap().count(), 0);
+    }
+
+    /// A tree with a file, a nested file, a symlink and an empty directory
+    fn cache_tree() -> tempfile::TempDir {
+        let ws = tempdir().unwrap();
+        let vendor = ws.path().join("vendor");
+        std::fs::create_dir_all(vendor.join("lib/empty")).unwrap();
+        std::fs::write(vendor.join("a.txt"), b"aaaa").unwrap();
+        std::fs::write(vendor.join("lib/b.txt"), b"bbbb").unwrap();
+        std::os::unix::fs::symlink("a.txt", vendor.join("link")).unwrap();
+        ws
+    }
+
+    async fn state_of(ws: &Path) -> CacheState {
+        cache_state(ws.to_str().unwrap(), &["vendor/".to_string()])
+            .await
+            .unwrap()
+            .expect("timestamps with nanoseconds")
+    }
+
+    /// What an extraction wrote is what the cache's paths then match, for
+    /// the patterns spelled either way
+    #[tokio::test]
+    async fn extracted_entries_are_what_the_paths_match() {
+        let src = cache_tree();
+        let stage = staging();
+        let paths = ["./vendor".to_string()];
+        let archive = create_cache_archive(src.path().to_str().unwrap(), &paths, stage.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let out = tempdir().unwrap();
+
+        let written = extract_cache_file(
+            archive.file.path(),
+            out.path().to_str().unwrap(),
+            &Stop::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(state_of(out.path()).await.entries, written);
+        // One more file under the paths: not what the archive wrote
+        std::fs::write(out.path().join("vendor/other.txt"), b"x").unwrap();
+        assert_ne!(state_of(out.path()).await.entries, written);
+    }
+
+    /// Any change to what an archive of the files would hold changes the
+    /// state; looking twice does not
+    #[tokio::test]
+    async fn the_cache_state_follows_every_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = cache_tree();
+        let vendor = ws.path().join("vendor");
+        let mut seen = vec![state_of(ws.path()).await];
+        assert_eq!(state_of(ws.path()).await, seen[0]);
+        let changes: Vec<Box<dyn Fn() + '_>> = vec![
+            // Same size, mtime set back
+            Box::new(|| {
+                let file = vendor.join("a.txt");
+                let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+                std::fs::write(&file, b"AAAA").unwrap();
+                std::fs::File::options()
+                    .append(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+            }),
+            // Replaced by a file of the same size and mtime
+            Box::new(|| {
+                let file = vendor.join("lib/b.txt");
+                let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+                let new = vendor.join("lib/.b.new");
+                std::fs::write(&new, b"BBBB").unwrap();
+                std::fs::File::options()
+                    .append(true)
+                    .open(&new)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+                std::fs::rename(&new, &file).unwrap();
+            }),
+            Box::new(|| {
+                std::fs::set_permissions(
+                    vendor.join("a.txt"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap()
+            }),
+            Box::new(|| {
+                std::fs::remove_file(vendor.join("link")).unwrap();
+                std::os::unix::fs::symlink("lib/b.txt", vendor.join("link")).unwrap();
+            }),
+            Box::new(|| std::fs::remove_dir(vendor.join("lib/empty")).unwrap()),
+            Box::new(|| std::fs::write(vendor.join("new.txt"), b"").unwrap()),
+            Box::new(|| std::fs::remove_file(vendor.join("a.txt")).unwrap()),
+        ];
+        for (n, change) in changes.iter().enumerate() {
+            // Past the tick of the file system's clock
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            change();
+            let state = state_of(ws.path()).await;
+            assert!(!seen.contains(&state), "change {} not seen", n);
+            seen.push(state);
+        }
     }
 
     #[test]

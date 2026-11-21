@@ -1227,10 +1227,23 @@ impl RunnerDaemon {
                 trace
                     .write(&format!("Restoring cache {}...\n", keys[0]))
                     .await;
+                // A pull-push cache the job leaves unchanged is not archived
+                // again; untracked files are only listed when saving
+                let paths: Vec<String> = cache_entry
+                    .paths
+                    .iter()
+                    .map(|path| script::expand(path, variables))
+                    .collect();
+                let tracking = (cache_entry.policy == "pull-push"
+                    && !cache_entry.untracked.unwrap_or(false))
+                .then_some(job_cache::Tracking {
+                    job_id: job.id,
+                    paths: &paths,
+                });
                 let tries = attempts(job, "RESTORE_CACHE_ATTEMPTS");
                 let mut restored = self
                     .cache
-                    .restore(project_id(job), &keys, &workspace, stop)
+                    .restore_job(project_id(job), &keys, &workspace, tracking, stop)
                     .await;
                 for _ in 1..tries {
                     if restored.is_ok() {
@@ -1238,7 +1251,7 @@ impl RunnerDaemon {
                     }
                     restored = self
                         .cache
-                        .restore(project_id(job), &keys, &workspace, stop)
+                        .restore_job(project_id(job), &keys, &workspace, tracking, stop)
                         .await;
                 }
                 self.metrics.cache_restore(match &restored {
@@ -1549,7 +1562,7 @@ impl RunnerDaemon {
                     trace.write("Cache not saved: job canceled\n").await;
                     return;
                 }
-                saved = self.cache.save(project_id(job), &key, &workspace, &paths) => saved,
+                saved = self.cache.save_job(Some(job.id), project_id(job), &key, &workspace, &paths) => saved,
             };
             if let Ok(Some(saved)) = &saved {
                 match &saved.upload {
@@ -1567,6 +1580,14 @@ impl RunnerDaemon {
                 }
             }
             match saved {
+                Ok(Some(saved)) if saved.unchanged_since_restore => {
+                    trace
+                        .write(&format!(
+                            "Cache {} unchanged since restore: not saved\n",
+                            key
+                        ))
+                        .await
+                }
                 Ok(Some(saved)) => {
                     trace
                         .write(&format!("Created cache {} ({} bytes)\n", key, saved.size))
@@ -2516,6 +2537,51 @@ mod tests {
             trace
         );
         assert!(trace.contains("cached-dep"), "{}", trace);
+    }
+
+    /// A pull-push cache the job did not touch is neither archived nor
+    /// uploaded again; one it changed (same size) is saved
+    #[tokio::test]
+    async fn an_unchanged_pull_push_cache_is_not_saved_again() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        daemon
+            .execute_job(lifecycle_job(
+                41,
+                &["mkdir -p vendor", "echo cached-dep > vendor/lib.txt"],
+                "on_success",
+            ))
+            .await
+            .unwrap();
+
+        daemon
+            .execute_job(lifecycle_job(42, &["cat vendor/lib.txt"], "on_success"))
+            .await
+            .unwrap();
+        let unchanged = trace_of(&server, 42).await;
+        assert!(
+            unchanged.contains("Cache deps unchanged since restore: not saved"),
+            "{}",
+            unchanged
+        );
+        assert!(!unchanged.contains("Created cache"), "{}", unchanged);
+
+        daemon
+            .execute_job(lifecycle_job(
+                43,
+                &["echo changed-dp > vendor/lib.txt"],
+                "on_success",
+            ))
+            .await
+            .unwrap();
+        let changed = trace_of(&server, 43).await;
+        assert!(changed.contains("Created cache deps"), "{}", changed);
+        daemon
+            .execute_job(lifecycle_job(44, &["cat vendor/lib.txt"], "on_success"))
+            .await
+            .unwrap();
+        assert!(trace_of(&server, 44).await.contains("changed-dp"));
     }
 
     #[tokio::test]

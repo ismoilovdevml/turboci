@@ -32,6 +32,17 @@ const STREAM_QUEUE: usize = 32;
 /// Longest wait at shutdown for S3 to abort the uploads of canceled jobs
 const ABORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Longer than a tick of the clock file systems stamp ctime with (the
+/// kernel's coarse clock: 10 ms at most, HZ=100). Waited once after a
+/// tracked restore, so a change the job makes later never gets the ctime
+/// the file had when the restore looked at it.
+const TIMESTAMP_TICK: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Restores remembered for the saves of their jobs (see `Tracking`); the
+/// oldest are forgotten beyond this, as are the restores of jobs that never
+/// save (failed, canceled)
+const MAX_TRACKED: usize = 1024;
+
 /// Whether `path` names a cache archive of either format
 fn is_archive(path: &Path) -> bool {
     path.file_name()
@@ -131,8 +142,9 @@ impl std::io::Read for ChannelReader {
 /// What S3 had for a key
 #[derive(Debug)]
 enum Fetched {
-    /// Downloaded (this many bytes) and extracted on the way
-    Extracted(u64),
+    /// Downloaded (this many bytes) and extracted on the way, writing these
+    /// entries; `None` when the archive could not be kept as the local copy
+    Extracted(u64, Option<artifacts::EntrySet>),
     /// The local archive at this path is current: S3 holds it unchanged,
     /// or it was just downloaded
     Local(PathBuf, Source),
@@ -153,6 +165,29 @@ pub struct LocalCache {
     /// Whether the ZIPs of versions up to 0.10 are looked for, locally and
     /// in S3, when a key has no tar.zst archive (`cache_legacy_zip`)
     legacy_zip: bool,
+    /// The state of the files of caches jobs restored, until they save them
+    restored: std::sync::Arc<std::sync::Mutex<HashMap<TrackedKey, Restored>>>,
+}
+
+/// A job's cache: job, project and key
+type TrackedKey = (u64, u64, String);
+
+/// What a job's restore left in its workspace
+#[derive(Debug)]
+struct Restored {
+    /// The cache's paths, which the state is of
+    paths: Vec<String>,
+    state: artifacts::CacheState,
+    at: std::time::Instant,
+}
+
+/// A `pull-push` cache the job may leave unchanged: its restore records the
+/// state of the files `paths` match, and its save (for the same key) skips
+/// archiving and uploading when that state did not change since
+#[derive(Debug, Clone, Copy)]
+pub struct Tracking<'a> {
+    pub job_id: u64,
+    pub paths: &'a [String],
 }
 
 /// Where a restored archive came from
@@ -199,6 +234,9 @@ pub enum Upload {
 pub struct Saved {
     pub size: u64,
     pub upload: Option<std::result::Result<Upload, String>>,
+    /// The files did not change since the job restored this key's archive:
+    /// nothing was archived or uploaded (`upload` is `Unchanged` with S3)
+    pub unchanged_since_restore: bool,
 }
 
 /// File next to an archive holding the ETag of its S3 object
@@ -390,6 +428,7 @@ impl LocalCache {
             max_size: None,
             remote: None,
             legacy_zip: true,
+            restored: Default::default(),
         }
     }
 
@@ -524,6 +563,7 @@ impl LocalCache {
     }
 
     /// Extract the first key that has an archive, in S3 or locally, until `stop`
+    #[cfg(test)]
     pub async fn restore(
         &self,
         project_id: u64,
@@ -531,15 +571,60 @@ impl LocalCache {
         workspace: &str,
         stop: &Stop,
     ) -> Result<Restore> {
+        self.restore_job(project_id, keys, workspace, None, stop)
+            .await
+    }
+
+    /// Extract the first key that has an archive, in S3 or locally, until
+    /// `stop`. With `tracking`, an archive of the job's own key (the first)
+    /// that the files its paths match in the workspace are exactly what it
+    /// wrote is remembered, so `save_job` can tell they did not change.
+    pub async fn restore_job(
+        &self,
+        project_id: u64,
+        keys: &[String],
+        workspace: &str,
+        tracking: Option<Tracking<'_>>,
+        stop: &Stop,
+    ) -> Result<Restore> {
+        let tracked = tracking.zip(keys.first());
+        if let Some((tracking, key)) = tracked {
+            self.forget(tracking.job_id, project_id, key);
+        }
+        let (outcome, extracted) = self
+            .restore_first(project_id, keys, workspace, stop)
+            .await?;
+        if let (Some((tracking, key)), Some((hit, _)), Some(extracted)) =
+            (tracked, &outcome.hit, extracted)
+        {
+            if hit == key {
+                self.remember(tracking, project_id, key, workspace, extracted)
+                    .await;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// `restore_job` without tracking. Also returns the entries the archive
+    /// restored wrote, when that archive is the key's current one in
+    /// format 2: in S3 (downloaded, or the unchanged local copy), or the
+    /// local copy without S3.
+    async fn restore_first(
+        &self,
+        project_id: u64,
+        keys: &[String],
+        workspace: &str,
+        stop: &Stop,
+    ) -> Result<(Restore, Option<artifacts::EntrySet>)> {
         let mut outcome = Restore::default();
         for key in keys {
             stop.check()?;
             let mut current = None;
             if let Some(remote) = &self.remote {
                 match self.fetch(remote, project_id, key, workspace, stop).await? {
-                    Ok(Fetched::Extracted(bytes)) => {
+                    Ok(Fetched::Extracted(bytes, extracted)) => {
                         outcome.hit = Some((key.clone(), Source::S3Downloaded(bytes)));
-                        return Ok(outcome);
+                        return Ok((outcome, extracted));
                     }
                     Ok(Fetched::Local(path, source)) => current = Some((path, source)),
                     Ok(Fetched::Missing) => {}
@@ -565,9 +650,12 @@ impl LocalCache {
                         }
                     })
                     .await;
-                    artifacts::extract_cache_file(&path, workspace, stop).await?;
+                    let extracted = artifacts::extract_cache_file(&path, workspace, stop).await?;
+                    // A local copy used because S3 failed or lacks the key
+                    // is not what S3 holds: its save must upload
+                    let current = source != Source::Local || self.remote.is_none();
                     outcome.hit = Some((key.clone(), source));
-                    return Ok(outcome);
+                    return Ok((outcome, extracted.filter(|_| current)));
                 }
                 // Evicted meanwhile by a concurrent job
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -576,7 +664,105 @@ impl LocalCache {
                 }
             }
         }
-        Ok(outcome)
+        Ok((outcome, None))
+    }
+
+    /// Forget what a restore of `key` for the job recorded
+    fn forget(&self, job_id: u64, project_id: u64, key: &str) {
+        if let Ok(mut restored) = self.restored.lock() {
+            restored.remove(&(job_id, project_id, key.to_string()));
+        }
+    }
+
+    /// Record the state of the files `tracking.paths` match after the
+    /// archive of `key` was extracted, writing `extracted`, unless the
+    /// workspace holds more of them than that archive (files of the checkout
+    /// or of another cache under the same paths): an archive of them would
+    /// differ from the one restored.
+    async fn remember(
+        &self,
+        tracking: Tracking<'_>,
+        project_id: u64,
+        key: &str,
+        workspace: &str,
+        extracted: artifacts::EntrySet,
+    ) {
+        let state = match artifacts::cache_state(workspace, tracking.paths).await {
+            Ok(Some(state)) if state.entries == extracted => state,
+            Ok(Some(_)) => {
+                tracing::debug!(
+                    "Cache {}: the workspace holds other files under its paths",
+                    key
+                );
+                return;
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "Cache {}: the file system keeps whole seconds, changes are not tracked",
+                    key
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::debug!("Cache {}: cannot read its files: {:#}", key, e);
+                return;
+            }
+        };
+        // The files were just written: a change in the same clock tick
+        // would keep their ctime. The job starts after this.
+        tokio::time::sleep(TIMESTAMP_TICK).await;
+        let Ok(mut restored) = self.restored.lock() else {
+            return;
+        };
+        if restored.len() >= MAX_TRACKED {
+            let oldest = restored
+                .iter()
+                .min_by_key(|(_, restored)| restored.at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                restored.remove(&oldest);
+            }
+        }
+        restored.insert(
+            (tracking.job_id, project_id, key.to_string()),
+            Restored {
+                paths: tracking.paths.to_vec(),
+                state,
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// The archive of `key` when the job restored it and the files `paths`
+    /// match are as the restore left them: the local copy is that archive
+    /// still, and S3 held it then
+    async fn unchanged_since_restore(
+        &self,
+        job_id: u64,
+        project_id: u64,
+        key: &str,
+        workspace: &str,
+        paths: &[String],
+    ) -> Option<Saved> {
+        let restored = self
+            .restored
+            .lock()
+            .ok()?
+            .remove(&(job_id, project_id, key.to_string()))?;
+        if restored.paths != paths {
+            return None;
+        }
+        // Evicted meanwhile: saved again
+        let size = tokio::fs::metadata(self.archive_path(project_id, key))
+            .await
+            .ok()?
+            .len();
+        let now = artifacts::cache_state(workspace, paths).await.ok()??;
+        (now == restored.state).then(|| Saved {
+            size,
+            upload: self.remote.as_ref().map(|_| Ok(Upload::Unchanged)),
+            unchanged_since_restore: true,
+        })
     }
 
     /// Bring the local archive of `key` up to date with S3: the archive
@@ -679,7 +865,7 @@ impl LocalCache {
                 )
                 // The rest of the stream is read (hashed and copied) to its
                 // end, so the hash is the whole object's
-                .map(|()| reader.finish())
+                .map(|entries| (entries, reader.finish()))
             })
         };
 
@@ -703,13 +889,14 @@ impl LocalCache {
             (Err(e), _) => return Ok(Err(e)),
             // A bad archive, or `stop`: as when extracting a local copy
             (Ok(()), Err(e)) => return Err(e),
-            (Ok(()), Ok(stream)) if stream.extra > 0 => {
+            (Ok(()), Ok((_, stream))) if stream.extra > 0 => {
                 return Ok(Err(anyhow::anyhow!(
                     "the cache archive ended before the download"
                 )))
             }
-            (Ok(()), Ok(stream)) => stream,
+            (Ok(()), Ok(extracted)) => extracted,
         };
+        let (entries, stream) = stream;
         let sha256 = stream.sha256;
         // The files are extracted already; a mismatch keeps the archive out
         // of the local layer, and the local copy then overwrites them
@@ -720,7 +907,7 @@ impl LocalCache {
             // The workspace has the whole archive; only the next restore
             // downloads it again
             tracing::warn!("Failed to write {}: {}", path.display(), e);
-            return Ok(Ok(Fetched::Extracted(size)));
+            return Ok(Ok(Fetched::Extracted(size, None)));
         }
         match staged.persist(path) {
             Ok(_) => {
@@ -728,15 +915,19 @@ impl LocalCache {
                 // It replaces the ZIP an older version saved for the key
                 remove_archive(legacy).await;
                 self.evict(dir, path).await;
+                Ok(Ok(Fetched::Extracted(size, Some(entries))))
             }
             // The cache is restored; only the next restore downloads again
-            Err(e) => tracing::warn!("Failed to save {}: {}", path.display(), e.error),
+            Err(e) => {
+                tracing::warn!("Failed to save {}: {}", path.display(), e.error);
+                Ok(Ok(Fetched::Extracted(size, None)))
+            }
         }
-        Ok(Ok(Fetched::Extracted(size)))
     }
 
     /// Archive `paths` from the workspace under `key` and upload it to S3, if
     /// any; `None` when no file matched (nothing is saved)
+    #[cfg(test)]
     pub async fn save(
         &self,
         project_id: u64,
@@ -744,6 +935,29 @@ impl LocalCache {
         workspace: &str,
         paths: &[String],
     ) -> Result<Option<Saved>> {
+        self.save_job(None, project_id, key, workspace, paths).await
+    }
+
+    /// Archive `paths` from the workspace under `key` and upload it to S3, if
+    /// any; `None` when no file matched (nothing is saved). With the job's
+    /// id, a cache its restore tracked (`Tracking`) whose files did not
+    /// change since is neither archived nor uploaded.
+    pub async fn save_job(
+        &self,
+        job_id: Option<u64>,
+        project_id: u64,
+        key: &str,
+        workspace: &str,
+        paths: &[String],
+    ) -> Result<Option<Saved>> {
+        if let Some(job_id) = job_id {
+            if let Some(saved) = self
+                .unchanged_since_restore(job_id, project_id, key, workspace, paths)
+                .await
+            {
+                return Ok(Some(saved));
+            }
+        }
         let path = self.archive_path(project_id, key);
         let dir = path.parent().unwrap_or(Path::new("."));
         tokio::fs::create_dir_all(dir)
@@ -780,7 +994,11 @@ impl LocalCache {
         };
         drop(file);
         self.evict(dir, &path).await;
-        Ok(Some(Saved { size: len, upload }))
+        Ok(Some(Saved {
+            size: len,
+            upload,
+            unchanged_since_restore: false,
+        }))
     }
 }
 
@@ -2054,6 +2272,274 @@ mod tests {
         assert!(archive(5).exists());
         assert!(!archive(3).exists() && !archive(4).exists());
         assert_eq!(unlimited.stats().0, 1);
+    }
+
+    fn tracking(job_id: u64, paths: &[String]) -> Option<Tracking<'_>> {
+        Some(Tracking { job_id, paths })
+    }
+
+    /// Restore `key` for job `job_id`, tracking `vendor`
+    async fn restore_tracked(cache: &LocalCache, job_id: u64, keys: &[&str], ws: &Path) -> Restore {
+        let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        cache
+            .restore_job(
+                5,
+                &keys,
+                ws.to_str().unwrap(),
+                tracking(job_id, &["vendor".to_string()]),
+                &Stop::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn save_tracked(cache: &LocalCache, job_id: u64, ws: &Path) -> Saved {
+        cache
+            .save_job(
+                Some(job_id),
+                5,
+                "main",
+                ws.to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// pull-push: files the job did not touch since the restore are not
+    /// archived again (the local archive stays as it is); the next job that
+    /// changes them saves them
+    #[tokio::test]
+    async fn an_unchanged_cache_is_not_archived_again() {
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path());
+        let producer = workspace("dep");
+        cache
+            .save(
+                5,
+                "main",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        let archive = cache.archive_path(5, "main");
+        let before = std::fs::read(&archive).unwrap();
+        let job = tempdir().unwrap();
+
+        let restored = restore_tracked(&cache, 7, &["main"], job.path()).await;
+        assert!(restored.hit.is_some(), "{:?}", restored);
+        let modified = std::fs::metadata(&archive).unwrap().modified().unwrap();
+        let saved = save_tracked(&cache, 7, job.path()).await;
+
+        assert!(saved.unchanged_since_restore, "{:?}", saved);
+        assert_eq!(saved.size, before.len() as u64);
+        assert_eq!(saved.upload, None);
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().modified().unwrap(),
+            modified,
+            "the archive was written again"
+        );
+        // The record is used once
+        assert!(
+            !save_tracked(&cache, 7, job.path())
+                .await
+                .unchanged_since_restore
+        );
+
+        // Another job: tracked again, and this one changes a file
+        restore_tracked(&cache, 8, &["main"], job.path()).await;
+        std::fs::write(job.path().join("vendor/lib.txt"), "new").unwrap();
+        let changed = save_tracked(&cache, 8, job.path()).await;
+        assert!(!changed.unchanged_since_restore);
+        let consumer = tempdir().unwrap();
+        cache
+            .restore(
+                5,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(consumer.path().join("vendor/lib.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    /// The edge mtime and size alone miss: the same size, the mtime set back
+    /// (as npm, `cp -p` or `tar -x` do). The ctime still moves.
+    #[tokio::test]
+    async fn a_change_that_keeps_size_and_mtime_is_saved() {
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path());
+        let producer = workspace("aaa");
+        cache
+            .save(
+                5,
+                "main",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        let job = tempdir().unwrap();
+        restore_tracked(&cache, 7, &["main"], job.path()).await;
+        let lib = job.path().join("vendor/lib.txt");
+        let mtime = std::fs::metadata(&lib).unwrap().modified().unwrap();
+
+        std::fs::write(&lib, "bbb").unwrap();
+        std::fs::File::options()
+            .append(true)
+            .open(&lib)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&lib).unwrap().modified().unwrap(), mtime);
+
+        let saved = save_tracked(&cache, 7, job.path()).await;
+        assert!(!saved.unchanged_since_restore);
+        let consumer = tempdir().unwrap();
+        cache
+            .restore(
+                5,
+                &["main".to_string()],
+                consumer.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(consumer.path().join("vendor/lib.txt")).unwrap(),
+            "bbb"
+        );
+    }
+
+    /// Files under the cache's paths that the archive did not hold (from
+    /// the checkout, say) would be in a new archive: it is saved
+    #[tokio::test]
+    async fn a_restore_over_other_files_is_saved_again() {
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path());
+        let producer = workspace("dep");
+        cache
+            .save(
+                5,
+                "main",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        let job = workspace("dep");
+        std::fs::write(job.path().join("vendor/checked-in.txt"), "x").unwrap();
+
+        restore_tracked(&cache, 7, &["main"], job.path()).await;
+        let saved = save_tracked(&cache, 7, job.path()).await;
+
+        assert!(!saved.unchanged_since_restore);
+    }
+
+    /// Only the job's own key is tracked: a fallback key's archive is not
+    /// the one its save writes
+    #[tokio::test]
+    async fn a_cache_restored_from_a_fallback_key_is_saved() {
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path());
+        let producer = workspace("dep");
+        cache
+            .save(
+                5,
+                "fallback",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        let job = tempdir().unwrap();
+
+        let restored = restore_tracked(&cache, 7, &["main", "fallback"], job.path()).await;
+        assert!(
+            matches!(restored.hit, Some((ref key, _)) if key == "fallback"),
+            "{:?}",
+            restored
+        );
+        let saved = save_tracked(&cache, 7, job.path()).await;
+
+        assert!(!saved.unchanged_since_restore);
+        assert!(cache.archive_path(5, "main").exists());
+    }
+
+    /// With S3: an archive restored from S3 and left unchanged costs no
+    /// request at all on save; one restored from the local copy because S3
+    /// failed is saved and uploaded
+    #[tokio::test]
+    async fn an_unchanged_cache_from_s3_costs_no_request() {
+        let server = MockServer::start().await;
+        let producer = workspace("dep");
+        let elsewhere = tempdir().unwrap();
+        LocalCache::new(elsewhere.path())
+            .save(
+                5,
+                "main",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        let archive = std::fs::read(elsewhere.path().join("project-5/main.tar.zst")).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/main.tar.zst"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(archive),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+        let job = tempdir().unwrap();
+        let restored = restore_tracked(&cache, 7, &["main"], job.path()).await;
+        assert!(
+            matches!(restored.hit, Some((_, Source::S3Downloaded(_)))),
+            "{:?}",
+            restored
+        );
+        let requests = server.received_requests().await.unwrap().len();
+
+        let saved = save_tracked(&cache, 7, job.path()).await;
+
+        assert!(saved.unchanged_since_restore);
+        assert_eq!(saved.upload, Some(Ok(Upload::Unchanged)));
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+
+        // S3 fails now: the local copy is restored, and the save uploads
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v2\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let restored = restore_tracked(&cache, 8, &["main"], job.path()).await;
+        assert!(
+            matches!(restored.hit, Some((_, Source::Local))),
+            "{:?}",
+            restored
+        );
+        let saved = save_tracked(&cache, 8, job.path()).await;
+        assert!(!saved.unchanged_since_restore);
+        assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
     }
 
     /// Runs `docker` with `args`, returning stdout
