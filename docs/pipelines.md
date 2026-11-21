@@ -108,11 +108,11 @@ TurboCI adds the variables gitlab-runner adds:
 
 ## Not supported
 
-- Executors other than `docker` and `shell` (Kubernetes, docker-autoscaler, ...)
+- Executors other than `docker` and `shell` (Kubernetes, docker-autoscaler, SSH, custom, ...)
+- Windows jobs and PowerShell
 - Native GCS and Azure caches (GCS works through its S3 interoperability with HMAC keys, see [S3 cache](configuration.md#shared-cache-in-s3))
 - Interactive web terminal and the session server
 - External secrets (`secrets:` with Vault, Azure Key Vault, ...)
-- Docker credential helpers (`credsStore`, `credHelpers`)
 - `GIT_SUBMODULE_FORCE_HTTPS`
 - Feature flags (`FF_*`)
 

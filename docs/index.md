@@ -22,9 +22,22 @@ Redis, no database, no helper daemon.
 
 - **One small binary**
 
-    A static Linux binary with no external services. It runs next to
-    gitlab-runner on the same host and Docker daemon without touching its
-    containers. [Operations →](operations.md)
+    A static binary with no external services that idles at a few MB of
+    memory. It runs next to gitlab-runner on the same host and Docker daemon
+    without touching its containers. [Operations →](operations.md)
+
+- **Fast jobs and caches**
+
+    Checkout, image pulls and services start together; caches are solid
+    `tar.zst` archives extracted while they download, and skipped when a job
+    left them unchanged. [Configuration →](configuration.md)
+
+- **Looks after the host**
+
+    Stops taking jobs when memory, disk or load cross a limit, keeps
+    workspaces, caches and unused images within size limits, exposes
+    Prometheus metrics and reloads its config on `SIGHUP`.
+    [Operations →](operations.md)
 
 </div>
 
@@ -35,7 +48,7 @@ Redis, no database, no helper daemon.
 ![How TurboCI runs a job: it polls GitLab, checks out sources in a helper container, restores the cache, runs the steps in the job container next to its services, streams the log and uploads artifacts](assets/diagrams/how-it-works.svg)
 
 1. **Request.** Whenever it has a free slot (`concurrent`), the runner asks
-   GitLab for a job.
+   GitLab for a job, long-polling so a new job is picked up at once.
 2. **Payload.** GitLab answers with the script, variables, image, services,
    cache and artifact settings.
 3. **Checkout.** A small helper container checks out the pipeline's exact
