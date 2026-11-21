@@ -349,7 +349,7 @@ mod tests {
     fn settings_read_only_at_start_are_pinned() {
         let old = parse("runner_token = \"t\"\nstate_dir = \"/srv/a\"\n[executor]\nexecutor_type = \"shell\"\n[executor.shell]\nwork_dir = \"/srv/a/b\"");
         let new = parse(
-            "runner_token = \"t2\"\ngitlab_url = \"https://other\"\nstate_dir = \"/srv/b\"\nproxy = \"http://p:3128\"\ncache_enabled = false\ncache_dir = \"/c\"\nenvironment = [\"A=1\"]\npre_build_script = \"echo\"\ncache_max_age_days = 1\ncache_max_size = \"1g\"\n[executor]\nexecutor_type = \"docker\"\nworkspace_max_age_days = 0\nworkspace_max_size = \"5g\"\n[executor.docker]\nbuilds_dir = \"/b\"\nmemory = \"1g\"\nvolumes = [\"/x\"]\npull_policy = \"never\"\n[executor.shell]\nwork_dir = \"/w\"",
+            "runner_token = \"t2\"\ngitlab_url = \"https://other\"\nstate_dir = \"/srv/b\"\nproxy = \"http://p:3128\"\ncache_enabled = false\ncache_dir = \"/c\"\nenvironment = [\"A=1\"]\npre_build_script = \"echo\"\ncache_legacy_zip = false\ncache_max_age_days = 1\ncache_max_size = \"1g\"\n[executor]\nexecutor_type = \"docker\"\nworkspace_max_age_days = 0\nworkspace_max_size = \"5g\"\n[executor.docker]\nbuilds_dir = \"/b\"\nmemory = \"1g\"\nvolumes = [\"/x\"]\npull_policy = \"never\"\n[executor.shell]\nwork_dir = \"/w\"",
         );
 
         let live = pin_restart_only(&old, &new);
@@ -357,6 +357,7 @@ mod tests {
         assert_eq!(
             changed_keys(&old, &live),
             [
+                "cache_legacy_zip",
                 "cache_max_age_days",
                 "cache_max_size",
                 "environment",

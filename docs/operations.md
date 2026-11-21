@@ -53,7 +53,7 @@ hook scripts (`pre_get_sources_script`, ...), every `[executor.docker]`
 setting except `builds_dir` (default image, pull policies, resource limits,
 volumes, services, registries, image and service allowlists, credential
 helpers, ...), `workspace_max_age_days`, `workspace_max_size`,
-`cache_max_age_days` and `cache_max_size`. The hourly cleanup uses the new
+`cache_max_age_days`, `cache_max_size` and `cache_legacy_zip`. The hourly cleanup uses the new
 limits too, `image_max_age_days` and `image_max_size` included. Seccomp
 profile files in `security_opt` are read again by the reload; one that
 cannot be read fails the whole reload.
