@@ -349,19 +349,35 @@ impl Docker {
         .await
     }
 
-    /// `DELETE /images/{name}`
-    #[cfg(test)]
+    /// `GET /images/json`: the tagged and untagged top-level images
+    pub async fn list_images(&self) -> Result<Vec<ImageSummary>> {
+        self.get("/images/json", Some(&[("all", "false")])).await
+    }
+
+    /// `DELETE /images/{name}`, never forced: dockerd refuses (409) to
+    /// remove an image a container uses. A tag of an image with other tags
+    /// is only untagged.
     pub async fn remove_image(&self, name: &str) -> Result<()> {
         let response = self
             .request(
                 Method::DELETE,
                 &format!("/images/{}", name),
-                None,
+                Some(&[("force", "false"), ("noprune", "false")]),
                 Vec::new(),
                 Bytes::new(),
             )
             .await?;
         json_body::<serde::de::IgnoredAny>(response).await.map(drop)
+    }
+
+    /// `POST /commit`: an image `repo:tag` of the container `id`
+    #[cfg(test)]
+    pub async fn commit_container(&self, id: &str, repo: &str, tag: &str) -> Result<String> {
+        let query = [("container", id), ("repo", repo), ("tag", tag)];
+        let response: CommitResponse = self
+            .send_json("/commit", Some(&query), &serde_json::json!({}))
+            .await?;
+        Ok(response.id)
     }
 
     // --- Containers

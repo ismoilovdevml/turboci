@@ -62,6 +62,66 @@ pub struct HostConfig {
     pub tmpfs: Option<HashMap<String, String>>,
     #[serde(rename = "ShmSize", skip_serializing_if = "Option::is_none")]
     pub shm_size: Option<i64>,
+    #[serde(rename = "ExtraHosts", skip_serializing_if = "Option::is_none")]
+    pub extra_hosts: Option<Vec<String>>,
+    #[serde(rename = "Dns", skip_serializing_if = "Option::is_none")]
+    pub dns: Option<Vec<String>>,
+    #[serde(rename = "DnsSearch", skip_serializing_if = "Option::is_none")]
+    pub dns_search: Option<Vec<String>>,
+    #[serde(rename = "CapAdd", skip_serializing_if = "Option::is_none")]
+    pub cap_add: Option<Vec<String>>,
+    #[serde(rename = "CapDrop", skip_serializing_if = "Option::is_none")]
+    pub cap_drop: Option<Vec<String>>,
+    #[serde(rename = "SecurityOpt", skip_serializing_if = "Option::is_none")]
+    pub security_opt: Option<Vec<String>>,
+    #[serde(rename = "Devices", skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<DeviceMapping>>,
+    #[serde(rename = "DeviceRequests", skip_serializing_if = "Option::is_none")]
+    pub device_requests: Option<Vec<DeviceRequest>>,
+    #[serde(rename = "Sysctls", skip_serializing_if = "Option::is_none")]
+    pub sysctls: Option<HashMap<String, String>>,
+    #[serde(rename = "Ulimits", skip_serializing_if = "Option::is_none")]
+    pub ulimits: Option<Vec<Ulimit>>,
+    #[serde(rename = "Runtime", skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+}
+
+/// A host device made available in a container
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceMapping {
+    #[serde(rename = "PathOnHost")]
+    pub path_on_host: String,
+    #[serde(rename = "PathInContainer")]
+    pub path_in_container: String,
+    #[serde(rename = "CgroupPermissions")]
+    pub cgroup_permissions: String,
+}
+
+/// A request for devices of a driver, such as GPUs (`docker run --gpus`)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DeviceRequest {
+    #[serde(rename = "Driver")]
+    pub driver: String,
+    /// -1 for all devices
+    #[serde(rename = "Count")]
+    pub count: i64,
+    #[serde(rename = "DeviceIDs", skip_serializing_if = "Option::is_none")]
+    pub device_ids: Option<Vec<String>>,
+    #[serde(rename = "Capabilities")]
+    pub capabilities: Vec<Vec<String>>,
+    #[serde(rename = "Options")]
+    pub options: HashMap<String, String>,
+}
+
+/// A resource limit (`ulimit`) of a container's processes
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ulimit {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Soft")]
+    pub soft: i64,
+    #[serde(rename = "Hard")]
+    pub hard: i64,
 }
 
 /// A mount of a container to create
@@ -171,6 +231,9 @@ pub struct InspectHostConfig {
 pub struct ContainerSummary {
     #[serde(rename = "Id")]
     pub id: Option<String>,
+    /// ID of the image the container was created from
+    #[serde(rename = "ImageID")]
+    pub image_id: Option<String>,
     #[cfg(test)]
     #[serde(rename = "Names")]
     pub names: Option<Vec<String>>,
@@ -196,6 +259,33 @@ pub struct ContainerWaitExitError {
 #[derive(Debug, Deserialize)]
 pub struct CreateImageInfo {
     pub error: Option<String>,
+}
+
+/// An entry of `GET /images/json`
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageSummary {
+    #[serde(rename = "Id")]
+    pub id: String,
+    /// `repository:tag` references; `<none>:<none>` (or none at all) for an
+    /// untagged image
+    #[serde(rename = "RepoTags", default)]
+    pub repo_tags: Option<Vec<String>>,
+    #[serde(rename = "RepoDigests", default)]
+    pub repo_digests: Option<Vec<String>>,
+    /// When the image was built, in seconds since the epoch
+    #[serde(rename = "Created", default)]
+    pub created: i64,
+    /// Bytes of the image, its layers shared with other images included
+    #[serde(rename = "Size", default)]
+    pub size: i64,
+}
+
+/// `POST /commit` response
+#[cfg(test)]
+#[derive(Debug, Deserialize)]
+pub struct CommitResponse {
+    #[serde(rename = "Id")]
+    pub id: String,
 }
 
 /// Login for a registry, sent base64-encoded in the X-Registry-Auth header.

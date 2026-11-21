@@ -2,10 +2,76 @@
 //! projects together stay within a size, the least recently used going first.
 //! A workspace in use is never touched. Evicted workspaces are first renamed
 //! (quick, done while jobs cannot claim workspaces), then deleted.
+//!
+//! Docker image collection (`executor.docker.image_max_age_days` and
+//! `image_max_size`): which unused images to remove (see `images_to_remove`;
+//! the Docker side is `DockerExecutor::collect_images`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+/// A Docker image no container uses and no job of this runner is using
+#[derive(Debug, Clone)]
+pub struct UnusedImage {
+    pub id: String,
+    /// Its `repository:tag` names as dockerd lists them (none: untagged)
+    pub tags: Vec<String>,
+    /// Its tags and digests in the runner's form (see the executor's
+    /// `usage_key`), to match the images jobs use
+    pub references: Vec<String>,
+    /// Bytes, as `docker images` shows them
+    pub size: u64,
+    /// When it was built (seconds since the epoch)
+    pub created: i64,
+    /// When a job of this runner last used it, or when the collection first
+    /// saw it (dockerd does not record when an image was last used)
+    pub last_used: SystemTime,
+}
+
+impl UnusedImage {
+    /// Its first tag, or its short ID when untagged
+    pub fn name(&self) -> String {
+        self.tags.first().cloned().unwrap_or_else(|| {
+            let id = self.id.strip_prefix("sha256:").unwrap_or(&self.id);
+            id.chars().take(12).collect()
+        })
+    }
+}
+
+/// Images to remove, the least recently used first: those not used for
+/// `max_age` (an age of zero picks every one), then, while the remaining
+/// ones take more than `max_size` bytes, the least recently used of them.
+/// Images last used at the same time go in the order they were built.
+pub fn images_to_remove(
+    images: &[UnusedImage],
+    now: SystemTime,
+    max_age: Option<Duration>,
+    max_size: Option<u64>,
+) -> Vec<&UnusedImage> {
+    let mut by_use: Vec<&UnusedImage> = images.iter().collect();
+    by_use.sort_by_key(|image| (image.last_used, image.created));
+    let too_old = |image: &UnusedImage| {
+        max_age.is_some_and(|max_age| {
+            now.duration_since(image.last_used)
+                .unwrap_or(Duration::ZERO)
+                >= max_age
+        })
+    };
+    let (mut picked, kept): (Vec<&UnusedImage>, Vec<&UnusedImage>) =
+        by_use.into_iter().partition(|image| too_old(image));
+    if let Some(max_size) = max_size {
+        let mut total: u64 = kept.iter().map(|image| image.size).sum();
+        for image in kept {
+            if total <= max_size {
+                break;
+            }
+            total -= image.size;
+            picked.push(image);
+        }
+    }
+    picked
+}
 
 /// File in a workspace whose mtime says when a job last used it; the
 /// executor writes it when a job starts (see `executor::LAST_USED`)
@@ -254,5 +320,80 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["project-2-0"]);
+    }
+
+    fn image(tag: &str, size: u64, idle_hours: u64, created: i64) -> UnusedImage {
+        UnusedImage {
+            id: format!("sha256:{:0>64}", tag.len()),
+            tags: vec![tag.to_string()],
+            references: vec![tag.to_string()],
+            size,
+            created,
+            last_used: SystemTime::now() - Duration::from_secs(idle_hours * 3600),
+        }
+    }
+
+    fn tags(picked: &[&UnusedImage]) -> Vec<String> {
+        picked.iter().map(|image| image.name()).collect()
+    }
+
+    #[test]
+    fn images_past_the_age_go_least_recently_used_first() {
+        let images = [
+            image("a:1", 10, 30 * 24, 0),
+            image("b:1", 10, 2, 0),
+            image("c:1", 10, 8 * 24, 0),
+        ];
+        let now = SystemTime::now();
+        let week = Some(Duration::from_secs(7 * 24 * 3600));
+
+        assert_eq!(
+            tags(&images_to_remove(&images, now, week, None)),
+            ["a:1", "c:1"]
+        );
+        // Zero: every unused image
+        let all = images_to_remove(&images, now, Some(Duration::ZERO), None);
+        assert_eq!(tags(&all), ["a:1", "c:1", "b:1"]);
+        assert!(images_to_remove(&images, now, None, None).is_empty());
+    }
+
+    #[test]
+    fn images_beyond_the_size_go_least_recently_used_first() {
+        let images = [
+            image("recent:1", 40, 1, 0),
+            image("old:1", 30, 50, 0),
+            image("middle:1", 20, 10, 0),
+            image("oldest:1", 10, 100, 0),
+        ];
+        let now = SystemTime::now();
+
+        // 100 bytes in all: 60 must go to get within 40
+        let picked = images_to_remove(&images, now, None, Some(40));
+        assert_eq!(tags(&picked), ["oldest:1", "old:1", "middle:1"]);
+        assert!(images_to_remove(&images, now, None, Some(100)).is_empty());
+        // The age limit first, then the size of what is left
+        let picked = images_to_remove(&images, now, Some(Duration::from_secs(60 * 3600)), Some(65));
+        assert_eq!(tags(&picked), ["oldest:1", "old:1"]);
+    }
+
+    #[test]
+    fn images_used_at_the_same_time_go_oldest_built_first() {
+        let used = SystemTime::now() - Duration::from_secs(3600);
+        let mut newer = image("newer:1", 10, 0, 2_000_000_000);
+        let mut older = image("older:1", 10, 0, 1_000_000_000);
+        newer.last_used = used;
+        older.last_used = used;
+        let images = [newer, older];
+
+        let picked = images_to_remove(&images, SystemTime::now(), None, Some(10));
+        assert_eq!(tags(&picked), ["older:1"]);
+    }
+
+    #[test]
+    fn untagged_images_are_named_by_their_short_id() {
+        let mut untagged = image("x", 1, 0, 0);
+        untagged.tags.clear();
+        untagged.id = "sha256:0123456789abcdef0123".to_string();
+        assert_eq!(untagged.name(), "0123456789ab");
     }
 }

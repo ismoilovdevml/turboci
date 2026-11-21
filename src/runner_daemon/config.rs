@@ -174,6 +174,327 @@ pub struct DockerConfig {
     /// Storage driver options of job and service containers, e.g.
     /// size = "20G" (overlay2 needs xfs with pquota for it)
     pub storage_opt: std::collections::BTreeMap<String, String>,
+
+    // Container options of gitlab-runner's [runners.docker]. Like there,
+    // services get only extra_hosts, dns, dns_search and runtime.
+    /// `host:ip` entries added to /etc/hosts of job, service and checkout
+    /// containers ("host-gateway" for the host's address)
+    pub extra_hosts: Vec<String>,
+    /// DNS servers (IP addresses) of job, service and checkout containers
+    pub dns: Vec<String>,
+    /// DNS search domains of job, service and checkout containers
+    pub dns_search: Vec<String>,
+    /// Linux capabilities added to job containers, e.g. "SYS_PTRACE"
+    pub cap_add: Vec<String>,
+    /// Linux capabilities dropped from job containers, e.g. "NET_RAW"
+    pub cap_drop: Vec<String>,
+    /// Security options of job containers, e.g. "no-new-privileges" or
+    /// "seccomp=/etc/turboci/seccomp.json" (the file's JSON is sent)
+    pub security_opt: Vec<String>,
+    /// Host devices of job containers: "/dev/x[:/dev/y[:rwm]]"
+    pub devices: Vec<String>,
+    /// GPUs of job containers, as `docker run --gpus`: "all", a count, or
+    /// e.g. "\"device=0,1\"" or "count=2,capabilities=utility"
+    pub gpus: Option<String>,
+    /// Kernel parameters of job containers, e.g.
+    /// "net.ipv4.ip_unprivileged_port_start" = "0"
+    pub sysctls: std::collections::BTreeMap<String, String>,
+    /// Resource limits of job containers: name → "soft:hard" or one value
+    /// for both, e.g. nofile = "1024:4096"
+    pub ulimit: std::collections::BTreeMap<String, String>,
+    /// OCI runtime of job and service containers, e.g. "nvidia"
+    pub runtime: Option<String>,
+
+    /// Glob patterns of the images jobs may use with `image:` (empty: any);
+    /// `default_image` is always allowed
+    pub allowed_images: Vec<String>,
+    /// Glob patterns of the images jobs may use with `services:` (empty:
+    /// any); the services configured here are always allowed
+    pub allowed_services: Vec<String>,
+    /// Credential helpers a job's DOCKER_AUTH_CONFIG may run on the runner's
+    /// host: helper name (`ecr-login` for docker-credential-ecr-login) →
+    /// glob patterns of the registries it may be asked about. Helpers in
+    /// `auth_config_file` are the operator's and always run.
+    pub allowed_docker_credential_helpers: std::collections::BTreeMap<String, Vec<String>>,
+
+    /// Images no container uses and no job used for this many days are
+    /// removed by the hourly housekeeping (0: every unused image; unset: off)
+    pub image_max_age_days: Option<u64>,
+    /// Total size of the images no container uses, e.g. "50g"; beyond it the
+    /// least recently used are removed (unset or "0": no limit)
+    pub image_max_size: Option<String>,
+}
+
+/// Docker's `--ulimit` names
+const ULIMIT_NAMES: &[&str] = &[
+    "core",
+    "cpu",
+    "data",
+    "fsize",
+    "locks",
+    "memlock",
+    "msgqueue",
+    "nice",
+    "nofile",
+    "nproc",
+    "rss",
+    "rtprio",
+    "rttime",
+    "sigpending",
+    "stack",
+];
+
+/// `pattern` compiled with gitlab-runner's (doublestar) glob rules: `*` and
+/// `?` do not match `/`, `**` as a whole path segment matches any number of
+/// segments, `[abc]` matches one of the characters
+pub fn glob_pattern(field: &str, pattern: &str) -> Result<glob::Pattern> {
+    if pattern.trim().is_empty() {
+        anyhow::bail!("{}: empty pattern", field);
+    }
+    glob::Pattern::new(pattern).map_err(|e| {
+        anyhow::anyhow!(
+            "{}: {:?} is not a valid glob pattern ({}; `**` must be a whole path segment)",
+            field,
+            pattern,
+            e.msg
+        )
+    })
+}
+
+/// Whether `name` matches one of `patterns` (see `glob_pattern`); invalid
+/// patterns, rejected by validation, match nothing
+pub fn glob_matches(patterns: &[String], name: &str) -> bool {
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    patterns.iter().any(|pattern| {
+        glob::Pattern::new(pattern).is_ok_and(|pattern| pattern.matches_with(name, options))
+    })
+}
+
+/// A `host:ip` (or `host=ip`) entry of `extra_hosts` as dockerd takes it
+/// (`host:ip`, an IPv6 address without brackets)
+pub fn extra_host(entry: &str) -> Result<String> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "executor.docker.extra_hosts: {:?} must be host:ip, e.g. \"gitlab.corp:10.0.0.5\" or \"host.docker.internal:host-gateway\"",
+            entry
+        )
+    };
+    let (host, address) = entry
+        .split_once('=')
+        .or_else(|| entry.split_once(':'))
+        .ok_or_else(invalid)?;
+    let address = address
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(address);
+    let valid_host = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !valid_host || (address != "host-gateway" && address.parse::<std::net::IpAddr>().is_err()) {
+        return Err(invalid());
+    }
+    Ok(format!("{}:{}", host, address))
+}
+
+/// A `devices` entry, "host[:container[:permissions]]" like gitlab-runner
+/// (the container path defaults to the host path, permissions to "rwm")
+pub fn device_mapping(entry: &str) -> Result<super::docker_api::DeviceMapping> {
+    let parts: Vec<&str> = entry.split(':').collect();
+    let host = parts[0];
+    let container = parts.get(1).copied().unwrap_or(host);
+    let permissions = parts.get(2).copied().unwrap_or("rwm");
+    let valid_permissions = !permissions.is_empty()
+        && permissions.chars().all(|c| matches!(c, 'r' | 'w' | 'm'))
+        && permissions.len() <= 3;
+    if parts.len() > 3
+        || !host.starts_with('/')
+        || !container.starts_with('/')
+        || !valid_permissions
+    {
+        anyhow::bail!(
+            "executor.docker.devices: {:?} must be /dev/host[:/dev/container[:rwm]]",
+            entry
+        );
+    }
+    Ok(super::docker_api::DeviceMapping {
+        path_on_host: host.to_string(),
+        path_in_container: container.to_string(),
+        cgroup_permissions: permissions.to_string(),
+    })
+}
+
+/// Fields of a comma-separated line where "double quotes" protect commas,
+/// as Go's csv reader (used by `docker run --gpus`) reads them
+fn csv_fields(line: &str) -> Result<Vec<String>> {
+    let mut fields = vec![String::new()];
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                fields.last_mut().expect("never empty").push('"');
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(String::new()),
+            c => fields.last_mut().expect("never empty").push(c),
+        }
+    }
+    if quoted {
+        anyhow::bail!("unterminated quote");
+    }
+    Ok(fields)
+}
+
+/// The device request of a `gpus` value, parsed like `docker run --gpus`:
+/// "all", a count, or `count=`, `device=`, `driver=`, `capabilities=` and
+/// `options=` fields ("gpu" is always among the capabilities)
+pub fn gpu_request(value: &str) -> Result<super::docker_api::DeviceRequest> {
+    let invalid = |why: String| {
+        anyhow::anyhow!(
+            "executor.docker.gpus: {:?} is not a valid GPU request ({}); use \"all\", a count, or e.g. \"\\\"device=0,1\\\"\"",
+            value,
+            why
+        )
+    };
+    let count = |text: &str| -> Result<i64> {
+        match text {
+            "all" => Ok(-1),
+            text => text
+                .parse::<i64>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "count {:?} must be \"all\" or a positive number",
+                        text
+                    ))
+                }),
+        }
+    };
+    let mut request = super::docker_api::DeviceRequest::default();
+    let mut seen = std::collections::HashSet::new();
+    let mut counted = false;
+    for field in csv_fields(value.trim()).map_err(|e| invalid(e.to_string()))? {
+        let (key, val) = match field.split_once('=') {
+            Some((key, val)) => (key, Some(val)),
+            None => (field.as_str(), None),
+        };
+        let key_name = if val.is_none() { "count" } else { key };
+        if !seen.insert(key_name.to_string()) {
+            return Err(invalid(format!("{} is given twice", key_name)));
+        }
+        match (key, val) {
+            (count_text, None) | ("count", Some(count_text)) => {
+                request.count = count(count_text)?;
+                counted = true;
+            }
+            ("driver", Some(driver)) => request.driver = driver.to_string(),
+            ("device", Some(devices)) => {
+                let ids: Vec<String> = devices.split(',').map(str::to_string).collect();
+                if ids.iter().any(|id| id.trim().is_empty()) {
+                    return Err(invalid("empty device id".to_string()));
+                }
+                request.device_ids = Some(ids);
+            }
+            ("capabilities", Some(capabilities)) => {
+                let mut caps: Vec<String> = capabilities.split(',').map(str::to_string).collect();
+                caps.push("gpu".to_string());
+                request.capabilities = vec![caps];
+            }
+            ("options", Some(options)) => {
+                for option in csv_fields(options).map_err(|e| invalid(e.to_string()))? {
+                    let (key, val) = option.split_once('=').unwrap_or((option.as_str(), ""));
+                    request.options.insert(key.to_string(), val.to_string());
+                }
+            }
+            (key, Some(_)) => return Err(invalid(format!("unknown field {:?}", key))),
+        }
+    }
+    if counted && request.device_ids.is_some() {
+        return Err(invalid(
+            "a count and device ids exclude each other".to_string(),
+        ));
+    }
+    if !counted && request.device_ids.is_none() {
+        request.count = 1;
+    }
+    if request.capabilities.is_empty() {
+        request.capabilities = vec![vec!["gpu".to_string()]];
+    }
+    Ok(request)
+}
+
+/// A `ulimit` entry: "soft:hard", or one value for both (-1: unlimited)
+pub fn ulimit(name: &str, value: &str) -> Result<super::docker_api::Ulimit> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "executor.docker.ulimit: {} = {:?} must be \"soft:hard\" or one number, with soft at most hard (-1: unlimited)",
+            name,
+            value
+        )
+    };
+    if !ULIMIT_NAMES.contains(&name) {
+        anyhow::bail!(
+            "executor.docker.ulimit: unknown limit {:?}, expected one of {}",
+            name,
+            ULIMIT_NAMES.join(", ")
+        );
+    }
+    let number = |text: &str| {
+        text.trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= -1)
+            .ok_or_else(invalid)
+    };
+    let (soft, hard) = match value.split_once(':') {
+        Some((soft, hard)) => (number(soft)?, number(hard)?),
+        None => {
+            let both = number(value)?;
+            (both, both)
+        }
+    };
+    // -1 is RLIM_INFINITY, above every other value
+    let rank = |n: i64| if n == -1 { i64::MAX } else { n };
+    if rank(soft) > rank(hard) {
+        return Err(invalid());
+    }
+    Ok(super::docker_api::Ulimit {
+        name: name.to_string(),
+        soft,
+        hard,
+    })
+}
+
+/// A security option with a seccomp profile file replaced by the file's
+/// JSON, which is what dockerd takes (the docker CLI does the same)
+pub fn security_opt(option: &str) -> Result<String> {
+    match option.split_once('=') {
+        Some(("seccomp", profile))
+            if !matches!(profile, "unconfined" | "builtin") && !profile.starts_with('{') =>
+        {
+            let json = fs::read_to_string(profile).with_context(|| {
+                format!(
+                    "executor.docker.security_opt: cannot read the seccomp profile {}",
+                    profile
+                )
+            })?;
+            let parsed: serde_json::Value = serde_json::from_str(&json).with_context(|| {
+                format!(
+                    "executor.docker.security_opt: seccomp profile {} is not JSON",
+                    profile
+                )
+            })?;
+            Ok(format!("seccomp={}", parsed))
+        }
+        _ => Ok(option.to_string()),
+    }
 }
 
 /// A service in `[[executor.docker.services]]`
@@ -392,7 +713,162 @@ impl DockerConfig {
                 );
             }
         }
+        self.validate_container_options()?;
+        self.validate_image_policies()?;
         Ok(())
+    }
+
+    /// Check the gitlab-runner container options (extra_hosts ... runtime)
+    fn validate_container_options(&self) -> Result<()> {
+        let word = |text: &str| !text.is_empty() && !text.chars().any(char::is_whitespace);
+        for entry in &self.extra_hosts {
+            extra_host(entry)?;
+        }
+        if let Some(bad) = self
+            .dns
+            .iter()
+            .find(|server| server.parse::<std::net::IpAddr>().is_err())
+        {
+            anyhow::bail!(
+                "executor.docker.dns: {:?} must be the IP address of a DNS server",
+                bad
+            );
+        }
+        if let Some(bad) = self
+            .dns_search
+            .iter()
+            .find(|domain| !word(domain) || domain.contains(','))
+        {
+            anyhow::bail!(
+                "executor.docker.dns_search: {:?} must be a domain, e.g. \"corp.local\"",
+                bad
+            );
+        }
+        let capability = |cap: &str| {
+            cap.eq_ignore_ascii_case("ALL")
+                || (!cap.is_empty() && cap.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        };
+        if let Some(bad) = self
+            .cap_add
+            .iter()
+            .chain(&self.cap_drop)
+            .find(|cap| !capability(cap))
+        {
+            anyhow::bail!(
+                "executor.docker cap_add/cap_drop: {:?} must be a capability such as \"NET_RAW\" or \"ALL\"",
+                bad
+            );
+        }
+        for option in &self.security_opt {
+            if !word(option) {
+                anyhow::bail!(
+                    "executor.docker.security_opt: {:?} must not be empty or contain spaces",
+                    option
+                );
+            }
+            security_opt(option)?;
+        }
+        for entry in &self.devices {
+            device_mapping(entry)?;
+        }
+        if let Some(gpus) = self.gpus.as_deref().filter(|gpus| !gpus.trim().is_empty()) {
+            gpu_request(gpus)?;
+        }
+        for (key, value) in &self.sysctls {
+            if !word(key) || key.contains('=') || value.contains(['\n', '\r']) {
+                anyhow::bail!(
+                    "executor.docker.sysctls: {:?} = {:?} must be a kernel parameter and its value",
+                    key,
+                    value
+                );
+            }
+        }
+        for (name, value) in &self.ulimit {
+            ulimit(name, value)?;
+        }
+        if self
+            .runtime
+            .as_deref()
+            .is_some_and(|runtime| !word(runtime))
+        {
+            anyhow::bail!(
+                "executor.docker.runtime must be a runtime name such as \"nvidia\", got {:?}",
+                self.runtime
+            );
+        }
+        Ok(())
+    }
+
+    /// Check allowed_images, allowed_services, the credential helper
+    /// allowlist and the image collection settings
+    fn validate_image_policies(&self) -> Result<()> {
+        for pattern in &self.allowed_images {
+            glob_pattern("executor.docker.allowed_images", pattern)?;
+        }
+        for pattern in &self.allowed_services {
+            glob_pattern("executor.docker.allowed_services", pattern)?;
+        }
+        for (helper, registries) in &self.allowed_docker_credential_helpers {
+            if !super::credential_helper::valid_name(helper) {
+                anyhow::bail!(
+                    "executor.docker.allowed_docker_credential_helpers: {:?} must be a helper name such as \"ecr-login\" (for docker-credential-ecr-login)",
+                    helper
+                );
+            }
+            if registries.is_empty() {
+                anyhow::bail!(
+                    "executor.docker.allowed_docker_credential_helpers: {} needs registry patterns, e.g. [\"*.dkr.ecr.*.amazonaws.com\"]",
+                    helper
+                );
+            }
+            for pattern in registries {
+                glob_pattern("executor.docker.allowed_docker_credential_helpers", pattern)?;
+            }
+        }
+        self.image_max_size_bytes()?;
+        Ok(())
+    }
+
+    /// `image_max_size` in bytes; `None` when unset or "0"
+    pub fn image_max_size_bytes(&self) -> Result<Option<u64>> {
+        optional_size(
+            "executor.docker.image_max_size",
+            self.image_max_size.as_deref(),
+        )
+    }
+
+    /// Host devices of job containers (validated by `validate`)
+    pub fn device_mappings(&self) -> Vec<super::docker_api::DeviceMapping> {
+        self.devices
+            .iter()
+            .filter_map(|entry| device_mapping(entry).ok())
+            .collect()
+    }
+
+    /// The GPU request of job containers (validated by `validate`)
+    pub fn gpu_requests(&self) -> Vec<super::docker_api::DeviceRequest> {
+        self.gpus
+            .as_deref()
+            .filter(|gpus| !gpus.trim().is_empty())
+            .and_then(|gpus| gpu_request(gpus).ok())
+            .into_iter()
+            .collect()
+    }
+
+    /// Resource limits of job containers (validated by `validate`)
+    pub fn ulimits(&self) -> Vec<super::docker_api::Ulimit> {
+        self.ulimit
+            .iter()
+            .filter_map(|(name, value)| ulimit(name, value).ok())
+            .collect()
+    }
+
+    /// `extra_hosts` as dockerd takes them (validated by `validate`)
+    pub fn extra_host_entries(&self) -> Vec<String> {
+        self.extra_hosts
+            .iter()
+            .filter_map(|entry| extra_host(entry).ok())
+            .collect()
     }
 }
 
@@ -509,6 +985,22 @@ impl Default for DockerConfig {
             tmpfs: std::collections::BTreeMap::new(),
             storage_opt: std::collections::BTreeMap::new(),
             builds_dir: None,
+            extra_hosts: Vec::new(),
+            dns: Vec::new(),
+            dns_search: Vec::new(),
+            cap_add: Vec::new(),
+            cap_drop: Vec::new(),
+            security_opt: Vec::new(),
+            devices: Vec::new(),
+            gpus: None,
+            sysctls: std::collections::BTreeMap::new(),
+            ulimit: std::collections::BTreeMap::new(),
+            runtime: None,
+            allowed_images: Vec::new(),
+            allowed_services: Vec::new(),
+            allowed_docker_credential_helpers: std::collections::BTreeMap::new(),
+            image_max_age_days: None,
+            image_max_size: None,
         }
     }
 }
@@ -926,6 +1418,208 @@ mod tests {
         }
         let known = RunnerConfig::parse("runner_token = \"t\"\ncache_max_size = \"1g\"").unwrap();
         assert!(unknown_keys("cache_max_size = \"1g\"", &known).is_empty());
+    }
+
+    fn docker_config(lines: &str) -> Result<RunnerConfig> {
+        let config = RunnerConfig::parse(&format!(
+            "runner_token = \"t\"\n[executor.docker]\n{}",
+            lines
+        ))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn parses_the_container_options() {
+        let config = docker_config(
+            "extra_hosts = [\"gitlab.corp:10.0.0.5\", \"gw=host-gateway\", \"v6:[fe80::1]\"]\n\
+             dns = [\"10.0.0.53\", \"2001:db8::53\"]\n\
+             dns_search = [\"corp.local\"]\n\
+             cap_add = [\"SYS_PTRACE\", \"CAP_NET_ADMIN\"]\n\
+             cap_drop = [\"ALL\"]\n\
+             security_opt = [\"no-new-privileges\", \"seccomp=unconfined\", \"apparmor=docker-default\"]\n\
+             devices = [\"/dev/fuse\", \"/dev/sda:/dev/xvda:rw\"]\n\
+             gpus = \"all\"\n\
+             runtime = \"nvidia\"\n\
+             [executor.docker.sysctls]\n\"net.ipv4.ip_unprivileged_port_start\" = \"0\"\n\
+             [executor.docker.ulimit]\nnofile = \"1024:4096\"\nmemlock = \"-1\"\ncore = \"0\"\n",
+        )
+        .unwrap();
+        let docker = &config.executor.docker;
+        assert_eq!(
+            docker.extra_host_entries(),
+            ["gitlab.corp:10.0.0.5", "gw:host-gateway", "v6:fe80::1"]
+        );
+        assert_eq!(docker.device_mappings().len(), 2);
+        assert_eq!(docker.gpu_requests()[0].count, -1);
+        let limits = docker.ulimits();
+        assert_eq!(
+            (limits[0].name.as_str(), limits[0].soft, limits[0].hard),
+            ("core", 0, 0)
+        );
+        assert_eq!((limits[1].soft, limits[1].hard), (-1, -1));
+        assert_eq!((limits[2].soft, limits[2].hard), (1024, 4096));
+        assert_eq!(docker.runtime.as_deref(), Some("nvidia"));
+
+        // Unset: nothing
+        let defaults = docker_config("").unwrap().executor.docker;
+        assert!(defaults.extra_host_entries().is_empty() && defaults.gpu_requests().is_empty());
+        assert!(defaults.ulimits().is_empty() && defaults.device_mappings().is_empty());
+    }
+
+    #[test]
+    fn rejects_unusable_container_options() {
+        for bad in [
+            "extra_hosts = [\"gitlab.corp\"]",
+            "extra_hosts = [\"gitlab.corp:not-an-ip\"]",
+            "extra_hosts = [\":10.0.0.5\"]",
+            "extra_hosts = [\"bad host:10.0.0.5\"]",
+            "dns = [\"dns.corp\"]",
+            "dns_search = [\"a b\"]",
+            "dns_search = [\"\"]",
+            "cap_add = [\"NET-RAW\"]",
+            "cap_drop = [\"\"]",
+            "security_opt = [\"\"]",
+            "security_opt = [\"seccomp=/nonexistent/profile.json\"]",
+            "devices = [\"dev/fuse\"]",
+            "devices = [\"/dev/fuse:fuse\"]",
+            "devices = [\"/dev/fuse:/dev/fuse:rwx\"]",
+            "devices = [\"/dev/fuse:/dev/fuse:rw:x\"]",
+            "gpus = \"none\"",
+            "gpus = \"0\"",
+            "gpus = \"device=0,1\"",
+            "gpus = \"count=1,count=2\"",
+            "gpus = \"color=red\"",
+            "gpus = \"\\\"device=0\"",
+            "runtime = \"\"",
+            "runtime = \"nvidia runc\"",
+            "[executor.docker.sysctls]\n\"\" = \"1\"",
+            "[executor.docker.sysctls]\n\"a=b\" = \"1\"",
+            "[executor.docker.ulimit]\nfiles = \"1\"",
+            "[executor.docker.ulimit]\nnofile = \"a\"",
+            "[executor.docker.ulimit]\nnofile = \"4096:1024\"",
+            "[executor.docker.ulimit]\nnofile = \"-1:1024\"",
+            "[executor.docker.ulimit]\nnofile = \"-2\"",
+        ] {
+            assert!(docker_config(bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn gpu_requests_follow_docker_run_gpus() {
+        let all = gpu_request("all").unwrap();
+        assert_eq!((all.count, all.device_ids.clone()), (-1, None));
+        assert_eq!(all.capabilities, vec![vec!["gpu".to_string()]]);
+        assert_eq!(gpu_request("3").unwrap().count, 3);
+        assert_eq!(gpu_request("count=all").unwrap().count, -1);
+        let ids = gpu_request("\"device=0,GPU-3a23c669\"").unwrap();
+        assert_eq!(
+            ids.device_ids,
+            Some(vec!["0".to_string(), "GPU-3a23c669".to_string()])
+        );
+        assert_eq!(ids.count, 0);
+        // Only a driver: one device
+        let driver = gpu_request("driver=nvidia").unwrap();
+        assert_eq!((driver.count, driver.driver.as_str()), (1, "nvidia"));
+        let options = gpu_request("1,\"options=a=b,c=d\"").unwrap();
+        assert_eq!(options.options.get("a").map(String::as_str), Some("b"));
+        assert_eq!(options.options.get("c").map(String::as_str), Some("d"));
+        let caps = gpu_request("1,\"capabilities=compute,utility\"").unwrap();
+        assert_eq!(
+            caps.capabilities,
+            vec![vec![
+                "compute".to_string(),
+                "utility".to_string(),
+                "gpu".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn seccomp_profiles_are_sent_as_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("seccomp.json");
+        std::fs::write(&profile, "{\n  \"defaultAction\": \"SCMP_ACT_ALLOW\"\n}\n").unwrap();
+        let option = format!("seccomp={}", profile.display());
+
+        assert_eq!(
+            security_opt(&option).unwrap(),
+            "seccomp={\"defaultAction\":\"SCMP_ACT_ALLOW\"}"
+        );
+        for kept in [
+            "seccomp=unconfined",
+            "no-new-privileges",
+            "seccomp={\"a\":1}",
+        ] {
+            assert_eq!(security_opt(kept).unwrap(), kept);
+        }
+        std::fs::write(&profile, "not json").unwrap();
+        assert!(security_opt(&option).is_err());
+        assert!(docker_config(&format!("security_opt = [{:?}]", option)).is_err());
+    }
+
+    #[test]
+    fn image_patterns_and_collection_settings_are_validated() {
+        let config = docker_config(
+            "allowed_images = [\"ruby:*\", \"registry.corp/**\"]\n\
+             allowed_services = [\"postgres:*\"]\n\
+             image_max_age_days = 14\n\
+             image_max_size = \"50g\"\n\
+             [executor.docker.allowed_docker_credential_helpers]\n\
+             ecr-login = [\"*.dkr.ecr.*.amazonaws.com\"]\n",
+        )
+        .unwrap();
+        let docker = &config.executor.docker;
+        assert_eq!(docker.image_max_age_days, Some(14));
+        assert_eq!(docker.image_max_size_bytes().unwrap(), Some(50 << 30));
+        assert_eq!(docker.allowed_docker_credential_helpers.len(), 1);
+        assert_eq!(
+            docker_config("image_max_size = \"0\"")
+                .unwrap()
+                .executor
+                .docker
+                .image_max_size_bytes()
+                .unwrap(),
+            None
+        );
+
+        for bad in [
+            "allowed_images = [\"\"]",
+            "allowed_images = [\"registry.corp/**x\"]",
+            "allowed_services = [\"[postgres\"]",
+            "image_max_size = \"lots\"",
+            "image_max_size = \"-1\"",
+            "image_max_age_days = -1",
+            "[executor.docker.allowed_docker_credential_helpers]\n\"../sh\" = [\"*\"]",
+            "[executor.docker.allowed_docker_credential_helpers]\necr-login = []",
+            "[executor.docker.allowed_docker_credential_helpers]\necr-login = [\"**x\"]",
+        ] {
+            assert!(docker_config(bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn globs_follow_gitlab_runners_doublestar_rules() {
+        let patterns = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let ruby = patterns(&["ruby:*"]);
+        assert!(glob_matches(&ruby, "ruby:3.3-alpine"));
+        assert!(!glob_matches(&ruby, "ruby"));
+        assert!(!glob_matches(&ruby, "ruby:3/evil"));
+        let registry = patterns(&["registry.corp/**"]);
+        assert!(glob_matches(&registry, "registry.corp/app:1"));
+        assert!(glob_matches(&registry, "registry.corp/group/sub/app:1"));
+        assert!(!glob_matches(&registry, "registry.corp.evil/app:1"));
+        let nested = patterns(&["registry.corp/**/ci-*:*"]);
+        assert!(glob_matches(&nested, "registry.corp/ci-tools:1"));
+        assert!(glob_matches(&nested, "registry.corp/a/b/ci-tools:1"));
+        assert!(!glob_matches(&nested, "registry.corp/a/tools:1"));
+        let one = patterns(&["node:2?"]);
+        assert!(glob_matches(&one, "node:22") && !glob_matches(&one, "node:222"));
+        assert!(glob_matches(
+            &patterns(&["*.dkr.ecr.*.amazonaws.com"]),
+            "1.dkr.ecr.eu-west-1.amazonaws.com"
+        ));
+        assert!(!glob_matches(&patterns(&["[bad"]), "[bad"));
     }
 
     #[test]

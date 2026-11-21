@@ -301,10 +301,26 @@ instead of quietly using the default socket.
 | `cpu_shares` | – | Relative CPU weight of job and service containers (2 to 262144; Docker's default is 1024). Unlike `cpus` it caps nothing: a container may use idle CPU, it only gets a smaller share while the CPUs are busy |
 | `storage_opt` | `{}` | Storage driver options of job and service containers, e.g. `size = "20G"` (overlay2 needs xfs mounted with `pquota` for `size`; dockerd rejects the container otherwise) |
 | `tmpfs` | `{}` | tmpfs mounts of job containers (not services): container path → mount options, e.g. `"/tmp" = "rw,noexec,size=1g"`. Paths at or below `/builds` are rejected: they would hide the workspace |
-| `auth_config_file` | `~/.docker/config.json` of the service user | Docker client config whose `auths` are used to pull private images |
+| `auth_config_file` | `~/.docker/config.json` of the service user | Docker client config whose logins (`auths`, `credsStore`, `credHelpers`) are used to pull private images |
+| `allowed_docker_credential_helpers` | `{}` | Credential helpers a job's `DOCKER_AUTH_CONFIG` may run: helper → registry patterns (see [Private registries](#private-registries)) |
 | `insecure_registries` | `[]` | Registries (`host[:port]`) reached over HTTP or without certificate checks; docker:dind services get `--insecure-registry` for each |
 | `registry_ca` | `{}` | Registry → PEM CA file; mounted into docker:dind services as `/etc/docker/certs.d/<registry>/ca.crt` |
 | `services` | `[]` | Services started for every job (see below) |
+| `extra_hosts` | `[]` | `host:ip` entries of `/etc/hosts` in job, service and checkout containers; `host-gateway` is the Docker host |
+| `dns` | `[]` | DNS servers (IP addresses) of job, service and checkout containers |
+| `dns_search` | `[]` | DNS search domains of job, service and checkout containers |
+| `cap_add` | `[]` | Linux capabilities added to job containers, e.g. `["SYS_PTRACE"]` |
+| `cap_drop` | `[]` | Linux capabilities dropped from job containers, e.g. `["NET_RAW"]` |
+| `security_opt` | `[]` | Security options of job containers, e.g. `["no-new-privileges"]`; `seccomp=<file>` sends the file's JSON profile (read at start) |
+| `devices` | `[]` | Host devices of job containers: `/dev/host[:/dev/container[:rwm]]` |
+| `gpus` | – | GPUs of job containers, as `docker run --gpus`: `"all"`, a count, or e.g. `"\"device=0,1\""` (needs the NVIDIA container toolkit on the host) |
+| `sysctls` | `{}` | Kernel parameters of job containers, e.g. `"net.ipv4.ip_unprivileged_port_start" = "0"` |
+| `ulimit` | `{}` | Resource limits of job containers: name → `"soft:hard"` or one value for both, e.g. `nofile = "1024:4096"` (`-1`: unlimited) |
+| `runtime` | – | OCI runtime of job and service containers, e.g. `"nvidia"` (must be in dockerd's `runtimes`) |
+| `allowed_images` | `[]` | Glob patterns of the images jobs may name in `image:`; empty: any (see [Allowed images](#allowed-images-and-services)) |
+| `allowed_services` | `[]` | Glob patterns of the images jobs may name in `services:`; empty: any |
+| `image_max_age_days` | – | Images no container uses and no job used for this many days are removed (0: every unused image); see [Image cleanup](#image-cleanup) |
+| `image_max_size` | – | Total size of the unused images, e.g. `"50g"`; the least recently used are removed beyond it |
 
 `tmpfs` and `storage_opt` are tables:
 
@@ -321,6 +337,62 @@ bare path such as `"/cache"` becomes a Docker volume that keeps its content
 between the jobs of a project (one per project and concurrent slot), like
 gitlab-runner's cache volumes. The same volume is mounted in the job's
 services, so `"/certs/client"` shares Docker-in-Docker TLS certificates.
+
+### Container options
+
+The container options of gitlab-runner's `[runners.docker]` work the same
+way. As in gitlab-runner, services only get `extra_hosts`, `dns`,
+`dns_search` and `runtime`; capabilities, security options, devices, GPUs,
+sysctls and ulimits apply to the job container only (gitlab-runner's separate
+`services_*` variants are not supported). The container that checks out
+sources gets `extra_hosts`, `dns` and `dns_search`, so a GitLab that only
+`/etc/hosts` knows is reachable for the checkout too.
+
+```toml
+[executor.docker]
+extra_hosts = ["gitlab.corp.local:10.0.0.5"]
+dns = ["10.0.0.53"]
+dns_search = ["corp.local"]
+cap_drop = ["NET_RAW"]
+security_opt = ["no-new-privileges"]
+# GPU jobs (NVIDIA container toolkit on the host)
+# gpus = "all"
+# runtime = "nvidia"
+
+[executor.docker.sysctls]
+"net.ipv4.ip_unprivileged_port_start" = "0"
+
+[executor.docker.ulimit]
+nofile = "1024:4096"
+```
+
+Every value is checked when the runner starts (an IP for `dns`, `host:ip` for
+`extra_hosts`, known `ulimit` names, a readable JSON seccomp profile, ...).
+Whether the kernel or dockerd accepts a sysctl, a device or a runtime is only
+known when the job container is created: a wrong one fails each job with
+dockerd's error.
+
+### Allowed images and services
+
+With `allowed_images` or `allowed_services` set, a job whose `image:` or
+`services:` matches none of the patterns fails before anything is pulled,
+with the list of allowed patterns in its log (gitlab-runner's
+`allowed_images` and `allowed_services`):
+
+```toml
+[executor.docker]
+allowed_images = ["ruby:*", "registry.corp.local/**"]
+allowed_services = ["postgres:*", "redis:*"]
+```
+
+Patterns are globs as in gitlab-runner: `*` and `?` match within one path
+segment, `**` as a whole segment matches any number of segments
+(`registry.corp.local/**` allows every image of that registry), `[abc]`
+matches one character; `{a,b}` is not supported. The name is matched as the
+job wrote it, variables expanded and not normalized: `ruby:*` allows
+`ruby:3.3` but not `ruby` (no tag) or `docker.io/library/ruby:3.3`.
+`default_image` (for jobs without `image:`, or naming it) and the services in
+the runner's config are always allowed; `helper_image` is the runner's own.
 
 ### Services for every job
 
@@ -358,8 +430,47 @@ An image is pulled with the first login found, in gitlab-runner's order:
    (`/var/lib/turboci/.docker/config.json` for an installed runner);
 3. the credentials GitLab sends for its own container registry.
 
-Only `auths` entries are read; credential helpers (`credsStore`,
-`credHelpers`) are not run.
+Within one config, the login for a registry comes from, in the docker CLI's
+and gitlab-runner's order:
+
+1. `credHelpers["<registry>"]`, a credential helper for that registry;
+2. `credsStore`, the config's credential store, when it holds a login for the
+   registry (asked with `list`, then `get`);
+3. the static `auths` entry.
+
+A helper `<name>` is the program `docker-credential-<name>` on the runner's
+`PATH` (for an installed runner, the service's `PATH`), run on the runner's
+host as the runner's user with the docker-credential-helpers protocol
+(`get` with the registry on stdin). A `Username` of `<token>` makes the secret
+an identity token. A helper may take 30 seconds; secrets never reach a log.
+
+When a helper is missing, fails or times out, that config gives no login for
+the registry and the next one in the list above is tried (eventually an
+anonymous pull), as in gitlab-runner. The runner's log gets a warning with
+the helper's error output, and if the pull then fails, the job log shows the
+warning after the pull error. A helper with no login for the registry
+(`credentials not found`) also leaves it to the next config.
+
+Helpers of `auth_config_file` belong to the operator and always run. A job's
+`DOCKER_AUTH_CONFIG` (including one set in the runner's `environment`) may
+only run the helpers `allowed_docker_credential_helpers` lists for the
+registry, as gitlab-runner's setting of that name does: otherwise any project
+could have the runner host log in with the operator's credentials (a cloud
+role, a desktop keychain). Others are skipped with a warning, and the
+config's static `auths` still apply:
+
+```toml
+[executor.docker.allowed_docker_credential_helpers]
+ecr-login = ["*.dkr.ecr.*.amazonaws.com"]
+```
+
+With that, a job can pull from Amazon ECR with
+
+```json
+{"credHelpers": {"123456789012.dkr.ecr.eu-west-1.amazonaws.com": "ecr-login"}}
+```
+
+in `DOCKER_AUTH_CONFIG`, using the AWS credentials the runner's service has.
 
 A registry with an internal CA or without TLS:
 
@@ -404,6 +515,44 @@ runner hands them back to its own user after every job.
 !!! warning "The docker group is root-equivalent"
     The `turboci` user is in the `docker` group, which can start privileged
     containers. Treat the runner host accordingly.
+
+### Image cleanup
+
+Pulled images pile up on the Docker host. With `image_max_age_days` or
+`image_max_size` set, the housekeeping that runs at start and every hour
+removes images no container uses:
+
+```toml
+[executor.docker]
+image_max_age_days = 14
+image_max_size = "100g"
+```
+
+- `image_max_age_days`: images no job used for that many days go (0: every
+  unused image, at every sweep).
+- `image_max_size`: while the unused images take more than this, the least
+  recently used go. Sizes are those of `docker images`, so layers shared
+  between images count once per image and the space freed can be less.
+
+Kept are images any container uses (running or stopped), images a running
+job of this runner uses (also while it is pulling them), `helper_image`,
+`default_image` and the services of the runner's config. An image is removed
+by untagging its tags, never forced: dockerd keeps an image a container
+started using meanwhile, or one that is the parent of another image. Every
+sweep logs the removed images and the space freed.
+
+dockerd does not record when an image was last used, and its build time
+(`Created`) says nothing about it: a fresh pull of `postgres:16` may bring an
+image built months ago. The runner therefore counts an image's age from the
+last job of this runner that used it, or else from when the cleanup first saw
+it. That record lives in memory: after a restart every image starts again
+from zero, so a restart can delay a removal but never brings one forward.
+Images used the same time ago go in the order they were built.
+
+!!! warning
+    The cleanup covers every image on the Docker host, not only the ones the
+    runner pulled. Enable it on hosts whose Docker is dedicated to the
+    runner.
 
 ### Workspaces
 

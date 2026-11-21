@@ -127,6 +127,32 @@ helper_image = "alpine/git:latest"
 # still use idle CPU, it only gets less of it while the CPUs are busy
 # cpu_shares = 512
 
+# Container options as in gitlab-runner. Job, service and checkout containers:
+# extra_hosts = ["gitlab.corp.local:10.0.0.5"]
+# dns = ["10.0.0.53"]
+# dns_search = ["corp.local"]
+# Job containers only (gitlab-runner gives services none of these):
+# cap_add = ["SYS_PTRACE"]
+# cap_drop = ["NET_RAW"]
+# security_opt = ["no-new-privileges"]
+# devices = ["/dev/fuse"]
+# gpus = "all"
+# OCI runtime of job and service containers
+# runtime = "nvidia"
+# (sysctls and ulimit are tables, see the end of this file)
+
+# Glob patterns of the images jobs may use in image: and services: (empty:
+# any); default_image and the services below are always allowed
+# allowed_images = ["ruby:*", "registry.corp.local/**"]
+# allowed_services = ["postgres:*", "redis:*"]
+
+# Remove images no container uses, at start and every hour: those no job
+# used for this many days (0: all of them), then the least recently used
+# beyond a total size. Covers every image of the Docker host: only for a
+# Docker dedicated to the runner. Unset: off
+# image_max_age_days = 14
+# image_max_size = "100g"
+
 # Storage driver options of job and service containers; size needs overlay2
 # on xfs mounted with pquota
 # [executor.docker.storage_opt]
@@ -136,8 +162,9 @@ helper_image = "alpine/git:latest"
 # [executor.docker.tmpfs]
 # "/tmp" = "rw,noexec,size=1g"
 
-# Docker config.json whose "auths" logins are used to pull private images
-# (default: ~/.docker/config.json of the service user)
+# Docker config.json whose logins are used to pull private images: "auths",
+# and credential helpers ("credsStore", "credHelpers": docker-credential-<name>
+# on the runner's PATH). Default: ~/.docker/config.json of the service user
 # auth_config_file = "/var/lib/turboci/.docker/config.json"
 
 # Registries reached over HTTP or without certificate checks: docker:dind
@@ -156,3 +183,14 @@ helper_image = "alpine/git:latest"
 # /etc/docker/certs.d/<registry>/ca.crt
 # [executor.docker.registry_ca]
 # "harbor.corp.local" = "/etc/turboci-registry-ca/harbor.corp.local.pem"
+
+# Credential helpers a job's DOCKER_AUTH_CONFIG may run on this host, with the
+# registries they may be asked about (none by default)
+# [executor.docker.allowed_docker_credential_helpers]
+# ecr-login = ["*.dkr.ecr.*.amazonaws.com"]
+
+# Kernel parameters and resource limits of job containers
+# [executor.docker.sysctls]
+# "net.ipv4.ip_unprivileged_port_start" = "0"
+# [executor.docker.ulimit]
+# nofile = "1024:4096"

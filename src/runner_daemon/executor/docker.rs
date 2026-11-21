@@ -17,6 +17,8 @@ pub struct DockerExecutor {
     pulls: Arc<Flights<PullOutcome>>,
     /// Workspaces found to belong wholly to their owner when their last job ended
     clean_workspaces: Arc<CleanWorkspaces>,
+    /// Which images jobs use, for the image collection
+    images: Arc<ImageUsage>,
 }
 
 /// A workspace directory as found on disk: a workspace that was removed
@@ -83,6 +85,113 @@ impl CleanWorkspaces {
     fn take(&self, dir: &Path, stamp: WorkspaceStamp) -> bool {
         self.lock().remove(dir) == Some(stamp)
     }
+}
+
+/// When this runner's jobs last used each image and which images jobs are
+/// using right now, for `collect_images` (dockerd records neither)
+#[derive(Default)]
+struct ImageUsage {
+    /// Held by a job while it marks its images and by the collection around
+    /// each removal, so no job pulls or starts an image the collection has
+    /// just decided to remove
+    removal: tokio::sync::Mutex<()>,
+    state: std::sync::Mutex<UsageState>,
+}
+
+#[derive(Default)]
+struct UsageState {
+    /// Image (see `usage_key`) → when a job last used it
+    last_used: std::collections::HashMap<String, std::time::SystemTime>,
+    /// Image (see `usage_key`) → how many jobs use it now
+    held: std::collections::HashMap<String, usize>,
+    /// Image ID → when the collection first saw it
+    first_seen: std::collections::HashMap<String, std::time::SystemTime>,
+}
+
+impl ImageUsage {
+    fn state(&self) -> std::sync::MutexGuard<'_, UsageState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mark `images` as used by a job until the returned guard is dropped
+    async fn hold(self: &Arc<Self>, images: &[&str]) -> HeldImages {
+        let keys: Vec<String> = images.iter().map(|image| usage_key(image)).collect();
+        let _removal = self.removal.lock().await;
+        let now = std::time::SystemTime::now();
+        let mut state = self.state();
+        for key in &keys {
+            *state.held.entry(key.clone()).or_default() += 1;
+            state.last_used.insert(key.clone(), now);
+        }
+        HeldImages {
+            usage: Arc::clone(self),
+            keys,
+        }
+    }
+}
+
+/// Images a job uses; they count as used until it is dropped
+struct HeldImages {
+    usage: Arc<ImageUsage>,
+    keys: Vec<String>,
+}
+
+impl Drop for HeldImages {
+    fn drop(&mut self) {
+        let now = std::time::SystemTime::now();
+        let mut state = self.usage.state();
+        for key in &self.keys {
+            if let Some(count) = state.held.get_mut(key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state.held.remove(key);
+                }
+            }
+            state.last_used.insert(key.clone(), now);
+        }
+    }
+}
+
+/// An image reference as `GET /images/json` lists it: Docker Hub images
+/// without `docker.io/` and `library/`, and with the default tag
+fn usage_key(reference: &str) -> String {
+    let mut name = reference;
+    for prefix in ["docker.io/", "index.docker.io/"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            name = rest;
+            break;
+        }
+    }
+    if image::registry(name) == "docker.io" {
+        name = name.strip_prefix("library/").unwrap_or(name);
+    }
+    image::with_default_tag(name)
+}
+
+/// The real tags of a listed image (dockerd lists `<none>:<none>` for an
+/// untagged one, or nothing)
+fn image_tags(image: &docker_api::ImageSummary) -> Vec<String> {
+    image
+        .repo_tags
+        .iter()
+        .flatten()
+        .filter(|tag| !tag.starts_with("<none>"))
+        .cloned()
+        .collect()
+}
+
+/// A listed image's tags and digests as `usage_key` gives them
+fn image_references(image: &docker_api::ImageSummary) -> Vec<String> {
+    image
+        .repo_tags
+        .iter()
+        .flatten()
+        .chain(image.repo_digests.iter().flatten())
+        .filter(|reference| !reference.starts_with("<none>"))
+        .map(|reference| usage_key(reference))
+        .collect()
 }
 
 /// How a pull ended, as every job waiting for it sees it
@@ -736,6 +845,13 @@ impl DockerExecutor {
         let docker =
             Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
         config.validate()?;
+        let mut config = config;
+        // Seccomp profile files are read once, here
+        config.security_opt = config
+            .security_opt
+            .iter()
+            .map(|option| crate::runner_daemon::config::security_opt(option))
+            .collect::<Result<_>>()?;
 
         Ok(Self {
             docker: Arc::new(docker),
@@ -744,6 +860,7 @@ impl DockerExecutor {
             ca_pem: None,
             pulls: Arc::default(),
             clean_workspaces: Arc::default(),
+            images: Arc::default(),
         })
     }
 
@@ -824,6 +941,175 @@ impl DockerExecutor {
                 }
             }
         }
+    }
+
+    /// Remove the images of the Docker host that no container uses, past
+    /// `image_max_age_days` and, least recently used first, beyond
+    /// `image_max_size`. The helper and default images, the services of the
+    /// runner's config and the images of running jobs are kept; removals are
+    /// never forced, so dockerd keeps an image a container uses. An image's
+    /// last use is the last job of this runner that used it, or when the
+    /// collection first saw it: dockerd records no last use, and an image's
+    /// build time says nothing about it (a pull of `postgres:16` may bring
+    /// an image built months ago). Returns the names of the removed images.
+    pub async fn collect_images(&self) -> Vec<String> {
+        self.collect_images_where(|_| true).await
+    }
+
+    /// `collect_images` among the images `eligible` accepts
+    async fn collect_images_where(
+        &self,
+        eligible: impl Fn(&docker_api::ImageSummary) -> bool,
+    ) -> Vec<String> {
+        use crate::runner_daemon::housekeeping::{self, UnusedImage};
+
+        let max_age = self
+            .config
+            .image_max_age_days
+            .map(|days| Duration::from_secs(days.saturating_mul(24 * 60 * 60)));
+        let max_size = self.config.image_max_size_bytes().ok().flatten();
+        if max_age.is_none() && max_size.is_none() {
+            return Vec::new();
+        }
+        let started = std::time::SystemTime::now();
+        let images = match self.docker.list_images().await {
+            Ok(images) => images,
+            Err(e) => {
+                warn!("Image collection: cannot list the Docker images: {}", e);
+                return Vec::new();
+            }
+        };
+        // Without the containers any image may be in use: nothing is removed
+        let containers = match self
+            .docker
+            .list_containers(true, &std::collections::HashMap::new())
+            .await
+        {
+            Ok(containers) => containers,
+            Err(e) => {
+                warn!("Image collection: cannot list the containers: {}", e);
+                return Vec::new();
+            }
+        };
+        let in_use: std::collections::HashSet<String> = containers
+            .into_iter()
+            .filter_map(|container| container.image_id)
+            .collect();
+        let kept: std::collections::HashSet<String> =
+            [&self.config.helper_image, &self.config.default_image]
+                .into_iter()
+                .chain(self.config.services.iter().map(|service| &service.name))
+                .map(|image| usage_key(image))
+                .collect();
+
+        let mut unused = Vec::new();
+        {
+            let mut state = self.images.state();
+            state
+                .first_seen
+                .retain(|id, _| images.iter().any(|image| &image.id == id));
+            for image in images.iter().filter(|image| eligible(image)) {
+                let references = image_references(image);
+                let first_seen = *state.first_seen.entry(image.id.clone()).or_insert(started);
+                if in_use.contains(&image.id)
+                    || references.iter().any(|reference| {
+                        kept.contains(reference) || state.held.contains_key(reference)
+                    })
+                {
+                    continue;
+                }
+                let last_used = references
+                    .iter()
+                    .filter_map(|reference| state.last_used.get(reference).copied())
+                    .chain(std::iter::once(first_seen))
+                    .max()
+                    .unwrap_or(first_seen);
+                unused.push(UnusedImage {
+                    id: image.id.clone(),
+                    tags: image_tags(image),
+                    references,
+                    size: u64::try_from(image.size).unwrap_or(0),
+                    created: image.created,
+                    last_used,
+                });
+            }
+        }
+
+        let total: u64 = unused.iter().map(|image| image.size).sum();
+        let mut removed = Vec::new();
+        let mut freed = 0;
+        for image in housekeeping::images_to_remove(&unused, started, max_age, max_size) {
+            if self.remove_unused_image(image, started).await {
+                removed.push(image.name());
+                freed += image.size;
+            }
+        }
+        if !removed.is_empty() {
+            info!(
+                "🧹 Removed {} unused Docker images ({} of {} unused): {}",
+                removed.len(),
+                crate::runner_daemon::admission::human(freed),
+                crate::runner_daemon::admission::human(total),
+                removed.join(", ")
+            );
+        }
+        if let Some(max_size) = max_size {
+            if total - freed > max_size {
+                warn!(
+                    "Unused Docker images still take {}, above image_max_size {}",
+                    crate::runner_daemon::admission::human(total - freed),
+                    crate::runner_daemon::admission::human(max_size)
+                );
+            }
+        }
+        removed
+    }
+
+    /// Remove `image`, picked by the collection that started at `started`,
+    /// unless a job started using it since; true when it is gone
+    async fn remove_unused_image(
+        &self,
+        image: &crate::runner_daemon::housekeeping::UnusedImage,
+        started: std::time::SystemTime,
+    ) -> bool {
+        // No job marks its images while an image is checked and removed
+        let _removal = self.images.removal.lock().await;
+        {
+            let state = self.images.state();
+            let used_since = image.references.iter().any(|reference| {
+                state.held.contains_key(reference)
+                    || state
+                        .last_used
+                        .get(reference)
+                        .is_some_and(|used| *used >= started)
+            });
+            if used_since {
+                return false;
+            }
+        }
+        // Untagging the last tag removes the image; an untagged one goes by ID
+        let targets = if image.tags.is_empty() {
+            vec![image.id.clone()]
+        } else {
+            image.tags.clone()
+        };
+        for target in &targets {
+            match self.docker.remove_image(target).await {
+                Ok(()) => {}
+                Err(e) if e.status_code() == Some(404) => {}
+                // In use by a container created meanwhile, or a parent of
+                // another image: dockerd keeps it
+                Err(e) if e.status_code() == Some(409) => {
+                    info!("Image collection: kept {}: {}", target, e);
+                    return false;
+                }
+                Err(e) => {
+                    warn!("Image collection: cannot remove {}: {}", target, e);
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// `daemon_warnings` for the Docker daemon this runner uses
@@ -963,6 +1249,13 @@ impl DockerExecutor {
             images.push(&helper);
         }
         images.extend(job_images.iter().skip(1));
+        self.check_allowed_images(job.image.as_ref().map(|_| image.as_str()), &service_images)
+            .map_err(pull_failure)?;
+        // Until the job ends, the image collection leaves its images alone
+        let _held = self
+            .images
+            .hold(&images.iter().map(|need| need.name).collect::<Vec<_>>())
+            .await;
         let pulls = self.plan_pulls(&images, trace).await?;
         // Pulled by the branch that needs them; an image both need is pulled
         // once (see `pull_shared`)
@@ -1322,7 +1615,7 @@ impl DockerExecutor {
             host_config: Some(HostConfig {
                 binds: Some(vec![format!("{}:/builds", job_dir.display())]),
                 network_mode: Some(self.config.network_mode.clone()),
-                ..Default::default()
+                ..self.name_resolution()
             }),
             ..Default::default()
         };
@@ -1357,16 +1650,43 @@ impl DockerExecutor {
             cpu_shares: self.config.cpu_shares,
             storage_opt: (!self.config.storage_opt.is_empty())
                 .then(|| self.config.storage_opt.clone().into_iter().collect()),
+            runtime: self.config.runtime.clone(),
+            ..self.name_resolution()
+        }
+    }
+
+    /// `extra_hosts`, `dns` and `dns_search`: job, service and checkout
+    /// containers need them alike (e.g. to reach a GitLab only /etc/hosts
+    /// knows)
+    fn name_resolution(&self) -> HostConfig {
+        let list = |values: Vec<String>| (!values.is_empty()).then_some(values);
+        HostConfig {
+            extra_hosts: list(self.config.extra_host_entries()),
+            dns: list(self.config.dns.clone()),
+            dns_search: list(self.config.dns_search.clone()),
             ..Default::default()
         }
     }
 
     /// Host settings of the job container: those it shares with services,
-    /// plus the workspace and the job-only tmpfs mounts
+    /// plus the workspace and the options gitlab-runner gives job containers
+    /// only (tmpfs, capabilities, security options, devices, GPUs, sysctls
+    /// and ulimits)
     fn job_host_config(&self, binds: Vec<String>, network: Option<&str>) -> HostConfig {
+        fn list<T>(values: Vec<T>) -> Option<Vec<T>> {
+            (!values.is_empty()).then_some(values)
+        }
+        let config = &self.config;
         HostConfig {
-            tmpfs: (!self.config.tmpfs.is_empty())
-                .then(|| self.config.tmpfs.clone().into_iter().collect()),
+            tmpfs: (!config.tmpfs.is_empty()).then(|| config.tmpfs.clone().into_iter().collect()),
+            cap_add: list(config.cap_add.clone()),
+            cap_drop: list(config.cap_drop.clone()),
+            security_opt: list(config.security_opt.clone()),
+            devices: list(config.device_mappings()),
+            device_requests: list(config.gpu_requests()),
+            sysctls: (!config.sysctls.is_empty())
+                .then(|| config.sysctls.clone().into_iter().collect()),
+            ulimits: list(config.ulimits()),
             ..self.host_config(binds, network)
         }
     }
@@ -1404,27 +1724,107 @@ impl DockerExecutor {
 
     /// Registry login for `image`, in gitlab-runner's order: the job's
     /// DOCKER_AUTH_CONFIG, the runner's Docker config file, then the
-    /// credentials GitLab sent (its container registry)
-    async fn registry_login(&self, image: &str, job: &Job) -> Option<(String, String)> {
-        if let Some(login) = variable_value(job, "DOCKER_AUTH_CONFIG")
-            .and_then(|config| image::docker_config_auth(config, image))
-        {
-            return Some(login);
+    /// credentials GitLab sent (its container registry). Each Docker config
+    /// may name credential helpers (see `credential_helper`); a job's only
+    /// those `allowed_docker_credential_helpers` lists. Also returns what
+    /// went wrong on the way (never a secret).
+    async fn registry_login(
+        &self,
+        image: &str,
+        job: &Job,
+    ) -> (Option<docker_api::DockerCredentials>, Vec<String>) {
+        use crate::runner_daemon::credential_helper::{self as helpers, ConfigSource};
+
+        let mut warnings = Vec::new();
+        if let Some(json) = variable_value(job, "DOCKER_AUTH_CONFIG") {
+            let source = ConfigSource {
+                name: "DOCKER_AUTH_CONFIG",
+                json,
+                allowed_helpers: Some(&self.config.allowed_docker_credential_helpers),
+            };
+            let login = helpers::login(&source, image, Default::default(), &mut warnings).await;
+            if login.is_some() {
+                return (login, warnings);
+            }
         }
         let file = self.config.auth_config_file.clone().or_else(|| {
             std::env::var("HOME")
                 .ok()
                 .map(|home| format!("{}/.docker/config.json", home))
         });
-        let config = match file {
-            Some(file) => tokio::fs::read_to_string(file).await.ok(),
-            None => None,
-        };
-        if let Some(login) = config.and_then(|config| image::docker_config_auth(&config, image)) {
-            return Some(login);
+        if let Some(file) = file {
+            if let Ok(json) = tokio::fs::read_to_string(&file).await {
+                // The operator's own config: its helpers always run
+                let source = ConfigSource {
+                    name: &file,
+                    json: &json,
+                    allowed_helpers: None,
+                };
+                let login = helpers::login(&source, image, Default::default(), &mut warnings).await;
+                if login.is_some() {
+                    return (login, warnings);
+                }
+            }
         }
-        image::credentials_for(image, &job.credentials)
-            .map(|c| (c.username.clone(), c.password.clone()))
+        let login = image::credentials_for(image, &job.credentials).map(|c| {
+            docker_api::DockerCredentials {
+                username: Some(c.username.clone()),
+                password: Some(c.password.clone()),
+                serveraddress: Some(image::registry(image).to_string()),
+                ..Default::default()
+            }
+        });
+        (login, warnings)
+    }
+
+    /// gitlab-runner's `allowed_images` and `allowed_services`: when patterns
+    /// are set, the job's own image (`None` when it uses `default_image`) and
+    /// its own services must match one of them; `default_image` and the
+    /// services of the runner's config are always allowed. Names are matched
+    /// as the job wrote them, variables expanded (`ruby:*` does not match
+    /// `docker.io/library/ruby:3` nor `ruby`).
+    fn check_allowed_images(
+        &self,
+        job_image: Option<&str>,
+        service_images: &[String],
+    ) -> std::result::Result<(), String> {
+        use crate::runner_daemon::config::glob_matches;
+
+        let disallowed = |image: &str, kind: &str, patterns: &[String]| {
+            format!(
+                "The {:?} image is not present on list of allowed {}:\n{}\nPlease check the runner's executor.docker.allowed_{} configuration",
+                image,
+                kind,
+                patterns
+                    .iter()
+                    .map(|pattern| format!("- {}", pattern))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                kind
+            )
+        };
+        let allowed_images = &self.config.allowed_images;
+        if let Some(image) = job_image {
+            if !allowed_images.is_empty()
+                && image != self.config.default_image
+                && !glob_matches(allowed_images, image)
+            {
+                return Err(disallowed(image, "images", allowed_images));
+            }
+        }
+        // Services of the runner's config come first (see `start_and_run`)
+        let (configured, own) =
+            service_images.split_at(self.config.services.len().min(service_images.len()));
+        let allowed_services = &self.config.allowed_services;
+        if allowed_services.is_empty() {
+            return Ok(());
+        }
+        match own.iter().find(|service| {
+            !configured.contains(service) && !glob_matches(allowed_services, service)
+        }) {
+            Some(service) => Err(disallowed(service, "services", allowed_services)),
+            None => Ok(()),
+        }
     }
 
     /// Which of `images` need a pull according to their pull policies (each
@@ -1581,16 +1981,19 @@ impl DockerExecutor {
 
     /// Pull `image` for `platform` from its registry with the job's login for it
     async fn pull(&self, image: &str, platform: Option<&str>, job: &Job) -> JobOutcome {
-        let credentials = self
-            .registry_login(image, job)
+        let (credentials, warnings) = self.registry_login(image, job).await;
+        for warning in &warnings {
+            warn!("Job {}: {}", job.id, warning);
+        }
+        // A pull that fails says why a login it may have needed was not used
+        self.pull_shared(image, platform, credentials)
             .await
-            .map(|(username, password)| docker_api::DockerCredentials {
-                username: Some(username),
-                password: Some(password),
-                serveraddress: Some(image::registry(image).to_string()),
-                ..Default::default()
-            });
-        self.pull_shared(image, platform, credentials).await
+            .map_err(|mut failure| {
+                for warning in warnings {
+                    failure.message.push_str(&format!("\nWARNING: {}", warning));
+                }
+                failure
+            })
     }
 
     /// Pull `image` for `platform` with `credentials`, or wait for the pull
@@ -2321,6 +2724,163 @@ mod tests {
             .host_config
             .and_then(|config| config.cpu_shares);
         assert_eq!(shares, Some(512));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_job_gets_the_container_options() {
+        let docker_executor = DockerExecutor::new(DockerConfig {
+            pull_policy: "if-not-present".to_string(),
+            extra_hosts: vec!["gitlab.turboci.test:10.1.2.3".to_string()],
+            dns: vec!["10.9.8.7".to_string()],
+            dns_search: vec!["corp.turboci.test".to_string()],
+            cap_add: vec!["SYS_PTRACE".to_string()],
+            cap_drop: vec!["NET_RAW".to_string()],
+            security_opt: vec!["no-new-privileges".to_string()],
+            devices: vec!["/dev/null:/dev/turboci-null".to_string()],
+            sysctls: std::collections::BTreeMap::from([(
+                "net.ipv4.ip_unprivileged_port_start".to_string(),
+                "0".to_string(),
+            )]),
+            ulimit: std::collections::BTreeMap::from([(
+                "nofile".to_string(),
+                "1024:2048".to_string(),
+            )]),
+            runtime: Some("runc".to_string()),
+            ..DockerConfig::default()
+        })
+        .unwrap();
+        docker_executor
+            .pull_if_missing("alpine:3.20")
+            .await
+            .unwrap();
+        let executor = ExecutorType::Docker(docker_executor);
+        let job_id = 913_000_000 + u64::from(std::process::id());
+        // Bits of CapEff: 13 is CAP_NET_RAW, 19 CAP_SYS_PTRACE
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "alpine:3.20"},
+            "steps": steps(
+                &[
+                    "grep gitlab.turboci.test /etc/hosts",
+                    "cat /etc/resolv.conf",
+                    "eff=$(awk '/^CapEff/ {print $2}' /proc/self/status)",
+                    "echo net_raw=$(( (0x$eff >> 13) & 1 )) sys_ptrace=$(( (0x$eff >> 19) & 1 ))",
+                    "grep NoNewPrivs /proc/self/status",
+                    "test -c /dev/turboci-null && echo device-present",
+                    "echo port_start=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)",
+                    "echo nofile=$(ulimit -n)/$(ulimit -Hn)",
+                ],
+                &[]
+            )
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+        executor.cleanup(&j, false).await;
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("10.1.2.3\tgitlab.turboci.test"), "{}", log);
+        assert!(log.contains("nameserver 10.9.8.7"), "{}", log);
+        assert!(log.contains("search corp.turboci.test"), "{}", log);
+        assert!(log.contains("net_raw=0 sys_ptrace=1"), "{}", log);
+        assert!(log.contains("NoNewPrivs:\t1"), "{}", log);
+        assert!(log.contains("device-present"), "{}", log);
+        assert!(log.contains("port_start=0"), "{}", log);
+        assert!(log.contains("nofile=1024/2048"), "{}", log);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_image_collection_removes_only_unused_images() {
+        let executor = DockerExecutor::new(DockerConfig {
+            default_image: "alpine:3.20".to_string(),
+            image_max_age_days: Some(0),
+            ..DockerConfig::default()
+        })
+        .unwrap()
+        .with_owner(&format!("image-gc-test-{}", std::process::id()));
+        executor.pull_if_missing("alpine:3.20").await.unwrap();
+        let docker = &executor.docker;
+        let repo = format!("turboci-gc-test-{}", std::process::id());
+        // Three images of their own: committed containers with different commands
+        let mut ids = Vec::new();
+        for tag in ["old", "inuse", "held"] {
+            let container = executor
+                .create_named(
+                    &format!("{}-{}", repo, tag),
+                    ContainerCreateBody {
+                        image: Some("alpine:3.20".to_string()),
+                        cmd: Some(vec!["echo".to_string(), tag.to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            ids.push(
+                docker
+                    .commit_container(&container, &repo, tag)
+                    .await
+                    .unwrap(),
+            );
+            executor.force_remove(&container).await.unwrap();
+        }
+        // A (stopped) container uses one, a running job another
+        let user = executor
+            .create_named(
+                &format!("{}-user", repo),
+                ContainerCreateBody {
+                    image: Some(format!("{}:inuse", repo)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let held = executor.images.hold(&[&format!("{}:held", repo)]).await;
+        let ours = |image: &docker_api::ImageSummary| {
+            image_tags(image)
+                .iter()
+                .any(|tag| tag.starts_with(&format!("{}:", repo)))
+        };
+
+        let removed = executor.collect_images_where(ours).await;
+        let present = |tag: &str| {
+            let name = format!("{}:{}", repo, tag);
+            async move { docker.inspect_image(&name).await.is_ok() }
+        };
+        let (old, inuse, kept) = (
+            present("old").await,
+            present("inuse").await,
+            present("held").await,
+        );
+        let alpine = docker.inspect_image("alpine:3.20").await.is_ok();
+        // Once the job ended, its image is collected too
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let later = executor.collect_images_where(ours).await;
+        let held_gone = !present("held").await;
+        executor.force_remove(&user).await.unwrap();
+        for tag in ["inuse", "held"] {
+            let _ = docker.remove_image(&format!("{}:{}", repo, tag)).await;
+        }
+
+        assert_eq!(removed, [format!("{}:old", repo)]);
+        assert!(
+            !old && inuse && kept && alpine,
+            "{} {} {} {}",
+            old,
+            inuse,
+            kept,
+            alpine
+        );
+        assert_eq!(later, [format!("{}:held", repo)]);
+        assert!(held_gone);
+        // No limits configured: nothing is collected
+        let off = DockerExecutor::new(DockerConfig::default()).unwrap();
+        assert!(off.collect_images().await.is_empty());
     }
 
     #[tokio::test]
@@ -3888,6 +4448,7 @@ mod tests {
             owner: "turboci".to_string(),
             pulls: Arc::default(),
             clean_workspaces: Arc::default(),
+            images: Arc::default(),
         }
     }
 
@@ -4300,6 +4861,238 @@ mod tests {
         let unset = offline(DockerConfig::default());
         let job = unset.job_host_config(Vec::new(), None);
         assert!(job.cpu_shares.is_none() && job.tmpfs.is_none() && job.storage_opt.is_none());
+    }
+
+    #[test]
+    fn container_options_reach_jobs_and_services_as_in_gitlab_runner() {
+        let executor = offline(DockerConfig {
+            extra_hosts: vec![
+                "gitlab.corp=10.0.0.5".to_string(),
+                "v6.corp:::1".to_string(),
+            ],
+            dns: vec!["10.0.0.53".to_string()],
+            dns_search: vec!["corp.local".to_string()],
+            cap_add: vec!["SYS_PTRACE".to_string()],
+            cap_drop: vec!["NET_RAW".to_string()],
+            security_opt: vec!["no-new-privileges".to_string()],
+            devices: vec!["/dev/fuse".to_string(), "/dev/sda:/dev/xvda:r".to_string()],
+            gpus: Some("all".to_string()),
+            sysctls: std::collections::BTreeMap::from([(
+                "net.ipv4.ip_unprivileged_port_start".to_string(),
+                "0".to_string(),
+            )]),
+            ulimit: std::collections::BTreeMap::from([
+                ("nofile".to_string(), "1024:4096".to_string()),
+                ("core".to_string(), "0".to_string()),
+            ]),
+            runtime: Some("nvidia".to_string()),
+            ..DockerConfig::default()
+        });
+
+        let job = executor.job_host_config(Vec::new(), None);
+        let service = executor.host_config(Vec::new(), Some("net"));
+        let helper = executor.name_resolution();
+
+        // Name resolution and the runtime: jobs and services alike
+        for config in [&job, &service] {
+            assert_eq!(
+                config.extra_hosts,
+                Some(vec![
+                    "gitlab.corp:10.0.0.5".to_string(),
+                    "v6.corp:::1".to_string()
+                ])
+            );
+            assert_eq!(config.dns, Some(vec!["10.0.0.53".to_string()]));
+            assert_eq!(config.dns_search, Some(vec!["corp.local".to_string()]));
+            assert_eq!(config.runtime.as_deref(), Some("nvidia"));
+        }
+        // The checkout gets name resolution only
+        assert_eq!(helper.extra_hosts, job.extra_hosts);
+        assert_eq!(helper.dns, job.dns);
+        assert!(helper.runtime.is_none() && helper.cap_drop.is_none());
+        // The rest: jobs only
+        assert!(service.cap_add.is_none() && service.cap_drop.is_none());
+        assert!(service.security_opt.is_none() && service.devices.is_none());
+        assert!(service.device_requests.is_none() && service.sysctls.is_none());
+        assert!(service.ulimits.is_none());
+
+        let body = serde_json::to_value(&job).unwrap();
+        assert_eq!(body["CapAdd"], serde_json::json!(["SYS_PTRACE"]));
+        assert_eq!(body["CapDrop"], serde_json::json!(["NET_RAW"]));
+        assert_eq!(
+            body["SecurityOpt"],
+            serde_json::json!(["no-new-privileges"])
+        );
+        assert_eq!(
+            body["Devices"],
+            serde_json::json!([
+                {"PathOnHost": "/dev/fuse", "PathInContainer": "/dev/fuse", "CgroupPermissions": "rwm"},
+                {"PathOnHost": "/dev/sda", "PathInContainer": "/dev/xvda", "CgroupPermissions": "r"}
+            ])
+        );
+        assert_eq!(
+            body["DeviceRequests"],
+            serde_json::json!([
+                {"Driver": "", "Count": -1, "Capabilities": [["gpu"]], "Options": {}}
+            ])
+        );
+        assert_eq!(
+            body["Sysctls"],
+            serde_json::json!({"net.ipv4.ip_unprivileged_port_start": "0"})
+        );
+        assert_eq!(
+            body["Ulimits"],
+            serde_json::json!([
+                {"Name": "core", "Soft": 0, "Hard": 0},
+                {"Name": "nofile", "Soft": 1024, "Hard": 4096}
+            ])
+        );
+        assert_eq!(body["Runtime"], "nvidia");
+
+        // Unset: nothing is sent, dockerd's defaults apply
+        let body = serde_json::to_value(
+            offline(DockerConfig::default()).job_host_config(Vec::new(), None),
+        )
+        .unwrap();
+        for key in [
+            "ExtraHosts",
+            "Dns",
+            "DnsSearch",
+            "CapAdd",
+            "CapDrop",
+            "SecurityOpt",
+            "Devices",
+            "DeviceRequests",
+            "Sysctls",
+            "Ulimits",
+            "Runtime",
+        ] {
+            assert!(body.get(key).is_none(), "{} in {}", key, body);
+        }
+    }
+
+    #[test]
+    fn gpu_requests_of_device_ids_and_counts() {
+        let request = |gpus: &str| {
+            offline(DockerConfig {
+                gpus: Some(gpus.to_string()),
+                ..DockerConfig::default()
+            })
+            .job_host_config(Vec::new(), None)
+            .device_requests
+            .unwrap()
+        };
+        let ids = &request("\"device=0,2\"")[0];
+        assert_eq!(ids.device_ids, Some(vec!["0".to_string(), "2".to_string()]));
+        assert_eq!(ids.count, 0);
+        assert_eq!(ids.capabilities, vec![vec!["gpu".to_string()]]);
+        assert_eq!(request("2")[0].count, 2);
+        let utility = &request("count=1,capabilities=utility,driver=nvidia")[0];
+        assert_eq!(
+            utility.capabilities,
+            vec![vec!["utility".to_string(), "gpu".to_string()]]
+        );
+        assert_eq!(utility.driver, "nvidia");
+        assert!(offline(DockerConfig {
+            gpus: Some(" ".to_string()),
+            ..DockerConfig::default()
+        })
+        .job_host_config(Vec::new(), None)
+        .device_requests
+        .is_none());
+    }
+
+    #[test]
+    fn allowed_images_and_services_follow_gitlab_runner() {
+        let executor = offline(DockerConfig {
+            default_image: "alpine:3.20".to_string(),
+            allowed_images: vec!["ruby:*".to_string(), "registry.corp/**".to_string()],
+            allowed_services: vec!["postgres:*".to_string()],
+            services: vec![crate::runner_daemon::config::ServiceConfig {
+                name: "docker:27-dind".to_string(),
+                ..Default::default()
+            }],
+            ..DockerConfig::default()
+        });
+        let check = |image: Option<&str>, services: &[&str]| {
+            let services: Vec<String> = services.iter().map(|s| s.to_string()).collect();
+            executor.check_allowed_images(image, &services)
+        };
+
+        assert!(check(Some("ruby:3.3"), &["docker:27-dind"]).is_ok());
+        assert!(check(Some("registry.corp/group/sub/app:1"), &["docker:27-dind"]).is_ok());
+        // The default image, chosen by the job or not
+        assert!(check(Some("alpine:3.20"), &["docker:27-dind"]).is_ok());
+        assert!(check(None, &["docker:27-dind", "postgres:16"]).is_ok());
+
+        let error = check(Some("python:3.12"), &["docker:27-dind"]).unwrap_err();
+        assert!(error.contains("\"python:3.12\" image is not present on list of allowed images"));
+        assert!(error.contains("- ruby:*\n- registry.corp/**"), "{}", error);
+        assert!(
+            error.contains("executor.docker.allowed_images"),
+            "{}",
+            error
+        );
+        // `*` stops at `/`, names are not normalized, and a tag is needed
+        assert!(check(Some("ruby/evil:1"), &["docker:27-dind"]).is_err());
+        assert!(check(Some("docker.io/library/ruby:3"), &["docker:27-dind"]).is_err());
+        assert!(check(Some("ruby"), &["docker:27-dind"]).is_err());
+
+        let error = check(None, &["docker:27-dind", "mysql:8"]).unwrap_err();
+        assert!(error.contains("\"mysql:8\" image is not present on list of allowed services"));
+        // A job naming the configured service again is fine
+        assert!(check(None, &["docker:27-dind", "docker:27-dind"]).is_ok());
+
+        // No patterns: anything goes
+        let open = offline(DockerConfig::default());
+        assert!(open
+            .check_allowed_images(Some("anything/at:all"), &["any:service".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn usage_keys_match_how_dockerd_lists_images() {
+        assert_eq!(usage_key("alpine"), "alpine:latest");
+        assert_eq!(usage_key("docker.io/library/alpine:3.20"), "alpine:3.20");
+        assert_eq!(usage_key("index.docker.io/library/alpine"), "alpine:latest");
+        assert_eq!(usage_key("library/alpine:3"), "alpine:3");
+        assert_eq!(usage_key("docker.io/myorg/app:1"), "myorg/app:1");
+        assert_eq!(
+            usage_key("registry.corp:5000/app"),
+            "registry.corp:5000/app:latest"
+        );
+        assert_eq!(usage_key("alpine@sha256:abc"), "alpine@sha256:abc");
+
+        let listed = docker_api::ImageSummary {
+            id: "sha256:1".to_string(),
+            repo_tags: Some(vec!["alpine:3.20".to_string(), "<none>:<none>".to_string()]),
+            repo_digests: Some(vec!["alpine@sha256:abc".to_string()]),
+            created: 0,
+            size: 0,
+        };
+        assert_eq!(image_tags(&listed), ["alpine:3.20"]);
+        assert_eq!(
+            image_references(&listed),
+            ["alpine:3.20", "alpine@sha256:abc"]
+        );
+    }
+
+    #[tokio::test]
+    async fn held_images_count_as_used_until_the_job_ends() {
+        let usage = Arc::new(ImageUsage::default());
+        let before = std::time::SystemTime::now();
+
+        let first = usage.hold(&["alpine:3.20", "postgres"]).await;
+        let second = usage.hold(&["docker.io/library/alpine:3.20"]).await;
+        assert_eq!(usage.state().held["alpine:3.20"], 2);
+        assert_eq!(usage.state().held["postgres:latest"], 1);
+        drop(first);
+        assert_eq!(usage.state().held["alpine:3.20"], 1);
+        assert!(!usage.state().held.contains_key("postgres:latest"));
+        drop(second);
+        let state = usage.state();
+        assert!(state.held.is_empty());
+        assert!(state.last_used["alpine:3.20"] >= before);
     }
 
     #[test]

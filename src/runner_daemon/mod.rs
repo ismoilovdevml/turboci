@@ -18,6 +18,7 @@ pub mod artifacts;
 pub mod cancel;
 pub mod capacity;
 pub mod config;
+pub mod credential_helper;
 pub mod docker_api;
 pub mod executor;
 pub mod git;
@@ -961,7 +962,8 @@ impl RunnerDaemon {
 
     /// Remove workspaces no job used for `workspace_max_age_days`, the least
     /// recently used beyond `workspace_max_size`, and the cache archives of
-    /// every project past `cache_max_age_days` or `cache_max_size`.
+    /// every project past `cache_max_age_days` or `cache_max_size`, and
+    /// unused Docker images (`image_max_age_days`, `image_max_size`).
     /// Workspaces in use are never touched.
     async fn sweep(&self) {
         let root = self.executor.builds_root();
@@ -1030,6 +1032,7 @@ impl RunnerDaemon {
         }
         let _ = tokio::task::spawn_blocking(move || housekeeping::remove_detached(&root)).await;
         self.cache.evict_all().await;
+        self.executor.collect_images().await;
     }
 
     /// Keep-alive for the job: learns about remote cancellation even when the job

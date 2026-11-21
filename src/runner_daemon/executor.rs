@@ -186,6 +186,14 @@ impl ExecutorType {
         }
     }
 
+    /// Remove unused Docker images past `image_max_age_days` or beyond
+    /// `image_max_size` (nothing when neither is set)
+    pub async fn collect_images(&self) {
+        if let ExecutorType::Docker(executor) = self {
+            executor.collect_images().await;
+        }
+    }
+
     /// Mark the job's workspace as used now (see `evict_workspaces`) and
     /// remove what an earlier job left of its file variables
     pub async fn prepare(&self, job: &Job) -> Result<()> {
