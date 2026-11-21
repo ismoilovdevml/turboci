@@ -27,6 +27,11 @@ const CACHE_ZSTD_LEVEL: i64 = 1;
 /// zstd level of a cache archive (format 2, tar.zst)
 const CACHE_TAR_ZSTD_LEVEL: i32 = 1;
 
+/// Cache archives of more bytes than this are compressed by up to
+/// `CACHE_ZSTD_WORKERS` threads besides the one writing the tar
+const CACHE_ZSTD_MT_ABOVE: u64 = 64 << 20;
+const CACHE_ZSTD_WORKERS: u32 = 4;
+
 /// Largest zstd window (as a power of two) a cache archive may ask for:
 /// 16 MiB. It bounds what a crafted archive makes the runner allocate; the
 /// levels used write with 2 MiB at most.
@@ -1157,10 +1162,48 @@ fn build_zip<W: Write + Seek>(
 }
 
 /// Write `entries` (files, symlinks, directories) as a tar into one zstd
-/// stream on `out`, and finish both. Returns the writer.
+/// stream on `out`, and finish both, with several compression threads for
+/// large inputs. Returns the writer.
 fn build_tar_zst<W: Write>(out: W, root: &Path, entries: &[PathBuf]) -> Result<W> {
+    build_tar_zst_with(out, root, entries, zstd_workers(entries))
+}
+
+/// The zstd workers for archiving `entries`: up to `CACHE_ZSTD_WORKERS`
+/// (one per CPU) when their files hold more than `CACHE_ZSTD_MT_ABOVE`
+/// bytes, else none (the calling thread compresses). zstd writes the same
+/// bytes for any number of workers from one up (not for none), so hosts
+/// with different CPU counts still write the same archive for the same
+/// files, which the upload's hash check relies on.
+fn zstd_workers(entries: &[PathBuf]) -> u32 {
+    let mut total = 0u64;
+    for path in entries {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.is_file() {
+                total += meta.len();
+                if total > CACHE_ZSTD_MT_ABOVE {
+                    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+                    return u32::try_from(cpus)
+                        .unwrap_or(CACHE_ZSTD_WORKERS)
+                        .clamp(1, CACHE_ZSTD_WORKERS);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// `build_tar_zst` with `workers` zstd threads (0: none)
+fn build_tar_zst_with<W: Write>(
+    out: W,
+    root: &Path,
+    entries: &[PathBuf],
+    workers: u32,
+) -> Result<W> {
     let mut encoder = zstd::stream::write::Encoder::new(out, CACHE_TAR_ZSTD_LEVEL)?;
     encoder.include_checksum(true)?;
+    if workers > 0 {
+        encoder.multithread(workers)?;
+    }
     let mut tar = tar::Builder::new(encoder);
     for path in entries {
         add_path_to_tar(&mut tar, path, root)?;
@@ -2102,6 +2145,135 @@ mod tests {
                 best.1
             );
         }
+    }
+
+    /// A mixed tree of `megabytes` MB: source-like text in many small
+    /// files, about two fifths incompressible blobs (images, packed artifacts)
+    fn mixed_tree(megabytes: u64) -> tempfile::TempDir {
+        let ws = tempdir().unwrap();
+        let mut seed: u64 = 7;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let (mut bytes, mut n) = (0u64, 0u64);
+        while bytes < megabytes << 20 {
+            let dir = ws.path().join(format!("tree/d{}/e{}", n % 97, n % 13));
+            std::fs::create_dir_all(&dir).unwrap();
+            let content: Vec<u8> = if n.is_multiple_of(40) {
+                let len = (128 << 10) + (next() % (512 << 10)) as usize;
+                (0..len).map(|_| next() as u8).collect()
+            } else {
+                let mut s = String::new();
+                for l in 0..(20 + next() % 400) {
+                    s.push_str(&format!(
+                        "pub fn item_{}_{l}(x: u64) -> u64 {{ x.wrapping_mul({}) ^ {} }}\n",
+                        next() % 5000,
+                        next() % 977,
+                        next() % 31
+                    ));
+                }
+                s.into_bytes()
+            };
+            bytes += content.len() as u64;
+            std::fs::write(dir.join(format!("f{}.bin", n)), content).unwrap();
+            n += 1;
+        }
+        ws
+    }
+
+    /// Single-threaded against multi-threaded zstd on a 500 MB mixed tree:
+    /// time, size, and whether the output is the same for the same input
+    /// (per run and per worker count). Timing only, not a check.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored bench_cache_zstd_mt --nocapture"]
+    fn bench_cache_zstd_mt() {
+        use sha2::Digest;
+        let ws = mixed_tree(500);
+        let paths = ["tree".to_string()];
+        let files = collect_paths(ws.path().to_str().unwrap(), &paths, &[], true).unwrap();
+        println!(
+            "BENCH entries={} workers_auto={}",
+            files.len(),
+            zstd_workers(&files)
+        );
+        // Warm the page cache, so every run reads from memory
+        build_tar_zst_with(std::io::sink(), ws.path(), &files, 0).unwrap();
+        for workers in [0u32, 1, 2, 4, 4] {
+            let mut best = f64::MAX;
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                out = build_tar_zst_with(Vec::new(), ws.path(), &files, workers).unwrap();
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            let extracted = tempdir().unwrap();
+            extract_tar_zst(
+                &out[..],
+                extracted.path().to_str().unwrap(),
+                ExtractLimits::default(),
+                &Stop::default(),
+            )
+            .unwrap();
+            println!(
+                "BENCH workers={} time={:.3}s size={:.2}MB sha256={:x}",
+                workers,
+                best,
+                out.len() as f64 / 1048576.0,
+                sha2::Sha256::digest(&out)
+            );
+        }
+    }
+
+    /// Large inputs get zstd workers (one to four), small ones none; with
+    /// workers the output is the same whatever their number, so hosts with
+    /// different CPU counts write the same archive for the same files
+    #[tokio::test]
+    async fn large_cache_archives_are_compressed_by_several_threads() {
+        // Sparse: only the size counts for the choice
+        let large = tempdir().unwrap();
+        std::fs::create_dir(large.path().join("vendor")).unwrap();
+        std::fs::File::create(large.path().join("vendor/big.bin"))
+            .unwrap()
+            .set_len(CACHE_ZSTD_MT_ABOVE + 1)
+            .unwrap();
+        let large_root = large.path().to_str().unwrap();
+        let big = collect_paths(large_root, &["vendor".to_string()], &[], true).unwrap();
+        assert!((1..=CACHE_ZSTD_WORKERS).contains(&zstd_workers(&big)));
+
+        let ws = tempdir().unwrap();
+        std::fs::create_dir(ws.path().join("vendor")).unwrap();
+        let mut seed: u64 = 1;
+        let blob: Vec<u8> = (0..6 << 20)
+            .map(|i: usize| {
+                if i.is_multiple_of(4096) {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+                (seed >> 56) as u8 ^ (i as u8 & 0x0f)
+            })
+            .collect();
+        std::fs::write(ws.path().join("vendor/blob.bin"), &blob).unwrap();
+        std::fs::write(ws.path().join("vendor/small.txt"), b"small").unwrap();
+        let root = ws.path().to_str().unwrap();
+        let entries = collect_paths(root, &["vendor".to_string()], &[], true).unwrap();
+        assert_eq!(zstd_workers(&entries), 0);
+
+        let archives: Vec<Vec<u8>> = [1, 2, 4, 4]
+            .iter()
+            .map(|&workers| build_tar_zst_with(Vec::new(), ws.path(), &entries, workers).unwrap())
+            .collect();
+        assert!(archives.iter().all(|archive| *archive == archives[0]));
+        let out = tempdir().unwrap();
+        extract_tar_zst(
+            &archives[0][..],
+            out.path().to_str().unwrap(),
+            ExtractLimits::default(),
+            &Stop::default(),
+        )
+        .unwrap();
+        assert!(std::fs::read(out.path().join("vendor/blob.bin")).unwrap() == blob);
     }
 
     // --- cache archives, format 2 (tar.zst) ---

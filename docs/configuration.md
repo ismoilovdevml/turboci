@@ -218,6 +218,12 @@ of 15,000 files (57.6 MB, a twentieth of them incompressible images) the
 archive is 17.1 MB, saved in 0.37 s and extracted in 0.62 s, against
 20.6 MB, 0.46 s and 0.70 s for the zstd ZIPs of versions up to 0.10. zstd
 level 3 was both larger (17.9 MB) and slower there, so level 1 is used.
+Caches whose files hold more than 64 MiB are compressed by up to four zstd
+threads (one per CPU) besides the one reading the files: on a 500 MB mixed
+tree (23,000 files, two fifths incompressible) the archive took 0.6 to 0.8 s
+instead of 1.3 s, for 0.04% more bytes (253.2 MB against 253.1 MB). zstd
+writes the same archive for any number of threads, so runners with
+different CPU counts still find each other's archives unchanged.
 
 A `pull-push` cache the job leaves unchanged is not archived again. Right
 after restoring the job's own key (not a fallback key), the runner records
