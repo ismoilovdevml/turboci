@@ -65,6 +65,9 @@ pub struct RunnerConfig {
     pub cache_legacy_zip: bool,
     /// Where the runner keeps state it must write, like a rotated runner token
     pub state_dir: String,
+    /// Most job log kept, in KiB, as gitlab-runner's `output_limit`; output
+    /// past it is dropped while the job keeps running
+    pub output_limit: u64,
 
     /// `KEY=value` variables added to every job (they override the job's own)
     pub environment: Vec<String>,
@@ -963,6 +966,7 @@ impl Default for RunnerConfig {
             cache_max_size: None,
             cache_legacy_zip: true,
             state_dir: "/var/lib/turboci".to_string(),
+            output_limit: DEFAULT_OUTPUT_LIMIT_KIB,
             environment: Vec::new(),
             pre_get_sources_script: None,
             post_get_sources_script: None,
@@ -1409,6 +1413,11 @@ fn table_in<'a>(table: &'a mut toml::Table, key: &str, name: &str) -> Result<&'a
     }
 }
 
+/// `output_limit` when unset: 4 MiB, gitlab-runner's default
+const DEFAULT_OUTPUT_LIMIT_KIB: u64 = 4096;
+/// Accepted `output_limit`, in KiB: 64 KiB to 1 GiB
+const OUTPUT_LIMIT_KIB: std::ops::RangeInclusive<u64> = 64..=1024 * 1024;
+
 /// An optional size that must not be negative; `None` when unset or 0 (off)
 fn optional_size(field: &str, value: Option<&str>) -> Result<Option<u64>> {
     let Some(value) = value else {
@@ -1444,6 +1453,12 @@ impl RunnerConfig {
             .transpose()
     }
 
+    /// Job log limit (`output_limit`) in bytes
+    pub fn output_limit_bytes(&self) -> usize {
+        // `validate` keeps it at most 1 GiB, which fits a usize
+        usize::try_from(self.output_limit.saturating_mul(1024)).unwrap_or(usize::MAX)
+    }
+
     /// `min_free_memory` in bytes; `None` when off
     pub fn min_free_memory_bytes(&self) -> Result<Option<u64>> {
         optional_size("min_free_memory", self.min_free_memory.as_deref())
@@ -1455,6 +1470,14 @@ impl RunnerConfig {
     }
 
     fn validate_daemon_options(&self) -> Result<()> {
+        if !OUTPUT_LIMIT_KIB.contains(&self.output_limit) {
+            anyhow::bail!(
+                "output_limit must be between {} and {} (KiB), got {}",
+                OUTPUT_LIMIT_KIB.start(),
+                OUTPUT_LIMIT_KIB.end(),
+                self.output_limit
+            );
+        }
         self.min_free_memory_bytes()?;
         self.min_free_disk_bytes()?;
         self.metrics_addr()?;
@@ -2299,5 +2322,26 @@ executor_type = "shell"
             "cache_dir = \"/srv/ci/runners/docker-a/cache\"\nenvironment"
         ))
         .contains("must not share directories"));
+    }
+
+    #[test]
+    fn output_limit_is_in_kib_and_bounded() {
+        assert_eq!(daemon_config("").output_limit_bytes(), 4 * 1024 * 1024);
+        let content = "output_limit = 16384";
+        let config = daemon_config(content);
+        config.validate().unwrap();
+        assert!(unknown_keys(content, &config).is_empty());
+        assert_eq!(config.output_limit_bytes(), 16 * 1024 * 1024);
+        for ok in [64, 1024 * 1024] {
+            daemon_config(&format!("output_limit = {}", ok))
+                .validate()
+                .unwrap();
+        }
+
+        for bad in ["0", "63", "1048577"] {
+            let config = daemon_config(&format!("output_limit = {}", bad));
+            assert!(config.validate().is_err(), "accepted {}", bad);
+        }
+        assert!(RunnerConfig::parse("runner_token = \"t\"\noutput_limit = -1").is_err());
     }
 }

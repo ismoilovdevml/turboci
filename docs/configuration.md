@@ -56,7 +56,8 @@ work_dir = "/var/lib/turboci/builds"
 | `concurrent` | `4` | Jobs run at the same time. The runner only asks GitLab for a job when a slot is free |
 | `check_interval` | `3` | Seconds between the starts of job requests while idle. A request GitLab holds open (long polling, up to 50 s with Workhorse) is followed by the next one at once, as in gitlab-runner; after a 409 Conflict the runner asks again within 0.25 s, doubling up to `check_interval` |
 | `tls_ca_file` | – | PEM CA for a GitLab with a self-signed or internal certificate; also given to jobs as `CI_SERVER_TLS_CA_FILE` and `GIT_SSL_CAINFO` |
-| `state_dir` | `/var/lib/turboci` | Where the runner keeps state it writes: its system ID and a [rotated token](operations.md#runner-token-rotation) |
+| `state_dir` | `/var/lib/turboci` | Where the runner keeps state it writes: its system ID, a [rotated token](operations.md#runner-token-rotation), and the part of each [job log](operations.md#job-logs) GitLab has received |
+| `output_limit` | `4096` | Most job log kept, in KiB, as gitlab-runner's `output_limit` (`64` to `1048576`, i.e. 1 GiB). Past it the log says it was cut and the job keeps running |
 | `metrics_listen` | unset | `IP:port` of the [Prometheus endpoint](operations.md#metrics), e.g. `"127.0.0.1:9252"`. Unset: no endpoint |
 | `environment` | `[]` | `KEY=value` variables added to every job; they override the job's own |
 | `pre_get_sources_script` | – | Script run before the checkout of every job (before the job's `hooks:pre_get_sources_script`) |

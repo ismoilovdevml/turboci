@@ -34,7 +34,12 @@ gitlab_url = "https://gitlab.com"
 # Directory the runner writes its state to. When GitLab gives the runner token
 # an expiry, the runner resets it after 3/4 of its lifetime and keeps the new
 # token here (runner_token.json); a different runner_token above replaces it.
+# The part of job logs GitLab has received is kept here too, not in memory.
 state_dir = "/var/lib/turboci"
+
+# Most job log kept, in KiB (gitlab-runner's output_limit; 64 to 1048576).
+# Output past it is dropped while the job keeps running.
+# output_limit = 4096
 
 # Variables added to every job (they override the job's own), and scripts run
 # for every job, as in gitlab-runner's [[runners]] section

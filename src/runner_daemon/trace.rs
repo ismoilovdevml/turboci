@@ -4,10 +4,12 @@
 //!
 //! Only output GitLab has not acknowledged is kept in memory. Acknowledged output
 //! is moved to an unlinked temporary file (the spool) and read back from there if
-//! GitLab asks for it again.
+//! GitLab asks for it again. The spool goes in a directory on disk (the runner's
+//! state directory): `/tmp` is often a tmpfs, which would keep it in memory.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +20,8 @@ use super::cancel::CancelSignal;
 use crate::gitlab::GitLabClient;
 use crate::security::secret_scrubber::{SecretScrubber, StreamScrubber};
 
-/// Same default as gitlab-runner's `output_limit` (4 MiB)
+/// Same default as gitlab-runner's `output_limit` (4 MiB); the daemon sets
+/// the configured one with `with_limit`
 const DEFAULT_LIMIT: usize = 4 * 1024 * 1024;
 /// How often output is sent until GitLab asks for another interval
 const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(3);
@@ -53,6 +56,9 @@ pub struct TraceWriter<'a> {
     token: String,
     scrubber: StreamScrubber<'a>,
     spool: Spool,
+    /// Where the spool is created; the system's temporary directory if unset
+    /// or unusable
+    spool_dir: Option<PathBuf>,
     /// Length of the trace prefix in the spool
     spooled: usize,
     /// The trace from `spooled` on
@@ -81,6 +87,7 @@ impl<'a> TraceWriter<'a> {
             token: token.to_string(),
             scrubber: StreamScrubber::new(scrubber),
             spool: Spool::Unopened,
+            spool_dir: None,
             spooled: 0,
             tail: Vec::new(),
             sent: 0,
@@ -103,9 +110,15 @@ impl<'a> TraceWriter<'a> {
         self.cancel.clone()
     }
 
-    #[cfg(test)]
-    fn with_limit(mut self, limit: usize) -> Self {
+    /// Keep at most `limit` bytes of output (gitlab-runner's `output_limit`)
+    pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Create the spool in `dir`, a directory on disk
+    pub fn with_spool_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.spool_dir = Some(dir.into());
         self
     }
 
@@ -294,15 +307,9 @@ impl<'a> TraceWriter<'a> {
             return;
         }
         if matches!(self.spool, Spool::Unopened) {
-            self.spool = match tempfile::tempfile() {
-                Ok(file) => Spool::Open(Arc::new(file)),
-                Err(e) => {
-                    warn!(
-                        "Job #{} log kept in memory: no temporary file for it: {}",
-                        self.job_id, e
-                    );
-                    Spool::Failed(None)
-                }
+            self.spool = match create_spool(self.spool_dir.as_deref(), self.job_id) {
+                Some((file, _)) => Spool::Open(Arc::new(file)),
+                None => Spool::Failed(None),
             };
         }
         let file = match &self.spool {
@@ -367,6 +374,42 @@ impl<'a> TraceWriter<'a> {
                 .min((self.limit + NOTICE_ROOM).saturating_sub(self.spooled))
                 .max(needed);
             self.tail.reserve_exact(target - self.tail.len());
+        }
+    }
+}
+
+/// Where a spool was created
+#[derive(Debug, PartialEq, Eq)]
+enum SpoolPlace {
+    /// The directory the writer was given
+    Dir,
+    /// The system's temporary directory
+    TempDir,
+}
+
+/// An unlinked file for the spool of job `job_id`: in `dir` if it is usable,
+/// else in the system's temporary directory. `None` when neither works; the
+/// log then stays in memory.
+fn create_spool(dir: Option<&Path>, job_id: u64) -> Option<(File, SpoolPlace)> {
+    if let Some(dir) = dir {
+        match tempfile::tempfile_in(dir) {
+            Ok(file) => return Some((file, SpoolPlace::Dir)),
+            Err(e) => warn!(
+                "Job #{} log spooled to the temporary directory: no file for it in {}: {}",
+                job_id,
+                dir.display(),
+                e
+            ),
+        }
+    }
+    match tempfile::tempfile() {
+        Ok(file) => Some((file, SpoolPlace::TempDir)),
+        Err(e) => {
+            warn!(
+                "Job #{} log kept in memory: no temporary file for it: {}",
+                job_id, e
+            );
+            None
         }
     }
 }
@@ -606,6 +649,58 @@ mod tests {
         assert_eq!((trace.spooled, trace.sent), (0, 13));
         assert_eq!(trace.text(), "first\nsecond\n");
         assert_eq!(trace_on_gitlab(&server).await, "first\nsecond\n");
+    }
+
+    /// The file an open spool is in (Linux)
+    #[cfg(target_os = "linux")]
+    fn spool_path(file: &File) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap()
+    }
+
+    #[test]
+    fn spool_goes_in_the_given_directory_else_in_the_temporary_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_file, place) = create_spool(Some(dir.path()), 7).unwrap();
+        assert_eq!(place, SpoolPlace::Dir);
+        #[cfg(target_os = "linux")]
+        {
+            let path = spool_path(&_file);
+            assert!(
+                path.starts_with(dir.path().canonicalize().unwrap()),
+                "{path:?}"
+            );
+        }
+
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            create_spool(Some(&missing), 7).unwrap().1,
+            SpoolPlace::TempDir
+        );
+        assert_eq!(create_spool(None, 7).unwrap().1, SpoolPlace::TempDir);
+        // Unlinked: nothing is left in the directory
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_output_is_spooled_in_the_given_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace =
+            TraceWriter::new(None, 7, "job-token", &scrubber).with_spool_dir(dir.path());
+
+        trace.write("first\n").await;
+        assert!(trace.flush().await);
+        assert!(matches!(trace.spool, Spool::Open(_)));
+        assert_eq!((trace.spooled, trace.text().as_str()), (6, "first\n"));
+        #[cfg(target_os = "linux")]
+        {
+            let path = spool_path(trace.spool_file().unwrap());
+            assert!(
+                path.starts_with(dir.path().canonicalize().unwrap()),
+                "{path:?}"
+            );
+        }
     }
 
     #[tokio::test]

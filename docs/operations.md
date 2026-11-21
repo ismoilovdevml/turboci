@@ -187,8 +187,12 @@ finished before the runner exits.
 
 - Output is sent to GitLab every 3 seconds, or at the interval GitLab asks for
   (it asks for less frequent updates while nobody is watching the log).
-- Logs are limited to 4 MiB, as in gitlab-runner; the job keeps running, and
-  the log says that output was cut.
+- Logs are limited to `output_limit` (default 4 MiB, as in gitlab-runner); the
+  job keeps running, and the log says that output was cut at that limit.
+- Output GitLab has received leaves memory: it is kept in an unlinked file in
+  `state_dir` (on disk, unlike a tmpfs `/tmp`) in case GitLab asks for it
+  again. If no file can be created there, the system's temporary directory is
+  used, and failing that the log stays in memory.
 - Masked variables and tokens are replaced by `[MASKED]` before anything is
   sent, including in runner messages.
 

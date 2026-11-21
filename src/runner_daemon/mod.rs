@@ -931,6 +931,8 @@ impl RunnerDaemon {
         };
         let cancel = CancelSignal::default();
         let mut trace = TraceWriter::new(Some(&self.gitlab), job.id, &job.token, &scrubber)
+            .with_limit(self.config.output_limit_bytes())
+            .with_spool_dir(&self.config.state_dir)
             .with_cancel(cancel.clone());
         // Aborted when dropped, even if the job panics, so GitLab is not told
         // forever that a dead job is running
