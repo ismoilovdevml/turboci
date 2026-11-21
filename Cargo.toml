@@ -30,6 +30,13 @@ aho-corasick = "1.1.5"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
 bollard = "0.19"
+# Docker Engine API client (runner_daemon::docker_api) over dockerd's unix socket
+hyper = { version = "1.12", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+hyperlocal = { version = "0.9.1", default-features = false, features = ["client"] }
+http-body-util = "0.1.5"
+tokio-util = { version = "0.7.20", features = ["codec", "io"] }
+url = "2.5.8"
 futures-util = "0.3"
 hmac = "0.12"
 toml = "0.9"

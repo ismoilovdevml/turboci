@@ -18,6 +18,7 @@ pub mod artifacts;
 pub mod cancel;
 pub mod capacity;
 pub mod config;
+pub mod docker_api;
 pub mod executor;
 pub mod git;
 pub mod housekeeping;
