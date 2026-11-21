@@ -16,8 +16,15 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// RSS of a daemon this small; commit pages on demand instead
 #[cfg(target_env = "musl")]
 fn tune_allocator() {
-    // mi_option_arena_eager_commit in mimalloc.h (not exported by libmimalloc-sys)
-    const ARENA_EAGER_COMMIT: libmimalloc_sys::mi_option_t = 4;
+    use libmimalloc_sys::{mi_option_large_os_pages, mi_option_t, mi_option_verbose};
+    // mi_option_arena_eager_commit in mimalloc.h's mi_option_e (libmimalloc-sys
+    // does not export it). The crates are pinned in Cargo.toml; these checks
+    // catch a bump that renumbers the options libmimalloc-sys does export
+    // around it (verbose = 2, deprecated_eager_commit = 3, arena_eager_commit
+    // = 4, purge_decommits = 5, allow_large_os_pages = 6).
+    const ARENA_EAGER_COMMIT: mi_option_t = 4;
+    const _: () = assert!(mi_option_verbose == ARENA_EAGER_COMMIT - 2);
+    const _: () = assert!(mi_option_large_os_pages == ARENA_EAGER_COMMIT + 2);
     // SAFETY: setting an option only stores an integer; it is safe at any time
     unsafe { libmimalloc_sys::mi_option_set(ARENA_EAGER_COMMIT, 0) }
 }

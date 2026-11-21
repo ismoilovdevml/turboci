@@ -49,10 +49,13 @@ tar = { version = "0.4", default-features = false }
 # zstdmt: large cache archives are compressed by several threads
 zstd = { version = "0.14.4", default-features = false, features = ["zstdmt"] }
 
-# musl's malloc is slow under multi-threaded load; macOS and glibc keep the system allocator
+# musl's malloc is slow under multi-threaded load; macOS and glibc keep the system allocator.
+# Pinned: main.rs sets mi_option_arena_eager_commit by its number in mimalloc.h's
+# mi_option_e. Before bumping, check that number in the new
+# c_src/mimalloc/v3/include/mimalloc.h and the bracketing constants checked in main.rs.
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = "0.1"
-libmimalloc-sys = { version = "0.1", features = ["extended"] }
+mimalloc = "=0.1.52"
+libmimalloc-sys = { version = "=0.1.49", features = ["extended"] }
 
 [dev-dependencies]
 wiremock = "0.6"
