@@ -116,7 +116,7 @@ scrape_configs:
 | `turboci_concurrent_jobs` | gauge | Job slots (`concurrent`) |
 | `turboci_jobs_finished_total{result}` | counter | Jobs that ended: `success`, `failed`, `canceled` (in GitLab) |
 | `turboci_jobs_failed_total{reason}` | counter | Failed jobs by failure reason: `script_failure`, `runner_system_failure`, `job_execution_timeout`, `image_pull_failure`, `job_canceled` |
-| `turboci_job_requests_total{result}` | counter | Job requests to GitLab: `job`, `no_job`, `error` |
+| `turboci_job_requests_total{result}` | counter | Job requests to GitLab: `job`, `no_job`, `error`, `conflict` (409: another request took the job GitLab picked; retried after 0.25 s, doubling up to `check_interval`) |
 | `turboci_admission_blocked{resource}` | gauge | 1 while [admission control](configuration.md#admission-control) holds off jobs for `memory`, `disk` or `load` |
 | `turboci_cache_restores_total{result}` | counter | Cache entries restored: `hit`, `miss`, `error` |
 | `turboci_cache_uploads_total{result}` | counter | Saved archives in S3: `sent`, `unchanged` (S3 had the same content), `failed` |

@@ -4,7 +4,9 @@
 # Number of concurrent jobs the runner can execute
 concurrent = 4
 
-# How often to check for new jobs (seconds)
+# Seconds between the starts of job requests while idle. A request GitLab
+# holds open (long polling) is followed by the next one at once; after a 409
+# Conflict the runner asks again within 0.25s, doubling up to this
 check_interval = 3
 
 # GitLab runner token (get from GitLab CI/CD settings)

@@ -70,6 +70,17 @@ struct JobIdentity {
     token: String,
 }
 
+/// What GitLab answered to a job request
+#[derive(Debug)]
+pub enum Polled {
+    Job(Box<Job>),
+    /// No job for this runner now (204), or the request was stopped
+    NoJob,
+    /// 409: GitLab picked a job that another request took meanwhile; the
+    /// queue may hold more
+    Conflict,
+}
+
 #[derive(Debug, Clone)]
 pub struct GitLabClient {
     client: Client,
@@ -167,8 +178,15 @@ impl GitLabClient {
     /// Request a new job from GitLab (GitLab 17.x compatible)
     #[cfg(test)]
     pub async fn request_job(&self, runner_token: &str) -> Result<Option<Job>> {
-        self.request_job_until(runner_token, std::future::pending())
-            .await
+        Ok(
+            match self
+                .request_job_until(runner_token, std::future::pending())
+                .await?
+            {
+                Polled::Job(job) => Some(*job),
+                Polled::NoJob | Polled::Conflict => None,
+            },
+        )
     }
 
     /// Request a new job, giving up when `stop` resolves before GitLab answers.
@@ -181,7 +199,7 @@ impl GitLabClient {
         &self,
         runner_token: &str,
         stop: impl Future<Output = ()>,
-    ) -> Result<Option<Job>> {
+    ) -> Result<Polled> {
         let url = format!("{}/api/v4/jobs/request", self.url);
 
         debug!("Requesting job from: {}", url);
@@ -209,7 +227,7 @@ impl GitLabClient {
             response = request => response.context("Failed to request job from GitLab")?,
             _ = stop => {
                 debug!("Job request stopped before GitLab answered");
-                return Ok(None);
+                return Ok(Polled::NoJob);
             }
         };
         // Like gitlab-runner: kept from any answer that carries it
@@ -231,7 +249,7 @@ impl GitLabClient {
             StatusCode::NO_CONTENT => {
                 // No jobs available
                 debug!("No jobs available");
-                Ok(None)
+                Ok(Polled::NoJob)
             }
             StatusCode::OK | StatusCode::CREATED => {
                 // Get response text first for debugging
@@ -272,12 +290,12 @@ impl GitLabClient {
                     }
                 };
                 info!("Received job #{}", job.id);
-                Ok(Some(job))
+                Ok(Polled::Job(Box::new(job)))
             }
             StatusCode::CONFLICT => {
                 // Another request took the job meanwhile: ask again
                 debug!("Job request conflict");
-                Ok(None)
+                Ok(Polled::Conflict)
             }
             StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
                 warn!("Authentication failed - invalid runner token");
@@ -1466,7 +1484,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(job.is_none());
+        assert!(matches!(job, Polled::NoJob), "{:?}", job);
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -1631,6 +1649,27 @@ mod tests {
             .await;
 
         assert!(client(&server).request_job("bad-token").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn request_job_tells_a_conflict_from_no_job() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(409))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let poll = || client.request_job_until("runner-token", std::future::pending());
+
+        assert!(matches!(poll().await.unwrap(), Polled::Conflict));
+        assert!(matches!(poll().await.unwrap(), Polled::NoJob));
     }
 
     #[tokio::test]

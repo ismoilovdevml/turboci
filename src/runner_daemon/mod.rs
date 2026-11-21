@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::gitlab::{
-    ArtifactUpload, FailureReason, GitLabClient, Job, JobState, RemoteState, Variable,
+    ArtifactUpload, FailureReason, GitLabClient, Job, JobState, Polled, RemoteState, Variable,
 };
 use crate::security::secret_scrubber::SecretScrubber;
 use cancel::{CancelSignal, Stop};
@@ -247,7 +247,21 @@ async fn claim_job(
     runner_token: &str,
 ) -> Result<Option<(Job, capacity::Slot)>> {
     let slot = capacity.acquire().await;
-    claim_with_slot(slot, gitlab, runner_token, std::future::pending()).await
+    Ok(
+        match claim_with_slot(slot, gitlab, runner_token, std::future::pending()).await? {
+            Claimed::Job(job, slot) => Some((*job, slot)),
+            Claimed::NoJob | Claimed::Conflict => None,
+        },
+    )
+}
+
+/// What a job request for a reserved slot got
+enum Claimed<S> {
+    /// A job, with the slot it runs in
+    Job(Box<Job>, S),
+    NoJob,
+    /// GitLab answered 409 (see `Polled::Conflict`)
+    Conflict,
 }
 
 /// Ask GitLab for a job for an already reserved slot, until `stop` (see
@@ -258,22 +272,33 @@ async fn claim_with_slot<S>(
     gitlab: &GitLabClient,
     runner_token: &str,
     stop: impl std::future::Future<Output = ()>,
-) -> Result<Option<(Job, S)>> {
-    Ok(gitlab
-        .request_job_until(runner_token, stop)
-        .await?
-        .map(|job| (job, slot)))
+) -> Result<Claimed<S>> {
+    Ok(match gitlab.request_job_until(runner_token, stop).await? {
+        Polled::Job(job) => Claimed::Job(job, slot),
+        Polled::NoJob => Claimed::NoJob,
+        Polled::Conflict => Claimed::Conflict,
+    })
 }
 
 /// Longest wait between job requests that fail
 const MAX_REQUEST_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Waits between job requests: the check interval, doubled after each failed
-/// request in a row up to `MAX_REQUEST_BACKOFF`, with jitter so runners that
-/// lost GitLab at the same time do not retry in lockstep
+/// Wait after the first 409 Conflict in a row; doubled for each next one, up
+/// to the check interval
+const CONFLICT_RETRY: Duration = Duration::from_millis(250);
+
+/// Waits between job requests. Requests GitLab answers start one check
+/// interval apart, counted from the start of the previous one, as
+/// gitlab-runner feeds its runners on a fixed tick: a request Workhorse held
+/// for long polling is followed by the next one at once. After a 409 Conflict
+/// the next request goes out sooner. Failed requests wait the check interval,
+/// doubled after each failure in a row up to `MAX_REQUEST_BACKOFF`, with
+/// jitter so runners that lost GitLab at the same time do not retry in
+/// lockstep.
 struct RequestBackoff {
     check_interval: Duration,
     failures: u32,
+    conflicts: u32,
 }
 
 impl RequestBackoff {
@@ -281,6 +306,7 @@ impl RequestBackoff {
         Self {
             check_interval,
             failures: 0,
+            conflicts: 0,
         }
     }
 
@@ -289,14 +315,33 @@ impl RequestBackoff {
         self.check_interval = check_interval;
     }
 
-    /// Wait after a request GitLab answered
-    fn succeeded(&mut self) -> Duration {
+    /// GitLab gave a job: the next request goes out at once
+    fn got_job(&mut self) {
         self.failures = 0;
-        self.check_interval
+        self.conflicts = 0;
+    }
+
+    /// Wait after GitLab answered "no job" to a request that took `took`:
+    /// the rest of the check interval, nothing after a long poll
+    fn no_job(&mut self, took: Duration) -> Duration {
+        self.got_job();
+        self.check_interval.saturating_sub(took)
+    }
+
+    /// Wait after a 409 Conflict: `CONFLICT_RETRY`, doubled for each conflict
+    /// in a row, never more than the check interval
+    fn conflict(&mut self) -> Duration {
+        self.failures = 0;
+        let wait = CONFLICT_RETRY
+            .saturating_mul(1 << self.conflicts.min(16))
+            .min(self.check_interval);
+        self.conflicts = self.conflicts.saturating_add(1);
+        wait
     }
 
     /// Wait after a failed request: between half of and the full ceiling
     fn failed(&mut self) -> Duration {
+        self.conflicts = 0;
         self.failures = self.failures.saturating_add(1);
         let ceiling = self.ceiling();
         ceiling / 2 + ceiling.mul_f64(random_fraction() / 2.0)
@@ -558,6 +603,7 @@ impl RunnerDaemon {
                 }
                 continue;
             }
+            let requested = std::time::Instant::now();
             let claimed = claim_with_slot(
                 slot,
                 &self.gitlab,
@@ -573,7 +619,7 @@ impl RunnerDaemon {
                 );
             }
             let wait = match claimed {
-                Ok(Some((job, slot))) => {
+                Ok(Claimed::Job(job, slot)) => {
                     let job_name = job
                         .job_info
                         .as_ref()
@@ -585,16 +631,20 @@ impl RunnerDaemon {
                     let daemon = self.clone();
                     tokio::spawn(async move {
                         let _slot = slot;
-                        if let Err(e) = daemon.execute_job(job).await {
+                        if let Err(e) = daemon.execute_job(*job).await {
                             error!("Job execution failed: {}", e);
                         }
                     });
-                    backoff.succeeded();
+                    backoff.got_job();
                     None
                 }
-                Ok(None) => {
+                Ok(Claimed::NoJob) => {
                     self.metrics.request(metrics::Request::NoJob);
-                    Some(backoff.succeeded())
+                    Some(backoff.no_job(requested.elapsed()))
+                }
+                Ok(Claimed::Conflict) => {
+                    self.metrics.request(metrics::Request::Conflict);
+                    Some(backoff.conflict())
                 }
                 Err(e) => {
                     self.metrics.request(metrics::Request::Error);
@@ -3037,7 +3087,7 @@ mod tests {
     #[test]
     fn request_backoff_grows_to_a_cap_and_resets_on_success() {
         let mut backoff = RequestBackoff::new(Duration::from_secs(3));
-        assert_eq!(backoff.succeeded(), Duration::from_secs(3));
+        assert_eq!(backoff.no_job(Duration::ZERO), Duration::from_secs(3));
 
         let mut ceilings = Vec::new();
         for _ in 0..8 {
@@ -3048,8 +3098,10 @@ mod tests {
         }
         assert_eq!(ceilings, [3, 6, 12, 24, 48, 60, 60, 60]);
 
-        assert_eq!(backoff.succeeded(), Duration::from_secs(3));
+        assert_eq!(backoff.no_job(Duration::ZERO), Duration::from_secs(3));
         backoff.failed();
+        assert_eq!(backoff.ceiling(), Duration::from_secs(3));
+        backoff.got_job();
         assert_eq!(backoff.ceiling(), Duration::from_secs(3));
 
         // A check interval above the cap is never shortened
@@ -3057,6 +3109,114 @@ mod tests {
         slow.failed();
         slow.failed();
         assert_eq!(slow.ceiling(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn requests_start_a_check_interval_apart_and_conflicts_retry_sooner() {
+        let secs = Duration::from_secs;
+        let mut backoff = RequestBackoff::new(secs(3));
+        // The rest of the interval after a quick answer; nothing after a
+        // request GitLab held for long polling
+        assert_eq!(
+            backoff.no_job(Duration::from_millis(200)),
+            Duration::from_millis(2800)
+        );
+        assert_eq!(backoff.no_job(secs(3)), Duration::ZERO);
+        assert_eq!(backoff.no_job(secs(50)), Duration::ZERO);
+
+        // 409s in a row: a quick retry, growing up to the check interval
+        let waits: Vec<u128> = (0..6).map(|_| backoff.conflict().as_millis()).collect();
+        assert_eq!(waits, [250, 500, 1000, 2000, 3000, 3000]);
+        // Any other answer starts over
+        backoff.no_job(Duration::ZERO);
+        assert_eq!(backoff.conflict(), Duration::from_millis(250));
+        backoff.got_job();
+        assert_eq!(backoff.conflict(), Duration::from_millis(250));
+        // A conflict also ends a run of failures, and a failure one of conflicts
+        backoff.failed();
+        backoff.failed();
+        backoff.conflict();
+        assert_eq!(backoff.ceiling(), secs(3));
+        backoff.conflict();
+        backoff.failed();
+        assert_eq!(backoff.conflict(), Duration::from_millis(250));
+
+        // A short check interval caps the conflict wait too
+        let mut quick = RequestBackoff::new(secs(1));
+        let waits: Vec<u128> = (0..4).map(|_| quick.conflict().as_millis()).collect();
+        assert_eq!(waits, [250, 500, 1000, 1000]);
+    }
+
+    /// Job requests GitLab received so far
+    async fn job_requests(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/api/v4/jobs/request")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_job_request_gitlab_held_is_followed_at_once() {
+        let server = MockServer::start().await;
+        // Workhorse holds each request (long polling) longer than check_interval
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(2500)))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon_with(&server, dir.path(), |config| config.check_interval = 2).await;
+        let handle = daemon.shutdown_handle();
+        let running = tokio::spawn(async move { daemon.start().await });
+
+        // Held until 2.5s; the second request starts right then, not a check
+        // interval later (4.5s)
+        sleep(Duration::from_millis(3700)).await;
+        assert_eq!(job_requests(&server).await, 2);
+
+        handle.request(Shutdown::Abort);
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("daemon stopped")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_conflict_is_retried_soon_but_not_in_a_hot_loop() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/jobs/request"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon_with(&server, dir.path(), |config| config.check_interval = 5).await;
+        let handle = daemon.shutdown_handle();
+        let running = tokio::spawn({
+            let daemon = daemon.clone();
+            async move { daemon.start().await }
+        });
+
+        // Requests at 0, 0.25s, 0.75s and 1.75s, instead of one per 5s
+        sleep(Duration::from_millis(1300)).await;
+        let early = job_requests(&server).await;
+        assert_eq!(early, 3, "requests in the first 1.3s");
+        sleep(Duration::from_millis(1000)).await;
+        assert_eq!(job_requests(&server).await, 4, "requests in the first 2.3s");
+
+        handle.request(Shutdown::Graceful);
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("daemon stopped")
+            .unwrap()
+            .unwrap();
+        assert!(daemon
+            .render_metrics()
+            .contains("turboci_job_requests_total{result=\"conflict\"} 4\n"));
     }
 
     #[tokio::test]

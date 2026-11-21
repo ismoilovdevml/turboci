@@ -35,8 +35,10 @@ pub enum Request {
     Job,
     NoJob,
     Error,
+    /// 409: another request took the job GitLab picked
+    Conflict,
 }
-const REQUESTS: [&str; 3] = ["job", "no_job", "error"];
+const REQUESTS: [&str; 4] = ["job", "no_job", "error", "conflict"];
 
 /// Result of restoring one cache entry
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +75,7 @@ pub struct Metrics {
     started: f64,
     jobs_finished: [AtomicU64; 3],
     jobs_failed: [AtomicU64; 5],
-    job_requests: [AtomicU64; 3],
+    job_requests: [AtomicU64; 4],
     admission_blocked: [AtomicBool; 3],
     cache_restores: [AtomicU64; 3],
     cache_uploads: [AtomicU64; 3],

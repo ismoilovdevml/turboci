@@ -50,7 +50,7 @@ work_dir = "/var/lib/turboci/builds"
 | `runner_token` | – | Runner authentication token (`glrt-...`). Required |
 | `gitlab_url` | `https://gitlab.com` | GitLab URL (`http://` or `https://`) |
 | `concurrent` | `4` | Jobs run at the same time. The runner only asks GitLab for a job when a slot is free |
-| `check_interval` | `3` | Seconds between job requests while idle |
+| `check_interval` | `3` | Seconds between the starts of job requests while idle. A request GitLab holds open (long polling, up to 50 s with Workhorse) is followed by the next one at once, as in gitlab-runner; after a 409 Conflict the runner asks again within 0.25 s, doubling up to `check_interval` |
 | `tls_ca_file` | – | PEM CA for a GitLab with a self-signed or internal certificate; also given to jobs as `CI_SERVER_TLS_CA_FILE` and `GIT_SSL_CAINFO` |
 | `state_dir` | `/var/lib/turboci` | Where the runner keeps state it writes: its system ID and a [rotated token](operations.md#runner-token-rotation) |
 | `metrics_listen` | unset | `IP:port` of the [Prometheus endpoint](operations.md#metrics), e.g. `"127.0.0.1:9252"`. Unset: no endpoint |
