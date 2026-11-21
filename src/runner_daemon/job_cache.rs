@@ -38,16 +38,82 @@ fn is_archive(path: &Path) -> bool {
 /// Reads the chunks a download sends, blocking: for the extraction, which
 /// runs off the async runtime. The end of the channel is the end of the
 /// stream; a download that failed ends it early, which the extraction
-/// reports as a truncated archive.
+/// reports as a truncated archive. Every chunk is also hashed and written
+/// to the local copy here, on the extraction's thread rather than on the
+/// async workers that other jobs share.
 struct ChannelReader {
     chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     chunk: bytes::Bytes,
+    hasher: sha2::Sha256,
+    /// The local copy, until a write to it fails
+    copy: Option<std::io::BufWriter<std::fs::File>>,
+    copy_error: Option<std::io::Error>,
+}
+
+/// What a `ChannelReader` saw once the extraction was done with it
+struct Received {
+    /// Bytes that came after what the extraction read
+    extra: u64,
+    /// SHA-256 (hex) of the whole stream
+    sha256: String,
+    /// Whether the local copy holds the whole stream
+    copy: std::io::Result<()>,
+}
+
+impl ChannelReader {
+    fn new(chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>, copy: std::fs::File) -> Self {
+        use sha2::Digest;
+        Self {
+            chunks,
+            chunk: bytes::Bytes::new(),
+            hasher: sha2::Sha256::new(),
+            // Network chunks are small (often 16 KiB): written in larger pieces
+            copy: Some(std::io::BufWriter::with_capacity(256 * 1024, copy)),
+            copy_error: None,
+        }
+    }
+
+    /// The next chunk, hashed and copied; `None` at the end of the stream
+    fn next_chunk(&mut self) -> Option<bytes::Bytes> {
+        use sha2::Digest;
+        use std::io::Write;
+        let chunk = self.chunks.blocking_recv()?;
+        self.hasher.update(&chunk);
+        if let Some(copy) = &mut self.copy {
+            if let Err(e) = copy.write_all(&chunk) {
+                self.copy = None;
+                self.copy_error = Some(e);
+            }
+        }
+        Some(chunk)
+    }
+
+    /// Read what the extraction left to the end of the stream (a download
+    /// longer than the archive), and complete the local copy
+    fn finish(mut self) -> Received {
+        use sha2::Digest;
+        use std::io::Write;
+        let mut extra = self.chunk.len() as u64;
+        while let Some(chunk) = self.next_chunk() {
+            extra += chunk.len() as u64;
+        }
+        let copy = match (self.copy_error.take(), self.copy.take()) {
+            (Some(e), _) => Err(e),
+            (None, Some(mut copy)) => copy.flush(),
+            (None, None) => Ok(()),
+        };
+        Received {
+            extra,
+            sha256: format!("{:x}", self.hasher.finalize()),
+            copy,
+        }
+    }
 }
 
 impl std::io::Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         while self.chunk.is_empty() {
-            match self.chunks.blocking_recv() {
+            match self.next_chunk() {
                 Some(chunk) => self.chunk = chunk,
                 None => return Ok(0),
             }
@@ -562,9 +628,6 @@ impl LocalCache {
         workspace: &str,
         stop: &Stop,
     ) -> Result<Result<Fetched>> {
-        use sha2::Digest;
-        use tokio::io::AsyncWriteExt;
-
         let dir = path.parent().unwrap_or(Path::new("."));
         let staged = match tempfile::NamedTempFile::new_in(dir).and_then(|file| {
             let copy = file.reopen()?;
@@ -581,61 +644,57 @@ impl LocalCache {
         let extraction = {
             let (workspace, stop) = (workspace.to_string(), stop.clone());
             tokio::task::spawn_blocking(move || {
-                let reader = ChannelReader {
-                    chunks,
-                    chunk: bytes::Bytes::new(),
-                };
+                let mut reader = ChannelReader::new(chunks, copy);
                 artifacts::extract_tar_zst(
-                    reader,
+                    &mut reader,
                     &workspace,
                     artifacts::ExtractLimits::default(),
                     &stop,
                 )
+                // The rest of the stream is read (hashed and copied) to its
+                // end, so the hash is the whole object's
+                .map(|()| reader.finish())
             })
         };
 
-        // Network chunks are small (often 16 KiB): written in larger pieces
-        let mut out =
-            tokio::io::BufWriter::with_capacity(256 * 1024, tokio::fs::File::from_std(copy));
-        let mut hasher = sha2::Sha256::new();
         let mut size = 0u64;
-        let mut cut_short = false;
         let received = async {
             while let Some(chunk) = object.chunk().await? {
-                hasher.update(&chunk);
-                out.write_all(&chunk).await?;
                 size += chunk.len() as u64;
                 if sender.send(chunk).await.is_err() {
                     // The extraction ended: its error tells why
-                    cut_short = true;
                     break;
                 }
             }
-            // The file is complete before it is renamed into place
-            out.flush().await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
         drop(sender);
         let extracted = extraction.await.context("Extraction task panicked")?;
-        match (received, extracted) {
+        let stream = match (received, extracted) {
             // The extraction saw a truncated stream: the download's error
             // is the one to report, and the local copy is used
             (Err(e), _) => return Ok(Err(e)),
             // A bad archive, or `stop`: as when extracting a local copy
             (Ok(()), Err(e)) => return Err(e),
-            (Ok(()), Ok(())) if cut_short => {
+            (Ok(()), Ok(stream)) if stream.extra > 0 => {
                 return Ok(Err(anyhow::anyhow!(
                     "the cache archive ended before the download"
                 )))
             }
-            (Ok(()), Ok(())) => {}
-        }
-        let sha256 = format!("{:x}", hasher.finalize());
+            (Ok(()), Ok(stream)) => stream,
+        };
+        let sha256 = stream.sha256;
         // The files are extracted already; a mismatch keeps the archive out
         // of the local layer, and the local copy then overwrites them
         if let Err(e) = object.check(&sha256) {
             return Ok(Err(e));
+        }
+        if let Err(e) = stream.copy {
+            // The workspace has the whole archive; only the next restore
+            // downloads it again
+            tracing::warn!("Failed to write {}: {}", path.display(), e);
+            return Ok(Ok(Fetched::Extracted(size)));
         }
         match staged.persist(path) {
             Ok(_) => {
@@ -2048,9 +2107,10 @@ mod tests {
             second
         );
 
-        // An archive above the multipart threshold goes in signed parts of
-        // 5 MiB, S3's smallest; another host restores it and, saving the
-        // same files, finds them in S3 by the stored hash
+        // An archive above the multipart threshold goes in parts of 5 MiB,
+        // S3's smallest, each signed with its hash over plain HTTP; another
+        // host restores it and, saving the same files, finds them in S3 by
+        // the stored hash
         let big = tempdir().unwrap();
         std::fs::create_dir(big.path().join("vendor")).unwrap();
         let mut seed: u64 = 7;
@@ -2108,6 +2168,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(again.upload, Some(Ok(Upload::Unchanged)));
+
+        // Over HTTPS parts go unsigned (UNSIGNED-PAYLOAD), streamed from
+        // the file: MinIO takes them the same way over plain HTTP
+        let unsigned = || parts().with_unsigned_parts(true);
+        let saved = LocalCache::new(tempdir().unwrap().path())
+            .with_remote(unsigned())
+            .save(
+                9,
+                "big-unsigned",
+                big.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
+        let restored_unsigned = tempdir().unwrap();
+        let unsigned_hit = LocalCache::new(tempdir().unwrap().path())
+            .with_remote(unsigned())
+            .restore(
+                9,
+                &["big-unsigned".to_string()],
+                restored_unsigned.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(unsigned_hit.hit, Some((_, Source::S3Downloaded(_)))),
+            "{:?}",
+            unsigned_hit
+        );
+        assert!(std::fs::read(restored_unsigned.path().join("vendor/blob.bin")).unwrap() == noise);
 
         // A ZIP an older runner uploaded restores when the key has no
         // tar.zst archive

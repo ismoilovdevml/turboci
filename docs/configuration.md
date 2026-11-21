@@ -263,8 +263,15 @@ disk, a changed one is extracted while it downloads, and kept as the new
 local copy. A download that breaks off midway is a warning, and the local
 copy is extracted over what arrived. Saved archives are written locally and
 uploaded; archives above 64 MiB go as a multipart upload, in parts of 16 MiB
-(larger above 156 GiB, to stay within S3's 10,000 parts), four at a time, each signed with its own hash. A
-failed or canceled multipart upload is aborted, so S3 keeps no parts of it.
+(larger above 156 GiB, to stay within S3's 10,000 parts), four at a time.
+Each part is read from disk once. Over HTTPS it streams from the archive
+with an unsigned payload (`UNSIGNED-PAYLOAD`, which AWS S3, MinIO, Ceph RGW
+and R2 accept): TLS protects the body, the headers stay signed, and the
+archive's SHA-256 stored with the object is checked by every download. Over
+plain HTTP a part is read into memory, hashed, signed with its hash and sent
+from there, which holds at most 64 MiB per upload (four parts of 16 MiB, or
+one larger part at a time for archives above 156 GiB). A failed or canceled
+multipart upload is aborted, so S3 keeps no parts of it.
 An archive is the same for the same files (entries in path order, fixed
 timestamps), so a `pull-push` cache the job did not change is not uploaded
 again: the runner stores the archive's SHA-256 with the object

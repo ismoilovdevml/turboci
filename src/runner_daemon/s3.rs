@@ -36,6 +36,15 @@ const MAX_OBJECT_SIZE: u64 = 5 << 40;
 /// Parts uploaded at the same time
 const PART_CONCURRENCY: usize = 4;
 
+/// `x-amz-content-sha256` of a request whose body is not signed: the parts
+/// of a multipart upload over HTTPS, so each part is read from disk once
+pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+
+/// Most bytes of parts one upload holds in memory over plain HTTP, where a
+/// part is read once into memory to be hashed and sent: 4 parts of 16 MiB.
+/// Larger parts (archives above 156 GiB) go fewer at a time, one at least.
+const PART_BUFFER_BUDGET: u64 = PART_CONCURRENCY as u64 * MIN_PART_SIZE;
+
 /// Longest XML reply read (CreateMultipartUpload, CompleteMultipartUpload)
 const MAX_REPLY: usize = 1 << 20;
 
@@ -325,14 +334,21 @@ pub struct ObjectInfo {
 #[derive(Clone, Copy)]
 enum Payload<'a> {
     Empty,
-    /// `len` bytes of `file` from `offset`, hashing to `sha256` (hex)
+    /// `len` bytes of `file` from `offset`, hashing to `sha256` (hex), or
+    /// sent unsigned (`UNSIGNED_PAYLOAD`)
     File {
         file: &'a std::fs::File,
         offset: u64,
         len: u64,
         sha256: &'a str,
     },
-    /// A short body (the XML of CompleteMultipartUpload)
+    /// A body read into memory already, hashing to `sha256` (hex): a part
+    /// over plain HTTP
+    Buffer {
+        data: &'a bytes::Bytes,
+        sha256: &'a str,
+    },
+    /// A short body (the XML of CompleteMultipartUpload), hashed on the way
     Bytes(&'a [u8]),
 }
 
@@ -370,28 +386,35 @@ fn plan_parts(len: u64, min_part: u64) -> Result<Vec<Part>> {
         .collect())
 }
 
-/// SHA-256 (hex) of `len` bytes of `file` from `offset`, read at offsets
-/// off the async runtime
-async fn hash_range(file: &std::fs::File, offset: u64, len: u64) -> Result<String> {
+/// `len` bytes of `file` from `offset` and their SHA-256 (hex), read and
+/// hashed in one pass off the async runtime: a part signed with its hash
+/// over plain HTTP is sent from this buffer, not read again
+async fn read_part(file: &std::fs::File, offset: u64, len: u64) -> Result<(bytes::Bytes, String)> {
     let source = file.try_clone().context("Failed to open the archive")?;
-    tokio::task::spawn_blocking(move || -> Result<String> {
+    tokio::task::spawn_blocking(move || -> Result<(bytes::Bytes, String)> {
         use std::os::unix::fs::FileExt;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; IO_CHUNK];
-        let mut done = 0u64;
-        while done < len {
-            let want = (len - done).min(IO_CHUNK as u64) as usize;
-            let n = source.read_at(&mut buf[..want], offset + done)?;
-            if n == 0 {
-                anyhow::bail!("the archive shrank while it was uploaded");
+        let size = usize::try_from(len).context("part too large for this host")?;
+        let mut buf = vec![0u8; size];
+        source.read_exact_at(&mut buf, offset).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                anyhow::anyhow!("the archive shrank while it was uploaded")
+            } else {
+                anyhow::Error::new(e).context("Failed to read the archive")
             }
-            hasher.update(&buf[..n]);
-            done += n as u64;
-        }
-        Ok(hex(&hasher.finalize()))
+        })?;
+        let sha256 = hex(&Sha256::digest(&buf));
+        Ok((bytes::Bytes::from(buf), sha256))
     })
     .await
-    .context("Hashing task panicked")?
+    .context("Reading task panicked")?
+}
+
+/// Parts uploaded at the same time when each is held in memory
+fn buffered_concurrency(part_size: u64) -> usize {
+    let fit = PART_BUFFER_BUDGET / part_size.max(1);
+    usize::try_from(fit)
+        .unwrap_or(PART_CONCURRENCY)
+        .clamp(1, PART_CONCURRENCY)
 }
 
 /// The text of `<tag>` in an S3 XML reply, unescaped
@@ -558,6 +581,23 @@ fn upload_stream(
     Ok(stream)
 }
 
+/// The body of an upload held in memory, handed to the connection in
+/// `IO_CHUNK` pieces, bumping `progress` for every piece: a slow link is a
+/// slow upload, not a stalled one
+fn buffer_stream(
+    data: bytes::Bytes,
+    progress: Progress,
+) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static {
+    futures_util::stream::unfold((data, progress), |(mut rest, progress)| async move {
+        if rest.is_empty() {
+            return None;
+        }
+        let piece = rest.split_to(rest.len().min(IO_CHUNK));
+        progress.bump();
+        Some((Ok(piece), (rest, progress)))
+    })
+}
+
 /// A bucket (and prefix) holding cache archives. `Debug` is written by hand
 /// so the secret key is never printed.
 #[derive(Clone)]
@@ -577,6 +617,10 @@ pub struct Bucket {
     /// Uploads larger than this go in parts of at least `part_size` bytes
     multipart_threshold: u64,
     part_size: u64,
+    /// Parts go with `UNSIGNED_PAYLOAD` and stream from the file (HTTPS
+    /// endpoints: TLS protects the body), or are read into memory once to
+    /// be hashed, signed and sent (plain HTTP)
+    unsigned_parts: bool,
 }
 
 impl std::fmt::Debug for Bucket {
@@ -594,6 +638,7 @@ impl Bucket {
     /// every request: transfers have only a stall timeout.
     pub fn new(config: &S3CacheConfig, client: reqwest::Client) -> Result<Self> {
         let location = S3Location::parse(&config.url, config.region.as_deref())?;
+        let unsigned_parts = location.endpoint.scheme() == "https";
         Ok(Self {
             client,
             location,
@@ -605,6 +650,7 @@ impl Bucket {
             breaker: Arc::default(),
             multipart_threshold: MULTIPART_THRESHOLD,
             part_size: MIN_PART_SIZE,
+            unsigned_parts,
         })
     }
 
@@ -613,6 +659,14 @@ impl Bucket {
     pub fn with_multipart(mut self, threshold: u64, part_size: u64) -> Self {
         self.multipart_threshold = threshold;
         self.part_size = part_size;
+        self
+    }
+
+    /// Parts sent unsigned (`true`) or read into memory and signed with
+    /// their hash (`false`), whatever the scheme (tests)
+    #[cfg(test)]
+    pub fn with_unsigned_parts(mut self, unsigned: bool) -> Self {
+        self.unsigned_parts = unsigned;
         self
     }
 
@@ -724,7 +778,7 @@ impl Bucket {
         }
         let payload_hash = match payload {
             Payload::Empty => EMPTY_SHA256.to_string(),
-            Payload::File { sha256, .. } => sha256.to_string(),
+            Payload::File { sha256, .. } | Payload::Buffer { sha256, .. } => sha256.to_string(),
             Payload::Bytes(bytes) => hex(&Sha256::digest(bytes)),
         };
         let mut last_error = None;
@@ -782,6 +836,12 @@ impl Bucket {
                     // S3 needs the length up front (it rejects chunked uploads)
                     request = request
                         .header("content-length", len)
+                        .body(reqwest::Body::wrap_stream(stream));
+                }
+                Payload::Buffer { data, .. } => {
+                    let stream = buffer_stream(data.clone(), progress.clone());
+                    request = request
+                        .header("content-length", data.len())
                         .body(reqwest::Body::wrap_stream(stream));
                 }
                 Payload::Bytes(bytes) => request = request.body(bytes.to_vec()),
@@ -1011,11 +1071,16 @@ impl Bucket {
         // Each part in a task of its own; returning (the first failure) or
         // dropping the future drops the set, which ends the others
         let file = Arc::new(file.try_clone().context("Failed to open the archive")?);
+        let concurrency = if self.unsigned_parts {
+            PART_CONCURRENCY
+        } else {
+            buffered_concurrency(parts.first().map_or(0, |part| part.len))
+        };
         let mut queued = parts.iter().copied();
         let mut running = tokio::task::JoinSet::new();
         let mut etags: Vec<(u32, String)> = Vec::with_capacity(parts.len());
         loop {
-            while running.len() < PART_CONCURRENCY {
+            while running.len() < concurrency {
                 let Some(part) = queued.next() else { break };
                 let (bucket, key, upload_id, file) = (
                     self.clone(),
@@ -1055,7 +1120,10 @@ impl Bucket {
         Ok(xml_value(&reply, "ETag").or(etag))
     }
 
-    /// Send one part, signed with its own hash; returns its number and ETag
+    /// Send one part; returns its number and ETag. The file is read once:
+    /// over HTTPS the part streams from it unsigned (`UNSIGNED_PAYLOAD`),
+    /// over plain HTTP it is read into memory, hashed, signed with its hash
+    /// and sent from there (retries included).
     async fn upload_part(
         &self,
         key: &str,
@@ -1063,23 +1131,26 @@ impl Bucket {
         file: &std::fs::File,
         part: Part,
     ) -> Result<(u32, String)> {
-        let sha256 = hash_range(file, part.offset, part.len).await?;
         let number = part.number.to_string();
-        let payload = Payload::File {
-            file,
-            offset: part.offset,
-            len: part.len,
-            sha256: &sha256,
+        let query = [("partNumber", number.as_str()), ("uploadId", upload_id)];
+        let response = if self.unsigned_parts {
+            let payload = Payload::File {
+                file,
+                offset: part.offset,
+                len: part.len,
+                sha256: UNSIGNED_PAYLOAD,
+            };
+            self.send(reqwest::Method::PUT, key, &query, &[], payload)
+                .await?
+        } else {
+            let (data, sha256) = read_part(file, part.offset, part.len).await?;
+            let payload = Payload::Buffer {
+                data: &data,
+                sha256: &sha256,
+            };
+            self.send(reqwest::Method::PUT, key, &query, &[], payload)
+                .await?
         };
-        let response = self
-            .send(
-                reqwest::Method::PUT,
-                key,
-                &[("partNumber", &number), ("uploadId", upload_id)],
-                &[],
-                payload,
-            )
-            .await?;
         if !response.status().is_success() {
             return Err(status_error(response, self.stall_timeout).await);
         }
@@ -1962,6 +2033,101 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(requests_with(&server, "POST", "uploadId=").await.is_empty());
+    }
+
+    /// Over HTTPS a part streams from the file once, its payload unsigned
+    /// (TLS protects it); the whole archive's hash is still stored with the
+    /// object, and the headers are signed as SigV4 wants for that case
+    #[tokio::test]
+    async fn parts_over_https_are_sent_unsigned_and_read_once() {
+        let server = multipart_server().await;
+        let b = bucket(&server, "")
+            .with_multipart(2000, 1000)
+            .with_unsigned_parts(true);
+        let dir = tempfile::tempdir().unwrap();
+        let (file, body) = archive_of(dir.path(), 2500);
+        let hash = hex(&Sha256::digest(&body));
+
+        let etag = b
+            .put_file(&b.object_key(1, "big.tar.zst"), &file, &hash)
+            .await
+            .unwrap();
+
+        assert_eq!(etag.as_deref(), Some("\"final-3\""));
+        let created = requests_with(&server, "POST", "uploads").await;
+        assert_eq!(created[0].headers[META_SHA256], hash.as_str());
+        let mut parts = requests_with(&server, "PUT", "partNumber").await;
+        parts.sort_by_key(|part| part.url.query().unwrap().to_string());
+        let slices = [&body[..1000], &body[1000..2000], &body[2000..]];
+        assert_eq!(parts.len(), 3);
+        for (part, slice) in parts.iter().zip(slices) {
+            assert_eq!(part.body, slice);
+            assert_eq!(part.headers["x-amz-content-sha256"], UNSIGNED_PAYLOAD);
+            // The signature a server computes for this request
+            let date = part.headers["x-amz-date"].to_str().unwrap();
+            let host = part.headers["host"].to_str().unwrap();
+            let number = part
+                .url
+                .query_pairs()
+                .find(|(name, _)| name == "partNumber")
+                .unwrap()
+                .1
+                .into_owned();
+            let (_, canonical_query) =
+                encode_query(&[("partNumber", &number), ("uploadId", "up/1+x")]);
+            let expected = Signer {
+                access_key: "AK",
+                secret_key: "SK",
+                region: "us-east-1",
+            }
+            .authorization(
+                "PUT",
+                "/ci-cache/project-1/big.tar.zst",
+                &canonical_query,
+                &[
+                    ("host", host),
+                    ("x-amz-content-sha256", UNSIGNED_PAYLOAD),
+                    ("x-amz-date", date),
+                ],
+                UNSIGNED_PAYLOAD,
+                date,
+            );
+            assert_eq!(part.headers["authorization"], expected.as_str());
+        }
+    }
+
+    #[test]
+    fn parts_are_unsigned_only_over_https() {
+        let at = |url: &str| {
+            Bucket::new(
+                &crate::runner_daemon::config::S3CacheConfig {
+                    url: url.to_string(),
+                    access_key: "AK".to_string(),
+                    secret_key: "SK".to_string(),
+                    region: None,
+                },
+                reqwest::Client::new(),
+            )
+            .unwrap()
+            .unsigned_parts
+        };
+        assert!(at("https://s3.eu-central-1.amazonaws.com/ci"));
+        assert!(!at("http://minio.corp:9000/ci"));
+    }
+
+    /// Over plain HTTP parts are held in memory: at most four parts of the
+    /// usual 16 MiB, fewer of the larger parts of huge archives
+    #[test]
+    fn buffered_parts_stay_within_the_memory_budget() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(buffered_concurrency(1000), 4);
+        assert_eq!(buffered_concurrency(16 * MIB), 4);
+        assert_eq!(buffered_concurrency(20 * MIB), 3);
+        assert_eq!(buffered_concurrency(64 * MIB), 1);
+        assert_eq!(buffered_concurrency(525 * MIB), 1);
+        // The largest part S3's limits lead to
+        let largest = plan_parts(MAX_OBJECT_SIZE, MIN_PART_SIZE).unwrap()[0].len;
+        assert_eq!(buffered_concurrency(largest), 1);
     }
 
     #[tokio::test]
