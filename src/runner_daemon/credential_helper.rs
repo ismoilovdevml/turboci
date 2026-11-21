@@ -277,22 +277,36 @@ async fn run(
         Some(dir) => dir.join(&program),
         None => program.clone().into(),
     };
-    let mut child = tokio::process::Command::new(&path)
-        .arg(action)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                format!(
-                    "{} is not installed (not found in the runner's PATH)",
-                    program
-                )
+    let spawn = || {
+        tokio::process::Command::new(&path)
+            .arg(action)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+    };
+    // ETXTBSY: the helper is being written (upgraded), or another thread forked
+    // while it was open for writing; it clears within moments
+    let mut attempt = 0;
+    let spawned = loop {
+        match spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 3 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20 * attempt)).await;
             }
-            _ => format!("cannot run {}: {}", program, e),
-        })?;
+            other => break other,
+        }
+    };
+    let mut child = spawned.map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!(
+                "{} is not installed (not found in the runner's PATH)",
+                program
+            )
+        }
+        _ => format!("cannot run {}: {}", program, e),
+    })?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let answered = async move {
         // A helper that exits without reading its input is not an error here
