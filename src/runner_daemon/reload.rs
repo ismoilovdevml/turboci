@@ -1,27 +1,23 @@
-//! Config reload on SIGHUP: `concurrent`, `check_interval` and the admission
-//! limits change while the runner runs; any other change is reported as
-//! needing a restart. An invalid config changes nothing.
+//! Config reload on SIGHUP. `concurrent`, `check_interval` and the admission
+//! limits change at once; settings that only matter to a job (environment,
+//! hooks, Docker settings, cache limits, ...) apply to the jobs that start
+//! after the reload, while running jobs keep the settings they started with.
+//! Settings the runner only reads at start are reported as needing a
+//! restart (see `pin_restart_only`). An invalid config changes nothing.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use super::config::RunnerConfig;
-use super::{admission, metrics, RunnerDaemon};
-
-/// Keys a reload applies; changes to any other key need a restart
-const LIVE_KEYS: [&str; 5] = [
-    "concurrent",
-    "check_interval",
-    "min_free_memory",
-    "min_free_disk",
-    "max_load_avg",
-];
+use super::config::{RunnerConfig, GLOBAL_KEYS};
+use super::{admission, local_cache, metrics, RunnerDaemon, Settings};
 
 /// What a reload did
 #[derive(Debug, Default, PartialEq)]
 pub struct Reloaded {
-    /// Settings now in effect, as "key old → new"
+    /// Settings now in effect, as "key old → new" or, for those only new
+    /// jobs see, as "for new jobs: key, key"
     pub applied: Vec<String>,
     /// Keys whose new value only takes effect after a restart
     pub restart_needed: Vec<String>,
@@ -81,7 +77,15 @@ impl RunnerDaemon {
     pub fn reload(&self, path: &Path) -> Result<Reloaded> {
         let new = RunnerConfig::load(path)?;
         let limits = admission::Limits::from_config(&new)?;
+        let mut reloaded = self.reload_global(&new, limits);
+        let runner = self.reload_runner(&new);
+        reloaded.applied.extend(runner.applied);
+        reloaded.restart_needed.extend(runner.restart_needed);
+        Ok(reloaded)
+    }
 
+    /// Apply the settings of the whole process (`GLOBAL_KEYS`) from `new`
+    fn reload_global(&self, new: &RunnerConfig, limits: admission::Limits) -> Reloaded {
         let mut applied = Vec::new();
         let concurrent = self.capacity.set_limit(new.concurrent);
         if concurrent != new.concurrent {
@@ -120,15 +124,73 @@ impl RunnerDaemon {
                 limits.describe()
             ));
         }
-
-        Ok(Reloaded {
+        let restart_needed = if self.config.metrics_listen != new.metrics_listen {
+            vec!["metrics_listen".to_string()]
+        } else {
+            Vec::new()
+        };
+        Reloaded {
             applied,
-            restart_needed: changed_keys(&self.config, &new),
-        })
+            restart_needed,
+        }
+    }
+
+    /// Give the jobs that start from now on this runner's settings from
+    /// `new`; keys only read at start are reported instead
+    fn reload_runner(&self, new: &RunnerConfig) -> Reloaded {
+        let current = self.settings();
+        let live = pin_restart_only(&current.config, new);
+        let changed = changed_keys(&current.config, &live);
+        let restart_needed = changed_keys(&live, new);
+        if changed.is_empty() {
+            return Reloaded {
+                applied: Vec::new(),
+                restart_needed,
+            };
+        }
+        let mut cache = local_cache(&live);
+        if let Some(bucket) = &self.remote_cache {
+            cache = cache.with_remote(bucket.clone());
+        }
+        let settings = Settings {
+            executor: Arc::new(current.executor.reconfigured(&live.executor)),
+            config: Arc::new(live),
+            cache,
+        };
+        self.update_settings(|current| *current = settings);
+        Reloaded {
+            applied: vec![format!("for new jobs: {}", changed.join(", "))],
+            restart_needed,
+        }
     }
 }
 
-/// Dotted keys whose values differ between `old` and `new`, live keys aside
+/// `new` with the settings the runner only reads at start taken from `old`:
+/// the identity and connection to GitLab, where it keeps state, workspaces and
+/// the cache, and the executor kind. Everything else is read per job (from the
+/// settings it starts with) or per sweep, so it is safe to swap. A new setting
+/// read only at start must be added here.
+fn pin_restart_only(old: &RunnerConfig, new: &RunnerConfig) -> RunnerConfig {
+    let mut live = new.clone();
+    live.runner_token = old.runner_token.clone();
+    live.gitlab_url = old.gitlab_url.clone();
+    live.tls_ca_file = old.tls_ca_file.clone();
+    live.proxy = old.proxy.clone();
+    live.no_proxy = old.no_proxy.clone();
+    live.state_dir = old.state_dir.clone();
+    live.metrics_listen = old.metrics_listen.clone();
+    // The S3 layer is set up at start, and only while the cache is on
+    live.cache_enabled = old.cache_enabled;
+    live.cache_dir = old.cache_dir.clone();
+    live.cache_s3 = old.cache_s3.clone();
+    live.executor.executor_type = old.executor.executor_type.clone();
+    live.executor.docker.builds_dir = old.executor.docker.builds_dir.clone();
+    live.executor.shell.work_dir = old.executor.shell.work_dir.clone();
+    live
+}
+
+/// Dotted keys whose values differ between `old` and `new`, apart from the
+/// settings of the whole process (`GLOBAL_KEYS`, applied on their own)
 fn changed_keys(old: &RunnerConfig, new: &RunnerConfig) -> Vec<String> {
     fn walk(old: &toml::Table, new: &toml::Table, prefix: &str, out: &mut Vec<String>) {
         let keys: std::collections::BTreeSet<&String> = old.keys().chain(new.keys()).collect();
@@ -148,7 +210,7 @@ fn changed_keys(old: &RunnerConfig, new: &RunnerConfig) -> Vec<String> {
     else {
         return vec!["(unknown: the config could not be compared)".to_string()];
     };
-    for key in LIVE_KEYS {
+    for key in GLOBAL_KEYS {
         old.remove(key);
         new.remove(key);
     }
@@ -166,17 +228,17 @@ mod tests {
     }
 
     #[test]
-    fn finds_changes_that_need_a_restart() {
+    fn finds_changed_keys_apart_from_the_global_ones() {
         let old = parse("runner_token = \"t\"\nconcurrent = 4\n[executor.docker]\nmemory = \"1g\"");
 
-        // Live keys only: nothing needs a restart
-        let live = parse(
-            "runner_token = \"t\"\nconcurrent = 1\ncheck_interval = 9\nmin_free_disk = \"1g\"\nmax_load_avg = 3.0\n[executor.docker]\nmemory = \"1g\"",
+        // Global keys only: nothing to report here
+        let global = parse(
+            "runner_token = \"t\"\nconcurrent = 1\ncheck_interval = 9\nmin_free_disk = \"1g\"\nmax_load_avg = 3.0\nmetrics_listen = \"127.0.0.1:9252\"\n[executor.docker]\nmemory = \"1g\"",
         );
-        assert!(changed_keys(&old, &live).is_empty());
+        assert!(changed_keys(&old, &global).is_empty());
 
         let other = parse(
-            "runner_token = \"t2\"\ncache_dir = \"/srv/cache\"\nmetrics_listen = \"127.0.0.1:9252\"\n[executor.docker]\nmemory = \"2g\"\nprivileged = true",
+            "runner_token = \"t2\"\ncache_dir = \"/srv/cache\"\n[executor.docker]\nmemory = \"2g\"\nprivileged = true",
         );
         assert_eq!(
             changed_keys(&old, &other),
@@ -184,11 +246,49 @@ mod tests {
                 "cache_dir",
                 "executor.docker.memory",
                 "executor.docker.privileged",
-                "metrics_listen",
                 "runner_token",
             ]
         );
         // A key that was set and is now removed counts too
-        assert_eq!(changed_keys(&other, &old).len(), 5);
+        assert_eq!(changed_keys(&other, &old).len(), 4);
+    }
+
+    #[test]
+    fn settings_read_only_at_start_are_pinned() {
+        let old = parse("runner_token = \"t\"\nstate_dir = \"/srv/a\"\n[executor]\nexecutor_type = \"shell\"\n[executor.shell]\nwork_dir = \"/srv/a/b\"");
+        let new = parse(
+            "runner_token = \"t2\"\ngitlab_url = \"https://other\"\nstate_dir = \"/srv/b\"\nproxy = \"http://p:3128\"\ncache_enabled = false\ncache_dir = \"/c\"\nenvironment = [\"A=1\"]\npre_build_script = \"echo\"\ncache_max_age_days = 1\ncache_max_size = \"1g\"\n[executor]\nexecutor_type = \"docker\"\nworkspace_max_age_days = 0\nworkspace_max_size = \"5g\"\n[executor.docker]\nbuilds_dir = \"/b\"\nmemory = \"1g\"\nvolumes = [\"/x\"]\npull_policy = \"never\"\n[executor.shell]\nwork_dir = \"/w\"",
+        );
+
+        let live = pin_restart_only(&old, &new);
+
+        assert_eq!(
+            changed_keys(&old, &live),
+            [
+                "cache_max_age_days",
+                "cache_max_size",
+                "environment",
+                "executor.docker.memory",
+                "executor.docker.pull_policy",
+                "executor.docker.volumes",
+                "executor.workspace_max_age_days",
+                "executor.workspace_max_size",
+                "pre_build_script",
+            ]
+        );
+        assert_eq!(
+            changed_keys(&live, &new),
+            [
+                "cache_dir",
+                "cache_enabled",
+                "executor.docker.builds_dir",
+                "executor.executor_type",
+                "executor.shell.work_dir",
+                "gitlab_url",
+                "proxy",
+                "runner_token",
+                "state_dir",
+            ]
+        );
     }
 }

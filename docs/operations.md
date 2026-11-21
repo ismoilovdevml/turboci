@@ -5,8 +5,8 @@
 ```bash
 sudo systemctl status turboci
 sudo journalctl -u turboci -f       # runner and job events
-sudo systemctl reload turboci       # apply concurrent, check_interval, admission limits
-sudo systemctl restart turboci      # after any other config change
+sudo systemctl reload turboci       # apply config changes (see below for what needs a restart)
+sudo systemctl restart turboci      # after changes a reload cannot apply
 ```
 
 A healthy start ends with:
@@ -47,16 +47,28 @@ These settings take effect at once:
 | `check_interval` | From the next job request on |
 | `min_free_memory`, `min_free_disk`, `max_load_avg` | From the next job request on |
 
+Settings that only matter to a job apply to the jobs that start after the
+reload; running jobs keep the settings they started with: `environment`, the
+hook scripts (`pre_get_sources_script`, ...), every `[executor.docker]`
+setting except `builds_dir` (default image, pull policies, resource limits,
+volumes, services, registries, ...), `workspace_max_age_days`,
+`workspace_max_size`, `cache_max_age_days` and `cache_max_size` (the hourly
+cleanup uses the new limits too).
+
+These need a restart: `runner_token`, `gitlab_url`, `tls_ca_file`, `proxy`,
+`no_proxy`, `state_dir`, `metrics_listen`, `cache_enabled`, `cache_dir`,
+`cache_s3`, `executor_type`, `executor.docker.builds_dir` and
+`executor.shell.work_dir`. A reload lists their changes, and the runner keeps
+the old values (for new jobs too) until it restarts:
+
 ```text
 🔄 SIGHUP: reloading the config
-🔄 Config reloaded: concurrent 4 → 8, check_interval 3s → 5s
-Config changes to cache_dir, executor.docker.memory take effect after a restart
+🔄 Config reloaded: concurrent 4 → 8, check_interval 3s → 5s, for new jobs: environment, executor.docker.memory
+Config changes to cache_dir take effect after a restart
 ```
 
-Any other change is listed as needing a restart (values are never logged,
-only key names), and the runner keeps using the old value until then. A file
-that does not parse or validate changes nothing, not even its valid
-settings:
+Values are never logged, only key names. A file that does not parse or
+validate changes nothing, not even its valid settings:
 
 ```text
 ❌ Config reload failed, the runner keeps its config: Invalid config file: "/etc/turboci-runner.toml": ...

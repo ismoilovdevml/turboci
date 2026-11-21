@@ -215,8 +215,8 @@ async fn run() -> Result<()> {
 
 /// SIGQUIT: finish running jobs, then exit. SIGTERM/SIGINT: stop running jobs,
 /// report them failed and exit (the same signals gitlab-runner uses). SIGHUP:
-/// re-read the config and apply `concurrent`, `check_interval` and the
-/// admission limits; an invalid config is logged and changes nothing.
+/// re-read the config and apply what can change while the runner runs (see
+/// `runner_daemon::reload`); an invalid config is logged and changes nothing.
 fn spawn_signal_handler(
     shutdown: runner_daemon::ShutdownHandle,
     reloader: runner_daemon::reload::Reloader,

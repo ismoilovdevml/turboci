@@ -880,6 +880,15 @@ impl DockerExecutor {
         self
     }
 
+    /// The same executor (Docker connection, owner, image pulls in flight)
+    /// with other settings, for jobs that start from now on
+    pub fn reconfigured(&self, config: DockerConfig) -> Self {
+        Self {
+            config,
+            ..self.clone()
+        }
+    }
+
     fn labels(&self) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::from([(OWNER_LABEL.to_string(), self.owner.clone())])
     }

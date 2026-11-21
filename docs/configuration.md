@@ -5,10 +5,14 @@ the installer. Every key is optional except `runner_token`. Unknown keys are
 logged as warnings at startup; invalid values stop the runner with an error
 instead of being silently ignored.
 
-Apply changes with `sudo systemctl restart turboci`. Changes to `concurrent`,
-`check_interval` and the [admission limits](#admission-control) also apply
-with `sudo systemctl reload turboci`, without stopping running jobs (see
-[reloading the config](operations.md#reloading-the-config)).
+Apply changes with `sudo systemctl reload turboci`, without stopping running
+jobs: `concurrent`, `check_interval` and the [admission
+limits](#admission-control) change at once, settings that only matter to a
+job (`environment`, hooks, Docker settings, cache and workspace limits, ...)
+apply to the jobs that start afterwards. A few settings, such as
+`runner_token`, `gitlab_url`, `proxy`, the directories and `executor_type`,
+need `sudo systemctl restart turboci` (see [reloading the
+config](operations.md#reloading-the-config)).
 
 ## Example
 

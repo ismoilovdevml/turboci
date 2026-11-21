@@ -416,12 +416,35 @@ async fn abort_requested(shutdown: &mut watch::Receiver<Shutdown>) {
 /// Interval between keep-alive updates that also detect remote cancellation
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
+/// What a job runs with, taken when it starts: a config reload swaps it for
+/// the jobs that start later, running jobs keep theirs
+#[derive(Clone)]
+struct Settings {
+    config: Arc<config::RunnerConfig>,
+    executor: Arc<executor::ExecutorType>,
+    cache: job_cache::LocalCache,
+}
+
+/// The local job cache of `config` (without its S3 layer)
+fn local_cache(config: &config::RunnerConfig) -> job_cache::LocalCache {
+    job_cache::LocalCache::new(&config.cache_dir)
+        .with_max_age_days(config.cache_max_age_days)
+        // Checked by `RunnerConfig::validate` when it was loaded
+        .with_max_size(config.cache_max_size_bytes().unwrap_or(None))
+}
+
+/// A runner. Clones share its state; `config`, `executor` and `cache` are the
+/// settings this clone works with (see `current`).
 #[derive(Clone)]
 pub struct RunnerDaemon {
     cache: job_cache::LocalCache,
     config: Arc<config::RunnerConfig>,
     gitlab: Arc<GitLabClient>,
     executor: Arc<executor::ExecutorType>,
+    /// The settings new jobs get, swapped by a config reload
+    settings: Arc<std::sync::RwLock<Settings>>,
+    /// The cache's S3 layer, kept when a reload rebuilds the cache
+    remote_cache: Option<s3::Bucket>,
     /// Job slots: `concurrent`, changed by a config reload
     capacity: Arc<capacity::Capacity>,
     /// Seconds between job requests, changed by a config reload
@@ -482,17 +505,21 @@ impl RunnerDaemon {
 
         // Checked by `RunnerConfig::validate` when the config was loaded
         let limits = admission::Limits::from_config(&config).unwrap_or_default();
-        Self {
-            capacity: capacity::Capacity::new(config.concurrent),
-            check_interval: Arc::new(config.check_interval.into()),
-            limits: Arc::new(std::sync::RwLock::new(limits)),
-            cache: job_cache::LocalCache::new(&config.cache_dir)
-                .with_max_age_days(config.cache_max_age_days)
-                // Checked by `RunnerConfig::validate` when it was loaded
-                .with_max_size(config.cache_max_size_bytes().unwrap_or(None)),
+        let settings = Settings {
+            cache: local_cache(&config),
             config: Arc::new(config),
-            gitlab: Arc::new(gitlab),
             executor: Arc::new(executor),
+        };
+        Self {
+            capacity: capacity::Capacity::new(settings.config.concurrent),
+            check_interval: Arc::new(settings.config.check_interval.into()),
+            limits: Arc::new(std::sync::RwLock::new(limits)),
+            cache: settings.cache.clone(),
+            config: settings.config.clone(),
+            gitlab: Arc::new(gitlab),
+            executor: settings.executor.clone(),
+            settings: Arc::new(std::sync::RwLock::new(settings)),
+            remote_cache: None,
             scrubber: Arc::new(std::sync::RwLock::new(scrubber)),
             shutdown: Arc::new(watch::Sender::new(Shutdown::Running)),
             heartbeat_interval: HEARTBEAT_INTERVAL,
@@ -516,8 +543,38 @@ impl RunnerDaemon {
 
     /// Share the job cache with other runners through S3
     pub fn with_s3_cache(mut self, bucket: s3::Bucket) -> Self {
-        self.cache = self.cache.with_remote(bucket);
+        self.cache = self.cache.with_remote(bucket.clone());
+        self.remote_cache = Some(bucket);
+        let cache = self.cache.clone();
+        self.update_settings(|settings| settings.cache = cache);
         self
+    }
+
+    /// The settings new jobs get now
+    fn settings(&self) -> Settings {
+        match self.settings.read() {
+            Ok(settings) => settings.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn update_settings(&self, update: impl FnOnce(&mut Settings)) {
+        match self.settings.write() {
+            Ok(mut settings) => update(&mut settings),
+            Err(poisoned) => update(&mut poisoned.into_inner()),
+        }
+    }
+
+    /// This runner with the settings a job starting now gets: a config
+    /// reload may have changed them since this clone was made
+    fn current(&self) -> RunnerDaemon {
+        let settings = self.settings();
+        RunnerDaemon {
+            cache: settings.cache,
+            config: settings.config,
+            executor: settings.executor,
+            ..self.clone()
+        }
     }
 
     pub fn shutdown_handle(&self) -> ShutdownHandle {
@@ -628,7 +685,8 @@ impl RunnerDaemon {
                     info!("📦 Received job #{} ({})", job.id, job_name);
 
                     self.metrics.request(metrics::Request::Job);
-                    let daemon = self.clone();
+                    // The job keeps the settings it starts with
+                    let daemon = self.current();
                     tokio::spawn(async move {
                         let _slot = slot;
                         if let Err(e) = daemon.execute_job(*job).await {
@@ -1002,10 +1060,11 @@ impl RunnerDaemon {
         }
     }
 
-    /// Sweep at start and every `EVICTION_INTERVAL` (see `sweep`)
+    /// Sweep at start and every `EVICTION_INTERVAL` (see `sweep`), with the
+    /// limits in effect then
     async fn housekeeping(self) {
         loop {
-            self.sweep().await;
+            self.current().sweep().await;
             sleep(EVICTION_INTERVAL).await;
         }
     }
@@ -1594,17 +1653,7 @@ mod tests {
         dir: &std::path::Path,
         configure: impl FnOnce(&mut config::RunnerConfig),
     ) -> RunnerDaemon {
-        for (verb, route, status) in [
-            ("PATCH", r"^/api/v4/jobs/\d+/trace$", 202),
-            ("PUT", r"^/api/v4/jobs/\d+$", 200),
-            ("POST", r"^/api/v4/jobs/\d+/artifacts$", 201),
-        ] {
-            Mock::given(method(verb))
-                .and(wiremock::matchers::path_regex(route))
-                .respond_with(ResponseTemplate::new(status))
-                .mount(server)
-                .await;
-        }
+        job_routes(server).await;
         let mut config = config::RunnerConfig {
             runner_token: "glrt-test".to_string(),
             gitlab_url: server.uri(),
@@ -1621,6 +1670,21 @@ mod tests {
             GitLabClient::new(server.uri(), "glrt-test".to_string()),
             executor,
         )
+    }
+
+    /// GitLab's answers to trace, final state and artifact requests
+    async fn job_routes(server: &MockServer) {
+        for (verb, route, status) in [
+            ("PATCH", r"^/api/v4/jobs/\d+/trace$", 202),
+            ("PUT", r"^/api/v4/jobs/\d+$", 200),
+            ("POST", r"^/api/v4/jobs/\d+/artifacts$", 201),
+        ] {
+            Mock::given(method(verb))
+                .and(wiremock::matchers::path_regex(route))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(server)
+                .await;
+        }
     }
 
     fn lifecycle_job(id: u64, script: &[&str], artifacts_when: &str) -> Job {
@@ -2901,17 +2965,18 @@ mod tests {
             daemon.capacity.acquire().await,
         ];
 
-        write("concurrent = 1\ncheck_interval = 7\nmin_free_disk = \"1g\"\ncache_max_age_days = 3");
+        write("concurrent = 1\ncheck_interval = 7\nmin_free_disk = \"1g\"\ncache_max_age_days = 3\nmetrics_listen = \"127.0.0.1:0\"\ncache_enabled = false");
         let reloaded = daemon.reload(&file).unwrap();
         assert_eq!(
             reloaded.applied,
             [
                 "concurrent 4 → 1",
                 "check_interval 3s → 7s",
-                "admission limits off → min_free_disk 1.0 GB"
+                "admission limits off → min_free_disk 1.0 GB",
+                "for new jobs: cache_max_age_days",
             ]
         );
-        assert_eq!(reloaded.restart_needed, ["cache_max_age_days"]);
+        assert_eq!(reloaded.restart_needed, ["metrics_listen", "cache_enabled"]);
         assert_eq!(daemon.capacity.limit(), 1);
         assert_eq!(daemon.check_interval(), Duration::from_secs(7));
         assert_eq!(daemon.current_limits().min_free_disk, Some(1 << 30));
@@ -2922,6 +2987,81 @@ mod tests {
         // The same file again changes nothing
         let again = daemon.reload(&file).unwrap();
         assert!(again.applied.is_empty(), "{:?}", again.applied);
+    }
+
+    #[tokio::test]
+    async fn a_reload_gives_new_jobs_new_settings_and_running_jobs_keep_theirs() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("runner.toml");
+        let write = |settings: &str| {
+            std::fs::write(
+                &file,
+                format!(
+                    "runner_token = \"glrt-test\"\ngitlab_url = \"{}\"\nstate_dir = \"{}\"\ncache_dir = \"{}/cache\"\n{}\n",
+                    server.uri(),
+                    dir.path().display(),
+                    dir.path().display(),
+                    settings
+                ),
+            )
+            .unwrap()
+        };
+        write("environment = [\"STAGE=old\"]\n[executor]\nexecutor_type = \"shell\"");
+        job_routes(&server).await;
+        let daemon = daemon_from_file(&server, dir.path(), &file);
+        // What a job that started before the reload runs with
+        let started = daemon.current();
+
+        write(
+            "environment = [\"STAGE=new\"]\npre_build_script = \"echo hook ran\"\ncache_max_age_days = 3\nproxy = \"http://proxy.corp:3128\"\n[executor]\nexecutor_type = \"shell\"\nworkspace_max_age_days = 0\n[executor.shell]\nwork_dir = \"/elsewhere\"",
+        );
+        let reloaded = daemon.reload(&file).unwrap();
+        assert_eq!(
+            reloaded.applied,
+            ["for new jobs: cache_max_age_days, environment, executor.workspace_max_age_days, pre_build_script"]
+        );
+        assert_eq!(
+            reloaded.restart_needed,
+            ["executor.shell.work_dir", "proxy"]
+        );
+
+        let next = daemon.current();
+        assert_eq!(next.config.environment, ["STAGE=new"]);
+        // Settings needing a restart keep their running values
+        assert_eq!(next.config.proxy, None);
+        assert_eq!(
+            next.config.executor.shell.work_dir,
+            started.config.executor.shell.work_dir
+        );
+        assert_eq!(started.config.environment, ["STAGE=old"]);
+
+        let script = ["echo \"stage=$STAGE\""];
+        next.execute_job(lifecycle_job(91, &script, "on_success"))
+            .await
+            .unwrap();
+        let trace = trace_of(&server, 91).await;
+        assert!(
+            trace.contains("stage=new") && trace.contains("hook ran"),
+            "{}",
+            trace
+        );
+
+        started
+            .execute_job(lifecycle_job(92, &script, "on_success"))
+            .await
+            .unwrap();
+        let trace = trace_of(&server, 92).await;
+        assert!(
+            trace.contains("stage=old") && !trace.contains("hook ran"),
+            "{}",
+            trace
+        );
+
+        // Reloading the same file again changes nothing more
+        let again = daemon.reload(&file).unwrap();
+        assert!(again.applied.is_empty(), "{:?}", again.applied);
+        assert_eq!(again.restart_needed, reloaded.restart_needed);
     }
 
     #[tokio::test]

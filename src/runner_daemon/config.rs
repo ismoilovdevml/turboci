@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+/// Settings of the whole process rather than of one runner: with
+/// `[[runners]]` they are set once, at the top of the file
+pub const GLOBAL_KEYS: [&str; 6] = [
+    "concurrent",
+    "check_interval",
+    "metrics_listen",
+    "min_free_memory",
+    "min_free_disk",
+    "max_load_avg",
+];
+
 /// Runner daemon configuration. Every field has a default; `validate` rejects
 /// values the runner cannot work with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
