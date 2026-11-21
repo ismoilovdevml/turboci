@@ -462,6 +462,52 @@ impl Drop for PendingUpload {
     }
 }
 
+/// Result of a conditional GET
+pub enum Get<'a> {
+    /// The local copy with the given ETag is current (304)
+    NotModified,
+    /// No such object (404)
+    NotFound,
+    Found(Object<'a>),
+}
+
+/// An object being downloaded
+pub struct Object<'a> {
+    response: reqwest::Response,
+    bucket: &'a Bucket,
+    pub etag: Option<String>,
+    /// The hash runners store with an archive (`x-amz-meta-sha256`)
+    pub sha256: Option<String>,
+}
+
+impl Object<'_> {
+    /// The next piece of the body, `None` at its end. A stall or a dropped
+    /// connection opens the breaker.
+    pub async fn chunk(&mut self) -> Result<Option<bytes::Bytes>> {
+        let limit = self.bucket.stall_timeout;
+        tokio::time::timeout(limit, self.response.chunk())
+            .await
+            .map_err(|_| stalled(limit))
+            .and_then(|chunk| {
+                chunk
+                    .map_err(reqwest::Error::without_url)
+                    .context("S3 download interrupted")
+            })
+            .map_err(|e| self.bucket.trip(e))
+    }
+
+    /// Fail when the body received, hashing to `sha256`, is not the archive
+    /// that was uploaded (when the uploader stored its hash)
+    pub fn check(&self, sha256: &str) -> Result<()> {
+        match &self.sha256 {
+            Some(expected) if expected != sha256 => {
+                anyhow::bail!("the archive downloaded from S3 does not match its hash")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// The body of an upload: `len` bytes of `file` from `offset`, read in
 /// `IO_CHUNK` pieces at increasing offsets (never through the shared file
 /// position, so an attempt that is still being torn down cannot move the
@@ -800,21 +846,35 @@ impl Bucket {
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
-    /// Download `key` into a temporary file in `dir`, unless `etag` is current
-    pub async fn get_to_file(&self, key: &str, etag: Option<&str>, dir: &Path) -> Result<Download> {
+    /// Ask for `key`, unless `etag` is current; a found object's body is
+    /// then read with `Object::chunk`
+    pub async fn get(&self, key: &str, etag: Option<&str>) -> Result<Get<'_>> {
         let headers: Vec<(&str, &str)> = etag
             .map(|etag| vec![("if-none-match", etag)])
             .unwrap_or_default();
-        let mut response = self
+        let response = self
             .send(reqwest::Method::GET, key, &[], &headers, Payload::Empty)
             .await?;
         match response.status().as_u16() {
-            304 => return Ok(Download::NotModified),
-            404 => return Ok(Download::NotFound),
-            200 => {}
-            _ => return Err(status_error(response, self.stall_timeout).await),
+            304 => Ok(Get::NotModified),
+            404 => Ok(Get::NotFound),
+            200 => Ok(Get::Found(Object {
+                etag: header(&response, "etag"),
+                sha256: header(&response, META_SHA256),
+                response,
+                bucket: self,
+            })),
+            _ => Err(status_error(response, self.stall_timeout).await),
         }
-        let etag = header(&response, "etag");
+    }
+
+    /// Download `key` into a temporary file in `dir`, unless `etag` is current
+    pub async fn get_to_file(&self, key: &str, etag: Option<&str>, dir: &Path) -> Result<Download> {
+        let mut object = match self.get(key, etag).await? {
+            Get::NotModified => return Ok(Download::NotModified),
+            Get::NotFound => return Ok(Download::NotFound),
+            Get::Found(object) => object,
+        };
         let file = tempfile::NamedTempFile::new_in(dir)
             .with_context(|| format!("Failed to create a file in {}", dir.display()))?;
         // Network chunks are small (often 16 KiB): written in larger pieces
@@ -825,27 +885,20 @@ impl Bucket {
         let mut hasher = Sha256::new();
         let mut bytes = 0u64;
         use tokio::io::AsyncWriteExt;
-        while let Some(chunk) = tokio::time::timeout(self.stall_timeout, response.chunk())
-            .await
-            .map_err(|_| stalled(self.stall_timeout))
-            .and_then(|chunk| {
-                chunk
-                    .map_err(reqwest::Error::without_url)
-                    .context("S3 download interrupted")
-            })
-            .map_err(|e| self.trip(e))?
-        {
+        while let Some(chunk) = object.chunk().await? {
             hasher.update(&chunk);
             out.write_all(&chunk).await?;
             bytes += chunk.len() as u64;
         }
         // Writes the rest of the buffer: the file is complete before it is used
         out.flush().await?;
+        let sha256 = hex(&hasher.finalize());
+        object.check(&sha256)?;
         Ok(Download::Downloaded {
             file,
-            etag,
+            etag: object.etag,
             bytes,
-            sha256: hex(&hasher.finalize()),
+            sha256,
         })
     }
 

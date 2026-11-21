@@ -58,7 +58,9 @@ cache_max_age_days = 14
 # project. Unset or "0": no limit (only cache_max_age_days applies)
 # cache_max_size = "50g"
 # Share the cache between runner hosts through S3-compatible storage
-# (MinIO, AWS S3, Ceph, R2, ...); cache_dir stays the local first layer
+# (MinIO, AWS S3, Ceph, R2, ...); cache_dir stays the local first layer.
+# Expire old archives and incomplete multipart uploads with a bucket
+# lifecycle rule: the runner never deletes objects
 # [cache_s3]
 # url = "https://minio.corp:9000/turboci-cache"
 # access_key = "..."

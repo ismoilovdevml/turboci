@@ -147,18 +147,31 @@ writes the runner's side with `--proxy URL --no-proxy LIST`.
 | `cache_enabled` | `true` | Enables `cache:` in jobs |
 | `cache_dir` | `/var/lib/turboci/cache` | Local cache, one directory per project |
 | `cache_max_age_days` | `14` | Archives not used for this many days are deleted (`0` keeps them forever) |
-| `cache_max_size` | unset | Total size of the archives of all projects (`"512m"`, `"50g"`, bytes); after each save or download the least recently used archives are deleted until the cache fits, whatever their project. The archive just written is kept even if it is larger on its own. Unset or `"0"`: no limit |
+| `cache_max_size` | unset | Total size of the archives of all projects, of both formats (`"512m"`, `"50g"`, bytes); after each save or download the least recently used archives are deleted until the cache fits, whatever their project. The archive just written is kept even if it is larger on its own. Unset or `"0"`: no limit |
 
 Without `cache_s3` the cache is local to the runner host, like gitlab-runner
 without a distributed cache. Archives are written to a temporary file and
 renamed into place, so concurrent jobs never read a partial archive.
 
-Cache archives are ZIP files with zstd-compressed entries (artifacts stay
-deflate, which GitLab reads). On a 262 MB `node_modules` of 15,450 files
-saving took 0.76 s instead of 2.0 s, at the same size. Caches written by
-older versions still restore; older versions cannot read the new ones and
-treat them as a cache miss with a warning, so upgrade every runner that
-shares an S3 cache together.
+Cache archives are a tar of the cached files, symlinks and directories
+(empty ones included) in one zstd stream, `<key>.tar.zst`; artifacts stay
+deflate ZIPs, which GitLab reads. One stream compresses across files and is
+extracted as it downloads. File modes are kept (without setuid, setgid and
+sticky bits), timestamps and owners are not. On a synthetic `node_modules`
+of 15,000 files (57.6 MB, a twentieth of them incompressible images) the
+archive is 17.1 MB, saved in 0.37 s and extracted in 0.62 s, against
+20.6 MB, 0.46 s and 0.70 s for the zstd ZIPs of versions up to 0.10. zstd
+level 3 was both larger (17.9 MB) and slower there, so level 1 is used.
+
+Versions up to 0.10 saved ZIPs, `<key>.zip`. They still restore, from the
+local cache and from S3, when a key has no `.tar.zst` archive; the next save
+writes the new format and deletes the local ZIP. The new format has its own
+name, so in a fleet that mixes versions older runners never download an
+archive they cannot read: they keep reading and writing the ZIPs, and newer
+runners read those until they save the key themselves. While both run, a
+cache saved by a newer runner is not seen by older ones, and once a newer
+runner saved a key, a ZIP an older runner saves later is not seen by newer
+ones; upgrade every runner that shares an S3 cache to end that.
 
 ### Shared cache in S3
 
@@ -191,7 +204,9 @@ archives work.
 
 `cache_dir` stays the first layer. To restore, the runner asks S3 whether the
 archive changed (`If-None-Match`): an unchanged one is taken from the local
-disk, a changed one is downloaded. Saved archives are written locally and
+disk, a changed one is extracted while it downloads, and kept as the new
+local copy. A download that breaks off midway is a warning, and the local
+copy is extracted over what arrived. Saved archives are written locally and
 uploaded; archives above 64 MiB go as a multipart upload, in parts of 16 MiB
 (larger above 156 GiB, to stay within S3's 10,000 parts), four at a time, each signed with its own hash. A
 failed or canceled multipart upload is aborted, so S3 keeps no parts of it.
@@ -229,9 +244,10 @@ lifecycle rule with `Expiration: {Days: 14}`. Add
 well: a runner that is killed during an upload, or loses S3 in the middle,
 cannot abort it, and S3 keeps (and bills) the parts until the rule removes
 them. Archives are stored as
-`<prefix>/project-<id>/<encoded-key>.zip`, the cache key percent-encoded
-(`feature/x` is `feature%2Fx.zip`), and a key whose encoded name is longer
-than 200 characters as `h-<blake3 hash>.zip`; every runner with the
+`<prefix>/project-<id>/<encoded-key>.tar.zst` (`.zip` for versions up to
+0.10), the cache key percent-encoded (`feature/x` is `feature%2Fx.tar.zst`),
+and a key whose encoded name is longer than 200 characters as
+`h-<blake3 hash>.tar.zst`; every runner with the
 credentials can write every project's cache, so use one bucket or prefix per
 group of runners that trust each other. Archives above 5 TiB, S3's largest
 object, are kept only locally.

@@ -2379,13 +2379,14 @@ mod tests {
     async fn s3_errors_are_job_log_warnings_and_the_local_cache_is_used() {
         let server = MockServer::start().await;
         let s3 = MockServer::start().await;
-        Mock::given(wiremock::matchers::path("/ci/project-5/deps.zip"))
-            .respond_with(
-                ResponseTemplate::new(403)
-                    .set_body_string("<Error><Code>AccessDenied</Code></Error>"),
-            )
-            .mount(&s3)
-            .await;
+        Mock::given(wiremock::matchers::path_regex(
+            r"^/ci/project-5/deps\.(tar\.zst|zip)$",
+        ))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_string("<Error><Code>AccessDenied</Code></Error>"),
+        )
+        .mount(&s3)
+        .await;
         let bucket = s3::Bucket::new(
             &config::S3CacheConfig {
                 url: format!("{}/ci", s3.uri()),

@@ -20,10 +20,47 @@ pub struct Archive {
 /// Buffer size for reading and writing archives
 const IO_BUF: usize = 256 * 1024;
 
-/// zstd level of cache entries: the fastest. On a node_modules-like tree
-/// (15,000 files, 57.6 MB) the archive was 20.56 MB, against 20.54 MB with
-/// the default level 3.
+/// zstd level of the entries of a ZIP cache archive (written by older
+/// versions; tests write them to check they still restore)
 const CACHE_ZSTD_LEVEL: i64 = 1;
+
+/// zstd level of a cache archive (format 2, tar.zst)
+const CACHE_TAR_ZSTD_LEVEL: i32 = 1;
+
+/// Largest zstd window (as a power of two) a cache archive may ask for:
+/// 16 MiB. It bounds what a crafted archive makes the runner allocate; the
+/// levels used write with 2 MiB at most.
+const CACHE_ZSTD_WINDOW_LOG_MAX: u32 = 24;
+
+/// Longest name in a GNU long name or long link entry
+const MAX_LONG_NAME: u64 = 64 * 1024;
+
+/// Bytes that may follow the end of the tar inside the zstd stream (the
+/// end-of-archive blocks and padding)
+const MAX_TAR_TRAILER: u64 = 64 * 1024;
+
+/// First bytes of a zstd frame
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// The two formats of cache archives
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheFormat {
+    /// Format 1 (up to 0.10): a ZIP with zstd-compressed entries
+    Zip,
+    /// Format 2: a tar in one zstd stream
+    TarZst,
+}
+
+/// The format of an archive, from its first bytes
+pub fn cache_format(head: &[u8]) -> Option<CacheFormat> {
+    if head.starts_with(&ZSTD_MAGIC) {
+        Some(CacheFormat::TarZst)
+    } else if head.starts_with(b"PK") {
+        Some(CacheFormat::Zip)
+    } else {
+        None
+    }
+}
 
 /// Cache entries smaller than this are stored: compressing them gains
 /// nothing and costs a compressor per entry
@@ -71,6 +108,40 @@ pub async fn extract_archive_file(path: &Path, workspace_path: &str, stop: &Stop
             ExtractLimits::default(),
             &stop,
         )
+    })
+    .await
+    .context("Extraction task panicked")?
+}
+
+/// Extract an untrusted cache archive of either format (told by its first
+/// bytes) into the workspace, off the async runtime, until `stop`
+pub async fn extract_cache_file(path: &Path, workspace_path: &str, stop: &Stop) -> Result<()> {
+    let path = path.to_path_buf();
+    let workspace = workspace_path.to_string();
+    let stop = stop.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("Failed to open {}", path.display()))?;
+        let mut head = Vec::with_capacity(ZSTD_MAGIC.len());
+        (&mut file)
+            .take(ZSTD_MAGIC.len() as u64)
+            .read_to_end(&mut head)?;
+        file.rewind()?;
+        match cache_format(&head) {
+            Some(CacheFormat::TarZst) => extract_tar_zst(
+                std::io::BufReader::with_capacity(IO_BUF, file),
+                &workspace,
+                ExtractLimits::default(),
+                &stop,
+            ),
+            Some(CacheFormat::Zip) => extract_zip_reader(
+                SeekBufReader::new(file)?,
+                &workspace,
+                ExtractLimits::default(),
+                &stop,
+            ),
+            None => anyhow::bail!("{} is not a cache archive", path.display()),
+        }
     })
     .await
     .context("Extraction task panicked")?
@@ -261,7 +332,7 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
             let mut target = String::new();
             std::io::Read::read_to_string(&mut file, &mut target)?;
             if symlink_stays_inside(&rel_path, Path::new(&target)) {
-                safe_fs::create_symlink(&dir, name, &target)?;
+                safe_fs::create_symlink(&dir, name, Path::new(&target))?;
             } else {
                 warn!(
                     "Skipping symlink {:?} -> {:?}: points outside workspace",
@@ -296,6 +367,188 @@ fn extract_zip_reader<R: std::io::Read + std::io::Seek>(
         }
     }
 
+    Ok(())
+}
+
+/// Extract an untrusted tar.zst cache archive read from `reader` (a file,
+/// or a download as it arrives) into `workspace_path`, until `stop`. The
+/// zstd stream is read to its end, which checks its checksum: a truncated
+/// or corrupted archive is an error, even after its last entry.
+pub fn extract_tar_zst<R: Read>(
+    reader: R,
+    workspace_path: &str,
+    limits: ExtractLimits,
+    stop: &Stop,
+) -> Result<()> {
+    let mut decoder =
+        zstd::stream::read::Decoder::new(reader).context("Failed to read the cache archive")?;
+    decoder.window_log_max(CACHE_ZSTD_WINDOW_LOG_MAX)?;
+    extract_tar_reader(&mut decoder, workspace_path, limits, stop)?;
+    let rest = std::io::copy(
+        &mut StopReader {
+            inner: (&mut decoder).take(MAX_TAR_TRAILER + 1),
+            stop,
+        },
+        &mut std::io::sink(),
+    )
+    .context("Failed to read the end of the cache archive")?;
+    if rest > MAX_TAR_TRAILER {
+        anyhow::bail!("Unexpected data after the end of the cache archive");
+    }
+    Ok(())
+}
+
+/// The workspace-relative path of a tar entry. Absolute names and `..`
+/// reject the whole archive, as for ZIP; `.` components are dropped.
+fn tar_entry_path(name: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let unsafe_path = || {
+        anyhow::anyhow!(
+            "Unsafe path in archive: {:?}",
+            String::from_utf8_lossy(name)
+        )
+    };
+    if is_rooted_name(name) {
+        return Err(unsafe_path());
+    }
+    let mut path = PathBuf::new();
+    for component in Path::new(std::ffi::OsStr::from_bytes(name)).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            _ => return Err(unsafe_path()),
+        }
+    }
+    Ok(path)
+}
+
+/// Extract an untrusted tar stream into `workspace_path` with the same
+/// guarantees as `extract_zip_reader`: writes go through directory handles
+/// that never follow a symlink, paths outside the workspace reject the
+/// archive, symlinks pointing outside are skipped, setuid/setgid/sticky bits
+/// are dropped, and the entry count and total size are limited. Hard links,
+/// devices, FIFOs and other entry types reject the archive: the runner
+/// never writes them. Directories get the default mode, as with ZIP.
+fn extract_tar_reader<R: Read>(
+    reader: R,
+    workspace_path: &str,
+    limits: ExtractLimits,
+    stop: &Stop,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use tar::EntryType;
+
+    let root = Path::new(workspace_path);
+    std::fs::create_dir_all(root)?;
+    let root_dir = safe_fs::open_root(root)?;
+    let mut dirs = safe_fs::DirCache::default();
+    let mut buf = vec![0u8; IO_BUF];
+    let mut total_bytes: u64 = 0;
+    let mut count: usize = 0;
+    // GNU long names and link targets, for the next entry
+    let mut long_name: Option<Vec<u8>> = None;
+    let mut long_link: Option<Vec<u8>> = None;
+
+    let mut archive = tar::Archive::new(reader);
+    // Raw: the tar crate would read long names of any size into memory
+    let entries = archive
+        .entries()
+        .context("Failed to read the cache archive")?
+        .raw(true);
+    for entry in entries {
+        stop.check()?;
+        let mut entry = entry.context("Failed to read the cache archive")?;
+        let kind = entry.header().entry_type();
+        if kind.is_gnu_longname() || kind.is_gnu_longlink() {
+            let size = entry.header().entry_size()?;
+            if size > MAX_LONG_NAME {
+                anyhow::bail!("Archive entry name of {} bytes", size);
+            }
+            let mut value = Vec::with_capacity(size as usize);
+            (&mut entry).take(size).read_to_end(&mut value)?;
+            // NUL-terminated
+            while value.last() == Some(&0) {
+                value.pop();
+            }
+            if kind.is_gnu_longname() {
+                long_name = Some(value);
+            } else {
+                long_link = Some(value);
+            }
+            continue;
+        }
+
+        count += 1;
+        if count > limits.max_entries {
+            anyhow::bail!("Archive has more than {} entries", limits.max_entries);
+        }
+        let name = match long_name.take() {
+            Some(name) => name,
+            None => entry.header().path_bytes().into_owned(),
+        };
+        let link = match long_link.take() {
+            Some(link) => Some(link),
+            None => entry
+                .header()
+                .link_name_bytes()
+                .map(|link| link.into_owned()),
+        };
+        let rel_path = tar_entry_path(&name)?;
+
+        match kind {
+            EntryType::Directory => {
+                if rel_path.as_os_str().is_empty() {
+                    continue;
+                }
+                dirs.open(&root_dir, &rel_path)?;
+            }
+            EntryType::Symlink => {
+                let target =
+                    link.with_context(|| format!("Symlink {:?} has no target", rel_path))?;
+                let target = Path::new(std::ffi::OsStr::from_bytes(&target));
+                let (parent, file_name) = safe_fs::split_leaf(&rel_path)?;
+                if symlink_stays_inside(&rel_path, target) {
+                    let dir = dirs.open(&root_dir, parent)?;
+                    safe_fs::create_symlink(&dir, file_name, target)?;
+                } else {
+                    warn!(
+                        "Skipping symlink {:?} -> {:?}: points outside workspace",
+                        rel_path, target
+                    );
+                }
+            }
+            EntryType::Regular => {
+                let (parent, file_name) = safe_fs::split_leaf(&rel_path)?;
+                let dir = dirs.open(&root_dir, parent)?;
+                let remaining = limits.max_total_bytes.saturating_sub(total_bytes);
+                let mut out_file = safe_fs::create_file(&dir, file_name)?;
+                let written = copy_with(
+                    &mut buf,
+                    &mut StopReader {
+                        inner: (&mut entry).take(remaining.saturating_add(1)),
+                        stop,
+                    },
+                    &mut out_file,
+                )?;
+                if written > remaining {
+                    anyhow::bail!(
+                        "Archive exceeds uncompressed size limit of {} bytes",
+                        limits.max_total_bytes
+                    );
+                }
+                total_bytes += written;
+                // Without setuid/setgid/sticky bits
+                safe_fs::set_mode(&out_file, entry.header().mode()? & 0o777)?;
+            }
+            other => anyhow::bail!(
+                "Unsupported entry {:?} in cache archive ({:?})",
+                rel_path,
+                other
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -451,7 +704,7 @@ mod safe_fs {
         Ok(std::fs::File::from(fd))
     }
 
-    pub fn create_symlink(dir: impl AsFd, name: &OsStr, target: &str) -> Result<()> {
+    pub fn create_symlink(dir: impl AsFd, name: &OsStr, target: &Path) -> Result<()> {
         let dir = dir.as_fd();
         clear_leaf(dir, name)?;
         rfs::symlinkat(target, dir, name)
@@ -485,27 +738,28 @@ fn symlink_stays_inside(link: &Path, target: &Path) -> bool {
     true
 }
 
-/// A cache archive: a ZIP whose entries are zstd-compressed (or stored, when
-/// compressing gains nothing). Caches never leave the runners, so they need
-/// not be readable by GitLab; zstd saves a cache about 2.5x faster than
-/// deflate at the same size.
+/// A cache archive (format 2): a tar of the files, symlinks and directories
+/// in one zstd stream. Caches never leave the runners, so they need not be
+/// readable by GitLab. One stream compresses across files, which per-entry
+/// compression (the ZIPs of format 1) cannot, and is read as it downloads.
 ///
-/// It is written as a stream (sizes in data descriptors after each entry,
-/// no seeking back), so its SHA-256 is computed on the way. Entries are in
-/// path order with a fixed timestamp: the same files give the same archive,
-/// and the same hash.
+/// It is written as a stream, so its SHA-256 is computed on the way.
+/// Entries are in path order with a fixed timestamp, owner and group: the
+/// same files give the same archive, and the same hash. Modes are kept
+/// (without setuid/setgid/sticky bits), timestamps are not, as in format 1.
 pub async fn create_cache_archive(
     workspace_path: &str,
     paths: &[String],
     staging_dir: &Path,
 ) -> Result<Option<Archive>> {
-    create_archive(workspace_path, paths, &[], "zip-zstd", staging_dir).await
+    create_archive(workspace_path, paths, &[], "tar-zstd", staging_dir).await
 }
 
 /// Archive the files matching `paths` in the format GitLab expects for the
 /// artifact: `zip` (archives), `gzip` (reports; one gzip member per file) or
-/// `raw` (a single file as is), or `zip-zstd` for caches, written to a
-/// temporary file in `staging_dir`.
+/// `raw` (a single file as is), or `tar-zstd` for caches (`zip-zstd`, the
+/// format before, remains for tests), written to a temporary file in
+/// `staging_dir`.
 /// `None` when no file matches.
 pub async fn create_archive(
     workspace_path: &str,
@@ -520,7 +774,8 @@ pub async fn create_archive(
     let format = format.to_string();
     let staging_dir = staging_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let files = collect_paths(&workspace, &patterns, &exclude)?;
+        // A cache keeps directories, empty ones included
+        let files = collect_paths(&workspace, &patterns, &exclude, format == "tar-zstd")?;
         if files.is_empty() {
             return Ok(None);
         }
@@ -533,6 +788,15 @@ pub async fn create_archive(
                 build_zip(ZipWriter::new(&mut out), root, &files, false)?;
                 out.flush()?;
                 None
+            }
+            "tar-zstd" => {
+                let out = HashingWriter::new(std::io::BufWriter::with_capacity(
+                    IO_BUF,
+                    file.as_file_mut(),
+                ));
+                let mut out = build_tar_zst(out, root, &files)?;
+                out.flush()?;
+                Some(out.hex())
             }
             "zip-zstd" => {
                 let mut out = HashingWriter::new(std::io::BufWriter::with_capacity(
@@ -639,7 +903,8 @@ fn open_found_file(path: &Path) -> Result<std::fs::File> {
     Ok(std::fs::File::from(fd))
 }
 
-/// Files matching `patterns` inside the workspace.
+/// Files matching `patterns` inside the workspace, in path order, with the
+/// directories they match or are under when `with_dirs`.
 ///
 /// Patterns that are absolute or contain `..` are skipped, matches reached through a
 /// symlinked directory are skipped, and symlinks are returned as-is (never followed).
@@ -647,6 +912,7 @@ fn collect_paths(
     workspace_path: &str,
     patterns: &[String],
     exclude: &[String],
+    with_dirs: bool,
 ) -> Result<Vec<PathBuf>> {
     use std::collections::{BTreeSet, HashMap};
     use std::path::Component;
@@ -683,7 +949,7 @@ fn collect_paths(
             if meta.is_dir() {
                 for item in walkdir::WalkDir::new(&path).follow_links(false) {
                     let item = item?;
-                    if !item.file_type().is_dir() {
+                    if with_dirs || !item.file_type().is_dir() {
                         entries.insert(item.into_path());
                     }
                 }
@@ -732,6 +998,89 @@ fn build_zip<W: Write + Seek>(
         add_path_to_zip(&mut zip, path, root, cache, &mut buf)?;
     }
     Ok(zip.finish()?)
+}
+
+/// Write `entries` (files, symlinks, directories) as a tar into one zstd
+/// stream on `out`, and finish both. Returns the writer.
+fn build_tar_zst<W: Write>(out: W, root: &Path, entries: &[PathBuf]) -> Result<W> {
+    let mut encoder = zstd::stream::write::Encoder::new(out, CACHE_TAR_ZSTD_LEVEL)?;
+    encoder.include_checksum(true)?;
+    let mut tar = tar::Builder::new(encoder);
+    for path in entries {
+        add_path_to_tar(&mut tar, path, root)?;
+    }
+    // Writes the end-of-archive blocks
+    let encoder = tar.into_inner()?;
+    Ok(encoder.finish()?)
+}
+
+/// Reads exactly `left` bytes from `inner`: a file that shrinks while it is
+/// archived is an error, not a tar entry shorter than its header says
+struct ExactReader<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for ExactReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Ok(0);
+        }
+        let want = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "a file shrank while it was archived",
+            ));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Add a regular file, symlink or directory to the tar under its
+/// workspace-relative name, with a fixed timestamp and owner (sockets,
+/// FIFOs and devices are left out)
+fn add_path_to_tar<W: Write>(tar: &mut tar::Builder<W>, path: &Path, root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let relative_path = path
+        .strip_prefix(root)
+        .with_context(|| format!("{:?} is not inside the workspace", path))?;
+    let meta = std::fs::symlink_metadata(path)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_size(0);
+    if meta.file_type().is_symlink() {
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        tar.append_link(&mut header, relative_path, std::fs::read_link(path)?)?;
+    } else if meta.is_dir() {
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(meta.permissions().mode() & 0o777);
+        tar.append_data(&mut header, relative_path, std::io::empty())?;
+    } else if meta.is_file() {
+        let file = open_found_file(path)?;
+        // The size and mode of what was opened, which the header must match
+        let opened = file.metadata()?;
+        if !opened.is_file() {
+            return Ok(());
+        }
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(opened.permissions().mode() & 0o777);
+        header.set_size(opened.len());
+        let data = ExactReader {
+            inner: file,
+            left: opened.len(),
+        };
+        tar.append_data(&mut header, relative_path, data)?;
+    }
+    Ok(())
 }
 
 /// Concatenated gzip members, one per regular file (symlinks are skipped)
@@ -1203,21 +1552,27 @@ mod tests {
         std::fs::write(ws.path().join("dist/js/app.js"), b"js").unwrap();
         std::fs::write(ws.path().join("report.xml"), b"xml").unwrap();
 
-        let data = create_cache_archive(
-            ws.path().to_str().unwrap(),
-            &[
-                "dist".to_string(),
-                "*.xml".to_string(),
-                "dist/js/*".to_string(),
-            ],
-            staging().path(),
-        )
-        .await
-        .unwrap()
-        .map(bytes)
-        .expect("files matched");
+        let paths = [
+            "dist".to_string(),
+            "*.xml".to_string(),
+            "dist/js/*".to_string(),
+        ];
+        let ws_path = ws.path().to_str().unwrap();
+        let artifact = create_archive(ws_path, &paths, &[], "zip", staging().path())
+            .await
+            .unwrap()
+            .map(bytes)
+            .expect("files matched");
+        let cache = create_cache_archive(ws_path, &paths, staging().path())
+            .await
+            .unwrap()
+            .map(bytes)
+            .expect("files matched");
 
-        assert_eq!(zip_names(&data), vec!["dist/js/app.js", "report.xml"]);
+        assert_eq!(zip_names(&artifact), vec!["dist/js/app.js", "report.xml"]);
+        // A cache keeps directories too, each entry once, in path order
+        let names: Vec<String> = tar_entries(&cache).into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["dist", "dist/js", "dist/js/app.js", "report.xml"]);
     }
 
     #[tokio::test]
@@ -1277,7 +1632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caches_use_zstd_and_artifacts_deflate_that_gitlab_reads() {
+    async fn caches_use_tar_zstd_and_artifacts_deflate_that_gitlab_reads() {
         let ws = tempdir().unwrap();
         std::fs::write(ws.path().join("a.txt"), "x".repeat(4096)).unwrap();
         let root = ws.path().to_str().unwrap();
@@ -1295,15 +1650,17 @@ mod tests {
             .unwrap()
             .map(bytes)
             .unwrap();
-        assert_eq!(methods(&cache), [zip::CompressionMethod::Zstd]);
+        assert_eq!(cache_format(&cache), Some(CacheFormat::TarZst));
+        assert!(cache.len() < 200, "{}", cache.len());
         let out = tempdir().unwrap();
-        extract_zip_to_workspace(&cache, out.path().to_str().unwrap()).unwrap();
+        extract_tar_zst_to_workspace(&cache, out.path().to_str().unwrap()).unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join("a.txt")).unwrap(),
             "x".repeat(4096)
         );
     }
 
+    /// Format 1 caches (ZIPs, written by versions up to 0.10)
     #[cfg(unix)]
     #[tokio::test]
     async fn cache_stores_tiny_and_compressed_files_and_extracts_both() {
@@ -1320,11 +1677,11 @@ mod tests {
         let paths = ["*".to_string()];
 
         let stage = staging();
-        let first = create_cache_archive(root, &paths, stage.path())
+        let first = create_archive(root, &paths, &[], "zip-zstd", stage.path())
             .await
             .unwrap()
             .unwrap();
-        let second = create_cache_archive(root, &paths, stage.path())
+        let second = create_archive(root, &paths, &[], "zip-zstd", stage.path())
             .await
             .unwrap()
             .unwrap();
@@ -1335,6 +1692,7 @@ mod tests {
         let data = bytes(first);
         assert_eq!(format!("{:x}", sha2::Sha256::digest(&data)), hash);
         assert_eq!(data, bytes(second));
+        assert_eq!(cache_format(&data), Some(CacheFormat::Zip));
 
         let mut archive = ZipArchive::new(std::io::Cursor::new(&data)).unwrap();
         for (name, method) in [
@@ -1478,12 +1836,14 @@ mod tests {
         .map(bytes)
         .expect("files matched");
 
-        let mut archive = ZipArchive::new(std::io::Cursor::new(&data)).unwrap();
-        let mut entry = archive.by_name("leak").unwrap();
-        assert!(entry.is_symlink());
-        let mut content = String::new();
-        entry.read_to_string(&mut content).unwrap();
-        assert!(!content.contains("runner-token"));
+        let entries = tar_entries(&data);
+        assert_eq!(entries.len(), 1);
+        let leak = &entries[0];
+        assert_eq!(leak.name, "leak");
+        assert_eq!(leak.kind, tar::EntryType::Symlink);
+        assert_eq!(leak.link.as_deref(), secret.to_str());
+        assert!(leak.content.is_empty());
+        assert!(!String::from_utf8_lossy(&data).contains("runner-token"));
     }
 
     #[cfg(unix)]
@@ -1553,33 +1913,517 @@ mod tests {
         }
         let root = ws.path().to_str().unwrap();
         let stage = staging();
-        let mut best = (f64::MAX, f64::MAX, 0u64);
-        for _ in 0..7 {
-            let started = std::time::Instant::now();
-            let archive = create_cache_archive(root, &["node_modules".to_string()], stage.path())
+        // Format 1 (ZIP, zstd per entry) against format 2 (tar.zst)
+        for format in ["zip-zstd", "tar-zstd"] {
+            let mut best = (f64::MAX, f64::MAX, 0u64);
+            for _ in 0..7 {
+                let paths = ["node_modules".to_string()];
+                let started = std::time::Instant::now();
+                let archive = create_archive(root, &paths, &[], format, stage.path())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let create = started.elapsed().as_secs_f64();
+                let out = tempdir().unwrap();
+                let started = std::time::Instant::now();
+                extract_cache_file(
+                    archive.file.path(),
+                    out.path().to_str().unwrap(),
+                    &Stop::default(),
+                )
+                .await
+                .unwrap();
+                let extract = started.elapsed().as_secs_f64();
+                best = (best.0.min(create), best.1.min(extract), archive.len);
+            }
+            println!(
+                "BENCH {} files={} input={:.1}MB archive={:.2}MB create={:.3}s extract={:.3}s",
+                format,
+                files,
+                bytes as f64 / 1048576.0,
+                best.2 as f64 / 1048576.0,
+                best.0,
+                best.1
+            );
+        }
+    }
+
+    // --- cache archives, format 2 (tar.zst) ---
+
+    fn extract_tar_zst_to_workspace(data: &[u8], workspace_path: &str) -> Result<()> {
+        extract_tar_zst_with_limits(data, workspace_path, ExtractLimits::default())
+    }
+
+    fn extract_tar_zst_with_limits(
+        data: &[u8],
+        workspace_path: &str,
+        limits: ExtractLimits,
+    ) -> Result<()> {
+        extract_tar_zst(data, workspace_path, limits, &Stop::default())
+    }
+
+    /// An entry of a tar.zst archive, for assertions
+    #[derive(Debug)]
+    struct TarEntry {
+        name: String,
+        kind: tar::EntryType,
+        mtime: u64,
+        uid: u64,
+        link: Option<String>,
+        content: Vec<u8>,
+    }
+
+    fn tar_entries(data: &[u8]) -> Vec<TarEntry> {
+        let decoder = zstd::stream::read::Decoder::new(data).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let mut entry = entry.unwrap();
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).unwrap();
+                let header = entry.header();
+                TarEntry {
+                    name: entry.path().unwrap().to_string_lossy().into_owned(),
+                    kind: header.entry_type(),
+                    mtime: header.mtime().unwrap(),
+                    uid: header.uid().unwrap(),
+                    link: entry
+                        .link_name()
+                        .unwrap()
+                        .map(|link| link.to_string_lossy().into_owned()),
+                    content,
+                }
+            })
+            .collect()
+    }
+
+    /// A crafted entry: the name and link are written verbatim into the
+    /// header, as an attacker would
+    struct Crafted<'a> {
+        name: &'a [u8],
+        kind: tar::EntryType,
+        mode: u32,
+        link: &'a [u8],
+        content: &'a [u8],
+    }
+
+    fn crafted<'a>(name: &'a str, kind: tar::EntryType, content: &'a [u8]) -> Crafted<'a> {
+        Crafted {
+            name: name.as_bytes(),
+            kind,
+            mode: 0o644,
+            link: b"",
+            content,
+        }
+    }
+
+    /// A tar.zst archive of `entries`
+    fn tar_zst_of(entries: &[Crafted]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for entry in entries {
+            let mut header = tar::Header::new_gnu();
+            let old = header.as_old_mut();
+            old.name[..entry.name.len()].copy_from_slice(entry.name);
+            old.linkname[..entry.link.len()].copy_from_slice(entry.link);
+            header.set_entry_type(entry.kind);
+            header.set_mode(entry.mode);
+            header.set_size(entry.content.len() as u64);
+            header.set_cksum();
+            tar.append(&header, entry.content).unwrap();
+        }
+        zstd::encode_all(&tar.into_inner().unwrap()[..], 1).unwrap()
+    }
+
+    /// Round trip of everything a cache keeps: modes (setuid dropped),
+    /// symlinks inside the workspace, empty directories, a file larger than
+    /// the I/O buffers, and names and link targets longer than a tar header
+    /// holds. Timestamps and owners are fixed, so the archive is the same
+    /// every time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_archives_round_trip_and_are_deterministic() {
+        use sha2::Digest;
+        use std::os::unix::fs::PermissionsExt;
+
+        let ws = tempdir().unwrap();
+        let p = |rel: &str| ws.path().join("vendor").join(rel);
+        let long_dir = "d".repeat(60) + "/" + &"e".repeat(60);
+        std::fs::create_dir_all(p(&long_dir)).unwrap();
+        std::fs::create_dir_all(p("empty/nested")).unwrap();
+        std::fs::create_dir_all(p("sub")).unwrap();
+        std::fs::write(p("sub/file"), b"inside").unwrap();
+        std::fs::write(p("tool.sh"), b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(p("tool.sh"), std::fs::Permissions::from_mode(0o4755)).unwrap();
+        std::fs::write(p("secret"), b"private").unwrap();
+        std::fs::set_permissions(p("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let large: Vec<u8> = (0..3 * IO_BUF + 17).map(|i| (i * 31 % 253) as u8).collect();
+        let long_file = format!("{}/{}", long_dir, "f".repeat(40));
+        std::fs::write(p(&long_file), &large).unwrap();
+        std::os::unix::fs::symlink("sub/file", p("link")).unwrap();
+        let long_target = format!("{}/{}", long_dir, "f".repeat(40));
+        std::os::unix::fs::symlink(&long_target, p("long-link")).unwrap();
+        let root = ws.path().to_str().unwrap();
+        let paths = ["vendor".to_string()];
+        let stage = staging();
+
+        let first = create_cache_archive(root, &paths, stage.path())
+            .await
+            .unwrap()
+            .unwrap();
+        // Later timestamps change nothing in the archive
+        std::fs::File::options()
+            .append(true)
+            .open(p("sub/file"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86400))
+            .unwrap();
+        let second = create_cache_archive(root, &paths, stage.path())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let hash = first.sha256.clone().unwrap();
+        assert_eq!(second.sha256.as_deref(), Some(hash.as_str()));
+        let data = bytes(first);
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&data)), hash);
+        assert_eq!(data, bytes(second));
+        assert!(tar_entries(&data)
+            .iter()
+            .all(|entry| entry.mtime == 0 && entry.uid == 0));
+
+        let out = tempdir().unwrap();
+        let archive = stage.path().join("cache.tar.zst");
+        std::fs::write(&archive, &data).unwrap();
+        extract_cache_file(&archive, out.path().to_str().unwrap(), &Stop::default())
+            .await
+            .unwrap();
+
+        let q = |rel: &str| out.path().join("vendor").join(rel);
+        let mode = |rel: &str| std::fs::metadata(q(rel)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            std::fs::read(q("tool.sh")).unwrap(),
+            b"#!/bin/sh\necho hi\n"
+        );
+        assert_eq!(mode("tool.sh"), 0o755);
+        assert_eq!(mode("secret"), 0o600);
+        assert_eq!(std::fs::read(q(&long_file)).unwrap(), large);
+        assert_eq!(
+            std::fs::read_link(q("link")).unwrap(),
+            Path::new("sub/file")
+        );
+        assert_eq!(std::fs::read(q("link")).unwrap(), b"inside");
+        assert_eq!(
+            std::fs::read_link(q("long-link")).unwrap(),
+            Path::new(&long_target)
+        );
+        assert!(q("empty/nested").is_dir());
+        assert_eq!(std::fs::read_dir(q("empty/nested")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn formats_are_told_by_their_first_bytes() {
+        assert_eq!(
+            cache_format(&[0x28, 0xB5, 0x2F, 0xFD, 0]),
+            Some(CacheFormat::TarZst)
+        );
+        assert_eq!(cache_format(b"PK\x03\x04"), Some(CacheFormat::Zip));
+        assert_eq!(cache_format(b"PK\x05\x06"), Some(CacheFormat::Zip));
+        for other in [&b""[..], b"\x28\xB5", b"\x1f\x8b\x08", b"ustar"] {
+            assert_eq!(cache_format(other), None, "{:?}", other);
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_files_of_both_formats_extract_and_others_are_refused() {
+        let ws = tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), b"a").unwrap();
+        let root = ws.path().to_str().unwrap();
+        let stage = staging();
+        for format in ["zip-zstd", "tar-zstd"] {
+            let archive = create_archive(root, &["a.txt".to_string()], &[], format, stage.path())
                 .await
                 .unwrap()
                 .unwrap();
-            let create = started.elapsed().as_secs_f64();
             let out = tempdir().unwrap();
-            let started = std::time::Instant::now();
-            extract_archive_file(
+            extract_cache_file(
                 archive.file.path(),
                 out.path().to_str().unwrap(),
                 &Stop::default(),
             )
             .await
             .unwrap();
-            let extract = started.elapsed().as_secs_f64();
-            best = (best.0.min(create), best.1.min(extract), archive.len);
+            assert_eq!(
+                std::fs::read(out.path().join("a.txt")).unwrap(),
+                b"a",
+                "{}",
+                format
+            );
         }
-        println!(
-            "BENCH files={} input={:.1}MB archive={:.2}MB create={:.3}s extract={:.3}s",
-            files,
-            bytes as f64 / 1048576.0,
-            best.2 as f64 / 1048576.0,
-            best.0,
-            best.1
+        let junk = stage.path().join("junk");
+        std::fs::write(&junk, b"not an archive").unwrap();
+        let error = extract_cache_file(&junk, root, &Stop::default())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("is not a cache archive"),
+            "{:#}",
+            error
         );
+    }
+
+    #[test]
+    fn tar_extract_rejects_parent_traversal() {
+        let root = tempdir().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        for name in ["../escaped.txt", "a/../../escaped.txt"] {
+            let data = tar_zst_of(&[crafted(name, tar::EntryType::Regular, b"pwned")]);
+            let result = extract_tar_zst_to_workspace(&data, ws.to_str().unwrap());
+            assert!(result.is_err(), "{}", name);
+        }
+        assert!(!root.path().join("escaped.txt").exists());
+    }
+
+    #[test]
+    fn tar_extract_rejects_absolute_path() {
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("abs.txt");
+        let data = tar_zst_of(&[crafted(
+            target.to_str().unwrap(),
+            tar::EntryType::Regular,
+            b"pwned",
+        )]);
+
+        let result = extract_tar_zst_to_workspace(&data, ws.path().to_str().unwrap());
+
+        assert!(result.is_err());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_extract_strips_setuid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = tempdir().unwrap();
+        let mut tool = crafted("tool", tar::EntryType::Regular, b"#!/bin/sh");
+        tool.mode = 0o6755;
+
+        extract_tar_zst_to_workspace(&tar_zst_of(&[tool]), ws.path().to_str().unwrap()).unwrap();
+
+        let mode = std::fs::metadata(ws.path().join("tool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_extract_does_not_write_through_existing_symlink() {
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+        let data = tar_zst_of(&[crafted("link/pwned.txt", tar::EntryType::Regular, b"pwned")]);
+
+        let result = extract_tar_zst_to_workspace(&data, ws.path().to_str().unwrap());
+
+        assert!(result.is_err());
+        assert!(!outside.path().join("pwned.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_extract_skips_symlinks_pointing_outside() {
+        let ws = tempdir().unwrap();
+        let link = |name: &'static str, target: &'static str| Crafted {
+            name: name.as_bytes(),
+            kind: tar::EntryType::Symlink,
+            mode: 0o777,
+            link: target.as_bytes(),
+            content: b"",
+        };
+        let data = tar_zst_of(&[
+            link("evil", "/etc"),
+            link("up", "../../outside"),
+            link("sub/up", "../../x"),
+            link("ok", "sub/file"),
+            link("sub/sibling", "../ok"),
+        ]);
+
+        extract_tar_zst_to_workspace(&data, ws.path().to_str().unwrap()).unwrap();
+
+        for skipped in ["evil", "up", "sub/up"] {
+            assert!(
+                std::fs::symlink_metadata(ws.path().join(skipped)).is_err(),
+                "{}",
+                skipped
+            );
+        }
+        assert_eq!(
+            std::fs::read_link(ws.path().join("ok")).unwrap(),
+            Path::new("sub/file")
+        );
+        assert_eq!(
+            std::fs::read_link(ws.path().join("sub/sibling")).unwrap(),
+            Path::new("../ok")
+        );
+    }
+
+    /// A later entry cannot turn a directory the cache holds into a symlink
+    #[cfg(unix)]
+    #[test]
+    fn tar_symlink_entry_cannot_replace_a_cached_directory() {
+        let ws = tempdir().unwrap();
+        let data = tar_zst_of(&[
+            crafted("d/x", tar::EntryType::Regular, b"x"),
+            Crafted {
+                name: b"d",
+                kind: tar::EntryType::Symlink,
+                mode: 0o777,
+                link: b"e",
+                content: b"",
+            },
+            crafted("d/y", tar::EntryType::Regular, b"y"),
+        ]);
+
+        let result = extract_tar_zst_to_workspace(&data, ws.path().to_str().unwrap());
+
+        assert!(result.is_err());
+        assert!(std::fs::symlink_metadata(ws.path().join("d"))
+            .unwrap()
+            .is_dir());
+        assert!(!ws.path().join("e").exists());
+    }
+
+    /// Hard links, devices and FIFOs: the runner never writes them, so an
+    /// archive holding one is refused
+    #[test]
+    fn tar_extract_refuses_links_devices_and_fifos() {
+        use tar::EntryType;
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, b"secret").unwrap();
+        let hard_link = Crafted {
+            name: b"stolen",
+            kind: EntryType::Link,
+            mode: 0o644,
+            link: secret.to_str().unwrap().as_bytes(),
+            content: b"",
+        };
+        let relative_link = Crafted {
+            name: b"copy",
+            kind: EntryType::Link,
+            mode: 0o644,
+            link: b"a",
+            content: b"",
+        };
+        for (entry, label) in [
+            (hard_link, "hard link outside"),
+            (relative_link, "hard link inside"),
+            (crafted("null", EntryType::Char, b""), "char device"),
+            (crafted("disk", EntryType::Block, b""), "block device"),
+            (crafted("pipe", EntryType::Fifo, b""), "fifo"),
+            (crafted("pax", EntryType::XHeader, b""), "pax header"),
+        ] {
+            let data = tar_zst_of(&[crafted("a", EntryType::Regular, b"a"), entry]);
+            let result = extract_tar_zst_to_workspace(&data, ws.path().to_str().unwrap());
+            assert!(result.is_err(), "{}", label);
+        }
+        for name in ["stolen", "copy", "null", "disk", "pipe"] {
+            assert!(
+                std::fs::symlink_metadata(ws.path().join(name)).is_err(),
+                "{}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn tar_extract_enforces_size_entry_and_name_limits() {
+        let ws = tempdir().unwrap();
+        let big = vec![0u8; 4096];
+        let data = tar_zst_of(&[
+            crafted("a", tar::EntryType::Regular, &big),
+            crafted("b", tar::EntryType::Regular, &big),
+        ]);
+        let ws_path = ws.path().to_str().unwrap();
+
+        let too_big = ExtractLimits {
+            max_entries: 10,
+            max_total_bytes: 5000,
+        };
+        assert!(extract_tar_zst_with_limits(&data, ws_path, too_big).is_err());
+        let too_many = ExtractLimits {
+            max_entries: 1,
+            max_total_bytes: u64::MAX,
+        };
+        assert!(extract_tar_zst_with_limits(&data, ws_path, too_many).is_err());
+
+        // A GNU long name is read into memory: its size is bounded
+        let long = vec![b'n'; MAX_LONG_NAME as usize + 1];
+        let data = tar_zst_of(&[Crafted {
+            name: b"././@LongLink",
+            kind: tar::EntryType::GNULongName,
+            mode: 0o644,
+            link: b"",
+            content: &long,
+        }]);
+        let error = extract_tar_zst_to_workspace(&data, ws_path).unwrap_err();
+        assert!(error.to_string().contains("name of"), "{:#}", error);
+    }
+
+    #[test]
+    fn tar_extract_refuses_truncated_and_trailing_data() {
+        let ws = tempdir().unwrap();
+        let ws_path = ws.path().to_str().unwrap();
+        let data = tar_zst_of(&[crafted("a", tar::EntryType::Regular, &[7u8; 10_000])]);
+        extract_tar_zst_to_workspace(&data, ws_path).unwrap();
+
+        assert!(extract_tar_zst_to_workspace(&data[..data.len() - 4], ws_path).is_err());
+        let mut trailing = data.clone();
+        trailing.extend_from_slice(b"garbage");
+        assert!(extract_tar_zst_to_workspace(&trailing, ws_path).is_err());
+    }
+
+    #[test]
+    fn tar_extraction_stops_within_a_file() {
+        let mut seed: u64 = 11;
+        let noise: Vec<u8> = (0..4 << 20)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 56) as u8
+            })
+            .collect();
+        let data = tar_zst_of(&[
+            crafted("big.bin", tar::EntryType::Regular, &noise),
+            crafted("next.txt", tar::EntryType::Regular, b"next"),
+        ]);
+        let ws = tempdir().unwrap();
+        let stop = Stop::default();
+        let reader = StopAfter {
+            inner: std::io::Cursor::new(data),
+            read: 0,
+            after: 1 << 20,
+            stop: stop.clone(),
+        };
+
+        let error = extract_tar_zst(
+            reader,
+            ws.path().to_str().unwrap(),
+            ExtractLimits::default(),
+            &stop,
+        )
+        .unwrap_err();
+
+        assert!(format!("{:#}", error).contains("stopped"), "{:#}", error);
+        let written = std::fs::metadata(ws.path().join("big.bin")).unwrap().len();
+        assert!(written < 4 << 20, "{}", written);
+        assert!(!ws.path().join("next.txt").exists());
     }
 }

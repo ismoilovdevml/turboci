@@ -1,10 +1,15 @@
 //! Job cache (`cache:` in .gitlab-ci.yml). GitLab has no cache API: archives are
-//! kept on the runner host, at `<root>/project-<id>/<encoded key>.zip`, and with
-//! `cache_s3` also in a bucket shared by runners (gitlab-runner's distributed
-//! cache). The local copy is the first layer; `<archive>.etag` holds the ETag
-//! of its S3 object, so an unchanged object is not downloaded again, and
-//! `<archive>.sha256` the hash of that object, so an archive with the same
-//! content is not uploaded again.
+//! kept on the runner host, at `<root>/project-<id>/<encoded key>.tar.zst`, and
+//! with `cache_s3` also in a bucket shared by runners (gitlab-runner's
+//! distributed cache). The local copy is the first layer; `<archive>.etag`
+//! holds the ETag of its S3 object, so an unchanged object is not downloaded
+//! again, and `<archive>.sha256` the hash of that object, so an archive with
+//! the same content is not uploaded again.
+//!
+//! Versions up to 0.10 wrote ZIPs, as `<encoded key>.zip`. They are still
+//! restored, locally and from S3, when a key has no tar.zst archive; the new
+//! format has its own name so that older runners sharing the bucket never
+//! read an archive they cannot extract.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -13,6 +18,57 @@ use std::path::{Path, PathBuf};
 use super::artifacts;
 use super::cancel::Stop;
 use super::script;
+
+/// Extension of cache archives (format 2)
+const ARCHIVE_EXTENSION: &str = ".tar.zst";
+
+/// Extension of the archives versions up to 0.10 wrote (format 1)
+const LEGACY_EXTENSION: &str = ".zip";
+
+/// Downloaded chunks queued for the extraction (backpressure on S3)
+const STREAM_QUEUE: usize = 32;
+
+/// Whether `path` names a cache archive of either format
+fn is_archive(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(ARCHIVE_EXTENSION) || name.ends_with(LEGACY_EXTENSION))
+}
+
+/// Reads the chunks a download sends, blocking: for the extraction, which
+/// runs off the async runtime. The end of the channel is the end of the
+/// stream; a download that failed ends it early, which the extraction
+/// reports as a truncated archive.
+struct ChannelReader {
+    chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    chunk: bytes::Bytes,
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.chunk.is_empty() {
+            match self.chunks.blocking_recv() {
+                Some(chunk) => self.chunk = chunk,
+                None => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.chunk.len());
+        buf[..n].copy_from_slice(&self.chunk.split_to(n));
+        Ok(n)
+    }
+}
+
+/// What S3 had for a key
+#[derive(Debug)]
+enum Fetched {
+    /// Downloaded (this many bytes) and extracted on the way
+    Extracted(u64),
+    /// The local archive at this path is current: S3 holds it unchanged,
+    /// or it was just downloaded
+    Local(PathBuf, Source),
+    /// S3 has no archive for the key
+    Missing,
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalCache {
@@ -117,6 +173,32 @@ async fn write_sidecars(archive: &Path, etag: Option<&str>, sha256: &str) {
     };
 }
 
+/// The ETag of the S3 object the local archive at `path` came from or went
+/// to; `None` without the archive
+async fn current_etag(path: &Path) -> Option<String> {
+    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        tokio::fs::read_to_string(sidecar(path)).await.ok()
+    } else {
+        None
+    }
+}
+
+/// File name of the archive of `key`, locally and in S3
+fn archive_name(key: &str) -> String {
+    format!("{}{}", encode_key(key), ARCHIVE_EXTENSION)
+}
+
+/// File name of the archive of `key` in the format of versions up to 0.10
+fn legacy_name(key: &str) -> String {
+    format!("{}{}", encode_key(key), LEGACY_EXTENSION)
+}
+
+/// Remove an archive and its sidecars, off the async runtime
+async fn remove_archive(archive: &Path) {
+    let archive = archive.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || remove_with_sidecars(&archive)).await;
+}
+
 fn remove_with_sidecars(archive: &Path) -> bool {
     let removed = std::fs::remove_file(archive).is_ok();
     for extension in SIDECARS {
@@ -166,7 +248,7 @@ fn evict_over_size(root: &Path, max_size: u64, keep: &Path) {
         };
         for file in files.flatten() {
             let path = file.path();
-            if path.extension().is_none_or(|ext| ext != "zip") {
+            if !is_archive(&path) {
                 continue;
             }
             let Ok(meta) = file.metadata() else { continue };
@@ -301,10 +383,18 @@ impl LocalCache {
         .await;
     }
 
+    /// The archive of `key` (format 2)
     fn archive_path(&self, project_id: u64, key: &str) -> PathBuf {
         self.root
             .join(format!("project-{}", project_id))
-            .join(format!("{}.zip", encode_key(key)))
+            .join(archive_name(key))
+    }
+
+    /// The archive an older version saved for `key` (format 1)
+    fn legacy_path(&self, project_id: u64, key: &str) -> PathBuf {
+        self.root
+            .join(format!("project-{}", project_id))
+            .join(legacy_name(key))
     }
 
     /// Number of cache archives and their total size in bytes
@@ -313,10 +403,34 @@ impl LocalCache {
             .into_iter()
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_type().is_file())
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "zip"))
+            .filter(|entry| is_archive(entry.path()))
             .fold((0, 0), |(count, size), entry| {
                 (count + 1, size + entry.metadata().map_or(0, |m| m.len()))
             })
+    }
+
+    /// The local archive of `key`: of the two formats, the one written or
+    /// used last
+    async fn local_archive(&self, project_id: u64, key: &str) -> Result<Option<PathBuf>> {
+        let mut found: Option<(std::time::SystemTime, PathBuf)> = None;
+        for path in [
+            self.archive_path(project_id, key),
+            self.legacy_path(project_id, key),
+        ] {
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) => {
+                    let used = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    if found.as_ref().is_none_or(|(newest, _)| used > *newest) {
+                        found = Some((used, path));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("Failed to read {}", path.display()))
+                }
+            }
+        }
+        Ok(found.map(|(_, path)| path))
     }
 
     /// Extract the first key that has an archive, in S3 or locally, until `stop`
@@ -330,17 +444,27 @@ impl LocalCache {
         let mut outcome = Restore::default();
         for key in keys {
             stop.check()?;
-            let path = self.archive_path(project_id, key);
-            let mut source = Source::Local;
+            let mut current = None;
             if let Some(remote) = &self.remote {
-                match self.fetch(remote, project_id, key, &path).await {
-                    Ok(Some(fetched)) => source = fetched,
-                    Ok(None) => {}
+                match self.fetch(remote, project_id, key, workspace, stop).await? {
+                    Ok(Fetched::Extracted(bytes)) => {
+                        outcome.hit = Some((key.clone(), Source::S3Downloaded(bytes)));
+                        return Ok(outcome);
+                    }
+                    Ok(Fetched::Local(path, source)) => current = Some((path, source)),
+                    Ok(Fetched::Missing) => {}
                     Err(e) => outcome
                         .warnings
                         .push(format!("S3 unavailable for cache {}: {:#}", key, e)),
                 }
             }
+            let (path, source) = match current {
+                Some(current) => current,
+                None => match self.local_archive(project_id, key).await? {
+                    Some(path) => (path, Source::Local),
+                    None => continue,
+                },
+            };
             match tokio::fs::metadata(&path).await {
                 Ok(_) => {
                     // Mark the archive as used, so eviction keeps it
@@ -351,10 +475,11 @@ impl LocalCache {
                         }
                     })
                     .await;
-                    artifacts::extract_archive_file(&path, workspace, stop).await?;
+                    artifacts::extract_cache_file(&path, workspace, stop).await?;
                     outcome.hit = Some((key.clone(), source));
                     return Ok(outcome);
                 }
+                // Evicted meanwhile by a concurrent job
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     return Err(e).with_context(|| format!("Failed to read {}", path.display()))
@@ -364,42 +489,165 @@ impl LocalCache {
         Ok(outcome)
     }
 
-    /// Bring the local archive of `key` up to date with S3: `Some` when S3 has
-    /// it (downloaded or unchanged), `None` when S3 does not
+    /// Bring the local archive of `key` up to date with S3: the archive
+    /// (format 2), or else the ZIP an older version uploaded. A changed
+    /// archive is extracted while it downloads. The inner error is an S3
+    /// problem, after which the local copy is used; the outer one is an
+    /// extraction that failed or was stopped.
     async fn fetch(
         &self,
         remote: &super::s3::Bucket,
         project_id: u64,
         key: &str,
-        path: &Path,
-    ) -> Result<Option<Source>> {
-        use super::s3::Download;
+        workspace: &str,
+        stop: &Stop,
+    ) -> Result<Result<Fetched>> {
+        use super::s3::{Download, Get};
+
+        let path = self.archive_path(project_id, key);
+        let dir = path.parent().unwrap_or(Path::new("."));
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+            return Ok(Err(e.into()));
+        }
+        let legacy = self.legacy_path(project_id, key);
+        let etag = current_etag(&path).await;
+        let object = remote.object_key(project_id, &archive_name(key));
+        match remote.get(&object, etag.as_deref()).await {
+            Ok(Get::NotModified) => return Ok(Ok(Fetched::Local(path, Source::S3NotModified))),
+            Ok(Get::Found(object)) => {
+                return self
+                    .download_and_extract(object, (&path, &legacy), workspace, stop)
+                    .await
+            }
+            Ok(Get::NotFound) => {}
+            Err(e) => return Ok(Err(e)),
+        }
+
+        // No archive in S3 in this format: one an older runner uploaded
+        let etag = current_etag(&legacy).await;
+        let object = remote.object_key(project_id, &legacy_name(key));
+        Ok(
+            match remote.get_to_file(&object, etag.as_deref(), dir).await {
+                Ok(Download::NotModified) => Ok(Fetched::Local(legacy, Source::S3NotModified)),
+                Ok(Download::NotFound) => Ok(Fetched::Missing),
+                Ok(Download::Downloaded {
+                    file,
+                    etag,
+                    bytes,
+                    sha256,
+                }) => match file.persist(&legacy) {
+                    Ok(_) => {
+                        write_sidecars(&legacy, etag.as_deref(), &sha256).await;
+                        // Hosts that only pull must keep the local layer bounded too
+                        self.evict(dir, &legacy).await;
+                        Ok(Fetched::Local(legacy, Source::S3Downloaded(bytes)))
+                    }
+                    Err(e) => Err(anyhow::Error::new(e.error))
+                        .with_context(|| format!("Failed to save {}", legacy.display())),
+                },
+                Err(e) => Err(e),
+            },
+        )
+    }
+
+    /// Download `object` into the local layer at `path` and extract it into
+    /// the workspace as it arrives: the download and the extraction overlap,
+    /// and the archive is read from disk only when it is unchanged later.
+    /// A download that fails midway leaves the files extracted so far; the
+    /// local copy restored after it overwrites them.
+    async fn download_and_extract(
+        &self,
+        mut object: super::s3::Object<'_>,
+        (path, legacy): (&Path, &Path),
+        workspace: &str,
+        stop: &Stop,
+    ) -> Result<Result<Fetched>> {
+        use sha2::Digest;
+        use tokio::io::AsyncWriteExt;
 
         let dir = path.parent().unwrap_or(Path::new("."));
-        tokio::fs::create_dir_all(dir).await?;
-        let etag = if tokio::fs::try_exists(path).await.unwrap_or(false) {
-            tokio::fs::read_to_string(sidecar(path)).await.ok()
-        } else {
-            None
-        };
-        let object = remote.object_key(project_id, &format!("{}.zip", encode_key(key)));
-        match remote.get_to_file(&object, etag.as_deref(), dir).await? {
-            Download::NotModified => Ok(Some(Source::S3NotModified)),
-            Download::NotFound => Ok(None),
-            Download::Downloaded {
-                file,
-                etag,
-                bytes,
-                sha256,
-            } => {
-                file.persist(path)
-                    .with_context(|| format!("Failed to save {}", path.display()))?;
-                write_sidecars(path, etag.as_deref(), &sha256).await;
-                // Hosts that only pull must keep the local layer bounded too
-                self.evict(dir, path).await;
-                Ok(Some(Source::S3Downloaded(bytes)))
+        let staged = match tempfile::NamedTempFile::new_in(dir).and_then(|file| {
+            let copy = file.reopen()?;
+            Ok((file, copy))
+        }) {
+            Ok(staged) => staged,
+            Err(e) => {
+                return Ok(Err(anyhow::Error::new(e)
+                    .context(format!("Failed to create a file in {}", dir.display()))))
             }
+        };
+        let (staged, copy) = staged;
+        let (sender, chunks) = tokio::sync::mpsc::channel(STREAM_QUEUE);
+        let extraction = {
+            let (workspace, stop) = (workspace.to_string(), stop.clone());
+            tokio::task::spawn_blocking(move || {
+                let reader = ChannelReader {
+                    chunks,
+                    chunk: bytes::Bytes::new(),
+                };
+                artifacts::extract_tar_zst(
+                    reader,
+                    &workspace,
+                    artifacts::ExtractLimits::default(),
+                    &stop,
+                )
+            })
+        };
+
+        // Network chunks are small (often 16 KiB): written in larger pieces
+        let mut out =
+            tokio::io::BufWriter::with_capacity(256 * 1024, tokio::fs::File::from_std(copy));
+        let mut hasher = sha2::Sha256::new();
+        let mut size = 0u64;
+        let mut cut_short = false;
+        let received = async {
+            while let Some(chunk) = object.chunk().await? {
+                hasher.update(&chunk);
+                out.write_all(&chunk).await?;
+                size += chunk.len() as u64;
+                if sender.send(chunk).await.is_err() {
+                    // The extraction ended: its error tells why
+                    cut_short = true;
+                    break;
+                }
+            }
+            // The file is complete before it is renamed into place
+            out.flush().await?;
+            Ok::<(), anyhow::Error>(())
         }
+        .await;
+        drop(sender);
+        let extracted = extraction.await.context("Extraction task panicked")?;
+        match (received, extracted) {
+            // The extraction saw a truncated stream: the download's error
+            // is the one to report, and the local copy is used
+            (Err(e), _) => return Ok(Err(e)),
+            // A bad archive, or `stop`: as when extracting a local copy
+            (Ok(()), Err(e)) => return Err(e),
+            (Ok(()), Ok(())) if cut_short => {
+                return Ok(Err(anyhow::anyhow!(
+                    "the cache archive ended before the download"
+                )))
+            }
+            (Ok(()), Ok(())) => {}
+        }
+        let sha256 = format!("{:x}", hasher.finalize());
+        // The files are extracted already; a mismatch keeps the archive out
+        // of the local layer, and the local copy then overwrites them
+        if let Err(e) = object.check(&sha256) {
+            return Ok(Err(e));
+        }
+        match staged.persist(path) {
+            Ok(_) => {
+                write_sidecars(path, object.etag.as_deref(), &sha256).await;
+                // It replaces the ZIP an older version saved for the key
+                remove_archive(legacy).await;
+                self.evict(dir, path).await;
+            }
+            // The cache is restored; only the next restore downloads again
+            Err(e) => tracing::warn!("Failed to save {}: {}", path.display(), e.error),
+        }
+        Ok(Ok(Fetched::Extracted(size)))
     }
 
     /// Archive `paths` from the workspace under `key` and upload it to S3, if
@@ -432,6 +680,8 @@ impl LocalCache {
             .file
             .persist(&path)
             .with_context(|| format!("Failed to save {}", path.display()))?;
+        // It replaces the ZIP an older version saved for the key
+        remove_archive(&self.legacy_path(project_id, key)).await;
         let upload = match &self.remote {
             None => {
                 // Without S3 the old ETag describes nothing any more
@@ -439,7 +689,7 @@ impl LocalCache {
                 None
             }
             Some(remote) => {
-                let object = remote.object_key(project_id, &format!("{}.zip", encode_key(key)));
+                let object = remote.object_key(project_id, &archive_name(key));
                 Some(upload(remote, &object, &path, &file, &sha256).await)
             }
         };
@@ -527,7 +777,7 @@ mod tests {
     async fn saves_upload_and_other_hosts_download() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path("/ci/project-5/main.zip"))
+            .and(path("/ci/project-5/main.tar.zst"))
             .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v1\""))
             .expect(1)
             .mount(&server)
@@ -548,7 +798,7 @@ mod tests {
             .unwrap();
         assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
         assert_eq!(
-            std::fs::read_to_string(host_a.path().join("project-5/main.zip.etag")).unwrap(),
+            std::fs::read_to_string(host_a.path().join("project-5/main.tar.zst.etag")).unwrap(),
             "\"v1\""
         );
 
@@ -562,7 +812,7 @@ mod tests {
             .unwrap()
             .body;
         Mock::given(method("GET"))
-            .and(path("/ci/project-5/main.zip"))
+            .and(path("/ci/project-5/main.tar.zst"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("etag", "\"v1\"")
@@ -594,7 +844,7 @@ mod tests {
             "dep"
         );
         assert!(
-            host_b.path().join("project-5/main.zip").exists(),
+            host_b.path().join("project-5/main.tar.zst").exists(),
             "kept as the local layer"
         );
     }
@@ -684,7 +934,7 @@ mod tests {
             "{:?}",
             saved.upload
         );
-        assert!(!root.path().join("project-5/main.zip.etag").exists());
+        assert!(!root.path().join("project-5/main.tar.zst.etag").exists());
 
         let consumer = tempdir().unwrap();
         let restored = cache
@@ -838,7 +1088,7 @@ mod tests {
     async fn fallback_keys_are_tried_in_s3() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/ci/project-5/feature.zip"))
+            .and(path("/ci/project-5/feature.tar.zst"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
@@ -853,9 +1103,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let archive = std::fs::read(staging.path().join("project-5/main.zip")).unwrap();
+        let archive = std::fs::read(staging.path().join("project-5/main.tar.zst")).unwrap();
         Mock::given(method("GET"))
-            .and(path("/ci/project-5/main.zip"))
+            .and(path("/ci/project-5/main.tar.zst"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
             .mount(&server)
             .await;
@@ -879,7 +1129,7 @@ mod tests {
             restored.hit
         );
         assert!(
-            !root.path().join("project-5/main.zip.etag").exists(),
+            !root.path().join("project-5/main.tar.zst.etag").exists(),
             "no ETag header, no sidecar"
         );
     }
@@ -909,7 +1159,7 @@ mod tests {
             .set_modified(two_days_ago)
             .unwrap();
         Mock::given(method("GET"))
-            .and(path("/ci/project-5/b.zip"))
+            .and(path("/ci/project-5/b.tar.zst"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
             .mount(&server)
             .await;
@@ -969,8 +1219,8 @@ mod tests {
     async fn caches_saved_by_older_versions_still_restore() {
         let cache_root = tempdir().unwrap();
         let cache = LocalCache::new(cache_root.path());
-        // Older versions wrote deflate entries
-        let path = cache.archive_path(42, "main");
+        // The first versions wrote ZIPs with deflate entries
+        let path = cache.legacy_path(42, "main");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
         zip.start_file(
@@ -997,6 +1247,340 @@ mod tests {
             std::fs::read(consumer.path().join("vendor/lib.txt")).unwrap(),
             b"old"
         );
+
+        // A save writes the new format and drops the old archive
+        let producer = workspace("new");
+        cache
+            .save(
+                42,
+                "main",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
+        let archive = std::fs::read(cache.archive_path(42, "main")).unwrap();
+        assert_eq!(
+            artifacts::cache_format(&archive),
+            Some(artifacts::CacheFormat::TarZst)
+        );
+        assert_eq!(cache.stats().0, 1);
+    }
+
+    /// A ZIP (format 1) of vendor/lib.txt = `content`, as versions up to
+    /// 0.10 saved it
+    async fn legacy_archive(content: &str) -> Vec<u8> {
+        let ws = workspace(content);
+        let staging = tempdir().unwrap();
+        let archive = artifacts::create_archive(
+            ws.path().to_str().unwrap(),
+            &["vendor".to_string()],
+            &[],
+            "zip-zstd",
+            staging.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::read(archive.file.path()).unwrap()
+    }
+
+    /// In a fleet where older runners still save ZIPs, a key without a
+    /// tar.zst archive in S3 restores from the ZIP; the next save writes
+    /// the new format under its own name, which older runners never read
+    #[tokio::test]
+    async fn s3_archives_of_older_runners_are_restored() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/main.zip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"old\"")
+                    .set_body_bytes(legacy_archive("from-zip").await),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/main.zip"))
+            .and(wiremock::matchers::header("if-none-match", "\"old\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/ci/project-5/main.tar.zst"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"new\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+        let job = tempdir().unwrap();
+        let job_path = job.path().to_str().unwrap();
+
+        let first = cache
+            .restore(5, &["main".to_string()], job_path, &Stop::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(first.hit, Some((_, Source::S3Downloaded(_)))),
+            "{:?}",
+            first
+        );
+        assert_eq!(
+            std::fs::read_to_string(job.path().join("vendor/lib.txt")).unwrap(),
+            "from-zip"
+        );
+        assert!(cache.legacy_path(5, "main").exists());
+        // Unchanged: the local ZIP is used
+        let second = cache
+            .restore(5, &["main".to_string()], job_path, &Stop::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(second.hit, Some((_, Source::S3NotModified))),
+            "{:?}",
+            second
+        );
+
+        let saved = cache
+            .save(5, "main", job_path, &["vendor".to_string()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.upload, Some(Ok(Upload::Sent)));
+        assert!(!cache.legacy_path(5, "main").exists());
+        let gets: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "GET")
+            .map(|request| request.url.path().to_string())
+            .collect();
+        // The new name first, every time
+        assert_eq!(
+            gets,
+            [
+                "/ci/project-5/main.tar.zst",
+                "/ci/project-5/main.zip",
+                "/ci/project-5/main.tar.zst",
+                "/ci/project-5/main.zip"
+            ]
+        );
+    }
+
+    /// A download is extracted as it arrives; one that breaks off midway is
+    /// a warning, and the local copy is restored over what it extracted
+    #[tokio::test]
+    async fn a_download_cut_short_falls_back_to_the_local_copy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempdir().unwrap();
+        let ws = workspace("local");
+        let local = LocalCache::new(root.path());
+        local
+            .save(
+                5,
+                "main",
+                ws.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        // A larger archive in S3, of which the server sends half
+        let big = tempdir().unwrap();
+        std::fs::create_dir(big.path().join("vendor")).unwrap();
+        let mut seed: u64 = 3;
+        let noise: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 56) as u8
+            })
+            .collect();
+        std::fs::write(big.path().join("vendor/blob.bin"), &noise).unwrap();
+        let staging = tempdir().unwrap();
+        let remote_archive = artifacts::create_cache_archive(
+            big.path().to_str().unwrap(),
+            &["vendor".to_string()],
+            staging.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = std::fs::read(remote_archive.file.path()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0u8; 4096]).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"cut\"\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body[..body.len() / 2]).await.unwrap();
+        });
+        let cache = LocalCache::new(root.path()).with_remote(
+            crate::runner_daemon::s3::Bucket::new(
+                &crate::runner_daemon::config::S3CacheConfig {
+                    url: format!("http://{}/ci", address),
+                    access_key: "AK".to_string(),
+                    secret_key: "SK".to_string(),
+                    region: None,
+                },
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        );
+        let job = tempdir().unwrap();
+
+        let restored = cache
+            .restore(
+                5,
+                &["main".to_string()],
+                job.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+        server.abort();
+
+        assert!(
+            matches!(restored.hit, Some((_, Source::Local))),
+            "{:?}",
+            restored
+        );
+        assert_eq!(restored.warnings.len(), 1, "{:?}", restored.warnings);
+        assert_eq!(
+            std::fs::read_to_string(job.path().join("vendor/lib.txt")).unwrap(),
+            "local"
+        );
+        // The broken download did not replace the local copy
+        assert!(!sidecar(&cache.archive_path(5, "main")).exists());
+    }
+
+    /// An archive from S3 is untrusted: one escaping the workspace fails the
+    /// restore as a local one would, and is not kept
+    #[tokio::test]
+    async fn a_hostile_archive_from_s3_is_refused_and_not_kept() {
+        let mut header = tar::Header::new_gnu();
+        header.as_old_mut().name[..14].copy_from_slice(b"../escaped.txt");
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(5);
+        header.set_cksum();
+        let mut tar = tar::Builder::new(Vec::new());
+        tar.append(&header, &b"pwned"[..]).unwrap();
+        let hostile = zstd::encode_all(&tar.into_inner().unwrap()[..], 1).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/main.tar.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(hostile))
+            .mount(&server)
+            .await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+        let parent = tempdir().unwrap();
+        let job = parent.path().join("job");
+
+        let error = cache
+            .restore(
+                5,
+                &["main".to_string()],
+                job.to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Unsafe path"), "{:#}", error);
+        assert!(!parent.path().join("escaped.txt").exists());
+        assert!(!cache.archive_path(5, "main").exists());
+    }
+
+    /// The hash the uploader stored with the object must match what arrived
+    #[tokio::test]
+    async fn a_download_that_does_not_match_its_hash_is_not_kept() {
+        let server = MockServer::start().await;
+        let producer = workspace("dep");
+        let elsewhere = tempdir().unwrap();
+        let other = LocalCache::new(elsewhere.path());
+        other
+            .save(
+                5,
+                "main",
+                producer.path().to_str().unwrap(),
+                &["vendor".to_string()],
+            )
+            .await
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/ci/project-5/main.tar.zst"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .insert_header(crate::runner_daemon::s3::META_SHA256, "0".repeat(64))
+                    .set_body_bytes(std::fs::read(other.archive_path(5, "main")).unwrap()),
+            )
+            .mount(&server)
+            .await;
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path()).with_remote(remote(&server));
+        let job = tempdir().unwrap();
+
+        let restored = cache
+            .restore(
+                5,
+                &["main".to_string()],
+                job.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(restored.hit.is_none(), "{:?}", restored);
+        assert!(
+            restored.warnings[0].contains("does not match its hash"),
+            "{:?}",
+            restored.warnings
+        );
+        assert!(!cache.archive_path(5, "main").exists());
+    }
+
+    /// cache_max_size counts archives of both formats
+    #[tokio::test]
+    async fn the_size_limit_counts_archives_of_both_formats() {
+        let root = tempdir().unwrap();
+        let cache = LocalCache::new(root.path());
+        let ws = workspace("dep");
+        let ws_path = ws.path().to_str().unwrap();
+        let paths = ["vendor".to_string()];
+        let legacy = cache.legacy_path(1, "old");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, legacy_archive("old").await).unwrap();
+        used_days_ago(&legacy, 3);
+        cache.save(2, "main", ws_path, &paths).await.unwrap();
+        used_days_ago(&cache.archive_path(2, "main"), 2);
+        assert_eq!(cache.stats().0, 2);
+        let size = std::fs::metadata(cache.archive_path(2, "main"))
+            .unwrap()
+            .len();
+
+        // Room for two new-format archives: the old ZIP goes first
+        LocalCache::new(root.path())
+            .with_max_size(Some(size * 2))
+            .save(3, "main", ws_path, &paths)
+            .await
+            .unwrap();
+
+        assert!(!legacy.exists());
+        assert!(cache.archive_path(2, "main").exists() && cache.archive_path(3, "main").exists());
+        assert_eq!(cache.stats().0, 2);
     }
 
     #[tokio::test]
@@ -1068,7 +1652,10 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(entries, vec!["%2E%2E%2F%2E%2E%2Fescaped.zip".to_string()]);
+        assert_eq!(
+            entries,
+            vec!["%2E%2E%2F%2E%2E%2Fescaped.tar.zst".to_string()]
+        );
         assert!(!root.path().join("escaped.zip").exists());
     }
 
@@ -1145,9 +1732,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let archive = std::fs::read(elsewhere.path().join("project-5/main.zip")).unwrap();
+        let archive = std::fs::read(elsewhere.path().join("project-5/main.tar.zst")).unwrap();
         Mock::given(method("GET"))
-            .and(path("/ci/project-5/main.zip"))
+            .and(path("/ci/project-5/main.tar.zst"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("etag", "\"v1\"")
@@ -1157,13 +1744,13 @@ mod tests {
             .await;
         // An object an older runner uploaded: no content hash in metadata
         Mock::given(method("HEAD"))
-            .and(path("/ci/project-5/main.zip"))
+            .and(path("/ci/project-5/main.tar.zst"))
             .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v1\""))
             .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("PUT"))
-            .and(path("/ci/project-5/main.zip"))
+            .and(path("/ci/project-5/main.tar.zst"))
             .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v2\""))
             .expect(1)
             .mount(&server)
@@ -1521,6 +2108,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(again.upload, Some(Ok(Upload::Unchanged)));
+
+        // A ZIP an older runner uploaded restores when the key has no
+        // tar.zst archive
+        let legacy = legacy_archive("from-0.10").await;
+        let staged = tempdir().unwrap();
+        let legacy_file = staged.path().join("old.zip");
+        std::fs::write(&legacy_file, &legacy).unwrap();
+        let hash = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&legacy))
+        };
+        let b = bucket();
+        b.put_file(
+            &b.object_key(9, "old.zip"),
+            &std::fs::File::open(&legacy_file).unwrap(),
+            &hash,
+        )
+        .await
+        .unwrap();
+        let restored_old = tempdir().unwrap();
+        let old = cache_b
+            .restore(
+                9,
+                &["old".to_string()],
+                restored_old.path().to_str().unwrap(),
+                &Stop::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(old.hit, Some((_, Source::S3Downloaded(_)))),
+            "{:?}",
+            old
+        );
+        assert_eq!(
+            std::fs::read_to_string(restored_old.path().join("vendor/lib.txt")).unwrap(),
+            "from-0.10"
+        );
 
         // S3 gone: the restore falls back to the local copy
         docker(&["stop", name]);
