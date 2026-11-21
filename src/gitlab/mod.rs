@@ -705,6 +705,8 @@ struct RunnerFeatures {
     return_exit_code: bool,
     service_variables: bool,
     cancel_gracefully: bool,
+    image_executor_opts: bool,
+    service_executor_opts: bool,
 }
 
 impl RunnerFeatures {
@@ -715,6 +717,10 @@ impl RunnerFeatures {
             services: executor == "docker",
             // `variables:` of a service reach its container
             service_variables: executor == "docker",
+            // `image:docker:` and `services:docker:` (platform, user) are honoured;
+            // without these GitLab does not send them
+            image_executor_opts: executor == "docker",
+            service_executor_opts: executor == "docker",
             artifacts: true,
             cache: true,
             fallback_cache_keys: true,
@@ -1604,7 +1610,13 @@ mod tests {
 
         assert_eq!(
             features("docker"),
-            with(&["image", "service_variables", "services"])
+            with(&[
+                "image",
+                "image_executor_opts",
+                "service_executor_opts",
+                "service_variables",
+                "services"
+            ])
         );
         assert_eq!(features("shell"), with(&["shared"]));
     }
