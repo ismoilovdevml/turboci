@@ -713,6 +713,8 @@ impl RunnerFeatures {
             variables: true,
             image: executor == "docker",
             services: executor == "docker",
+            // `variables:` of a service reach its container
+            service_variables: executor == "docker",
             artifacts: true,
             cache: true,
             fallback_cache_keys: true,
@@ -1562,6 +1564,49 @@ mod tests {
             .request_job("runner-token")
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn features_match_what_each_executor_implements() {
+        let features = |executor: &str| {
+            let json = serde_json::to_value(RunnerFeatures::for_executor(executor)).unwrap();
+            let mut enabled: Vec<String> = json
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, on)| on.as_bool().unwrap())
+                .map(|(name, _)| name.clone())
+                .collect();
+            enabled.sort();
+            enabled
+        };
+        let common = [
+            "artifacts",
+            "artifacts_exclude",
+            "cache",
+            "cancel_gracefully",
+            "cancelable",
+            "fallback_cache_keys",
+            "masking",
+            "multi_build_steps",
+            "raw_variables",
+            "refspecs",
+            "return_exit_code",
+            "upload_multiple_artifacts",
+            "upload_raw_artifacts",
+            "variables",
+        ];
+        let with = |extra: &[&str]| {
+            let mut all: Vec<String> = common.iter().chain(extra).map(|s| s.to_string()).collect();
+            all.sort();
+            all
+        };
+
+        assert_eq!(
+            features("docker"),
+            with(&["image", "service_variables", "services"])
+        );
+        assert_eq!(features("shell"), with(&["shared"]));
     }
 
     #[tokio::test]
