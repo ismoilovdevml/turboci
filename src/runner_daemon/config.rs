@@ -69,7 +69,9 @@ pub struct RunnerConfig {
     /// past it is dropped while the job keeps running
     pub output_limit: u64,
 
-    /// `KEY=value` variables added to every job (they override the job's own)
+    /// `KEY=value` variables added to every job, as gitlab-runner's
+    /// `environment`: the job's own variables (from GitLab and the pipeline)
+    /// override them. The value is kept as written, spaces included.
     pub environment: Vec<String>,
     /// Scripts run for every job, as in gitlab-runner: before and after the
     /// checkout, and before and after the job's script (in the same shell)
@@ -1097,7 +1099,27 @@ impl RunnerConfig {
         if !work_dir_given {
             self.executor.shell.work_dir = builds;
         }
+        let git_defaults = self.environment_git_defaults();
+        if !git_defaults.is_empty() {
+            tracing::warn!(
+                "environment{} sets {}: a job's own value overrides it (as in gitlab-runner), so it is only the default for jobs that set none",
+                place,
+                git_defaults.join(", ")
+            );
+        }
         self
+    }
+
+    /// Git settings the runner `environment` sets. Up to 0.12 they overrode
+    /// the job's own; now they only apply to jobs that set none, which a
+    /// config written for an older version may not expect.
+    fn environment_git_defaults(&self) -> Vec<&str> {
+        self.environment
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, _)| key.trim())
+            .filter(|key| ["GIT_STRATEGY", "GIT_DEPTH", "GIT_CLEAN_FLAGS"].contains(key))
+            .collect()
     }
 
     /// Host directory of the job workspaces of the configured executor
@@ -1628,13 +1650,17 @@ mod tests {
     }
 
     #[test]
-    fn workspace_sharing_is_a_setting() {
+    fn workspace_sharing_and_git_defaults_in_environment() {
         let config = RunnerConfig::parse(
-            "runner_token = \"t\"\n[executor]\nshare_workspace_across_protection = true",
+            "runner_token = \"t\"\nenvironment = [\"GIT_STRATEGY=clone\", \" GIT_DEPTH =1\", \"A=GIT_CLEAN_FLAGS\", \"GIT_CLEAN_FLAGS=-ffd\"]\n[executor]\nshare_workspace_across_protection = true",
         )
         .unwrap();
         config.validate().unwrap();
         assert!(config.executor.share_workspace_across_protection);
+        assert_eq!(
+            config.environment_git_defaults(),
+            ["GIT_STRATEGY", "GIT_DEPTH", "GIT_CLEAN_FLAGS"]
+        );
         assert!(RunnerConfig::parse(
             "runner_token = \"t\"\n[executor]\nshare_workspace_across_protection = \"yes\""
         )

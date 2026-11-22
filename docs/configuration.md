@@ -59,7 +59,7 @@ work_dir = "/var/lib/turboci/builds"
 | `state_dir` | `/var/lib/turboci` | Where the runner keeps state it writes: its system ID, a [rotated token](operations.md#runner-token-rotation), and the part of each [job log](operations.md#job-logs) GitLab has received |
 | `output_limit` | `4096` | Most job log kept, in KiB, as gitlab-runner's `output_limit` (`64` to `1048576`, i.e. 1 GiB). Past it the log says it was cut and the job keeps running |
 | `metrics_listen` | unset | `IP:port` of the [Prometheus endpoint](operations.md#metrics), e.g. `"127.0.0.1:9252"`. Unset: no endpoint |
-| `environment` | `[]` | `KEY=value` variables added to every job; they override the job's own |
+| `environment` | `[]` | `KEY=value` variables added to every job, as defaults: the job's own variables override them (see [variable precedence](#variable-precedence)) |
 | `pre_get_sources_script` | – | Script run before the checkout of every job (before the job's `hooks:pre_get_sources_script`) |
 | `post_get_sources_script` | – | Script run after the checkout |
 | `pre_build_script` | – | Script run before `before_script`, in the same shell as the job's script |
@@ -71,9 +71,41 @@ These work as the settings of the same names in gitlab-runner's
 `[[runners]]`, so a gitlab-runner config can be carried over:
 
 ```toml
-environment = ["ANDROID_HOME=/home/ci/Android/Sdk", "GIT_STRATEGY=clone"]
+environment = ["ANDROID_HOME=/home/ci/Android/Sdk"]
 pre_get_sources_script = "export PATH=$PATH:/opt/flutter/bin"
 ```
+
+### Variable precedence
+
+A job gets its variables in this order, and a later definition of a name
+overrides an earlier one, as in gitlab-runner:
+
+1. The proxy variables of `proxy` (see [proxy](#proxy)).
+2. The runner's `environment`.
+3. The variables the runner defines: `CI_CONCURRENT_ID`,
+   `CI_CONCURRENT_PROJECT_ID`, `CI_RUNNER_VERSION`, `CI_RUNNER_REVISION`,
+   `CI_RUNNER_EXECUTABLE_ARCH`, `CI_RUNNER_SHORT_TOKEN`.
+4. The job's variables from GitLab: predefined ones (`CI_COMMIT_SHA`, ...),
+   then instance, group and project variables, `.gitlab-ci.yml`, pipeline,
+   trigger and manual variables, in GitLab's own precedence.
+
+So `environment` holds defaults: `environment = ["GIT_DEPTH=10"]` applies to
+jobs that set no `GIT_DEPTH`, and a job's `GIT_DEPTH: 0` wins. The runner
+logs a warning at start (and on a reload) when `environment` sets
+`GIT_STRATEGY`, `GIT_DEPTH` or `GIT_CLEAN_FLAGS`.
+
+!!! warning "Changed after 0.12.1"
+    Up to 0.12.1 `environment` came last and overrode the job's own
+    variables. A config carried over from gitlab-runner, or written for an
+    older TurboCI, with for example `GIT_STRATEGY=clone` in `environment` made
+    every job clone. It is now only the default for jobs that set none.
+
+Unlike gitlab-runner, `environment` also overrides `CI_BUILDS_DIR`,
+`CI_PROJECT_DIR`, `CI_SERVER`, `CI_JOB_STATUS`, `CI_JOB_TIMEOUT` and
+`CI_SHARED_ENVIRONMENT` / `CI_DISPOSABLE_ENVIRONMENT` when it sets them; do
+not set those there. An entry is split at its first `=`. The value is kept
+as written, as in gitlab-runner: `"KEY= v"` gives `" v"`. Spaces around the
+name are dropped.
 
 ## Several runners
 
@@ -173,8 +205,8 @@ With `proxy` set:
   go through it. Without it the runner reads `HTTP_PROXY`, `HTTPS_PROXY` and
   `NO_PROXY` from its environment.
 - Jobs, the source checkout and services get `HTTP_PROXY`, `HTTPS_PROXY`,
-  `NO_PROXY` and their lowercase forms. A job that sets one of them itself
-  keeps its own value; the runner's `environment` overrides both. Each of the
+  `NO_PROXY` and their lowercase forms. The runner's `environment` overrides
+  them, and a job that sets one of them itself keeps its own value. Each of the
   six is overridden on its own: a job that sets only `HTTP_PROXY` still gets
   the runner's `http_proxy`, which curl and git read first, and a job-level
   `NO_PROXY` replaces the runner's list, including the loopback and service

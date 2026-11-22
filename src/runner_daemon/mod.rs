@@ -50,6 +50,17 @@ fn attempts(job: &Job, key: &str) -> u32 {
 /// Add the runner config's proxy, `environment`, hook scripts and workspace
 /// sharing to a job
 fn apply_runner_config(job: &mut Job, config: &config::RunnerConfig) {
+    // As gitlab-runner (common/build.go GetAllVariables): the runner's
+    // `environment` comes before the variables the runner defines and the
+    // job's own, so they override it; the value is kept as written, like
+    // gitlab-runner's ParseVariable ("KEY= v" gives " v")
+    let environment: Vec<Variable> = config
+        .environment
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| runner_variable(key.trim(), value.to_string()))
+        .collect();
+    prepend_variables(job, environment);
     job.share_workspace_across_protection = config.executor.share_workspace_across_protection;
     if let Some(proxy) = &config.proxy {
         // Service aliases only exist on the job's network, never behind the proxy
@@ -70,7 +81,7 @@ fn apply_runner_config(job: &mut Job, config: &config::RunnerConfig) {
             })
             .collect();
         let no_proxy = crate::net::effective_no_proxy(config.no_proxy.as_deref(), &aliases);
-        // First, so the job's own variables and `environment` win
+        // First, so `environment` and the job's own variables win
         let proxy_variables = [
             ("no_proxy", no_proxy.as_str()),
             ("NO_PROXY", no_proxy.as_str()),
@@ -85,13 +96,6 @@ fn apply_runner_config(job: &mut Job, config: &config::RunnerConfig) {
         });
         prepend_variables(job, proxy_variables);
     }
-    job.variables.extend(
-        config
-            .environment
-            .iter()
-            .filter_map(|entry| entry.split_once('='))
-            .map(|(key, value)| runner_variable(key.trim(), value.to_string())),
-    );
     // Runner hooks run before the job's own hooks of the same name
     for (name, script) in [
         ("post_get_sources_script", &config.post_get_sources_script),
@@ -2248,7 +2252,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = daemon(&server, dir.path()).await;
         let mut config = (*runner.config).clone();
-        config.environment = vec!["FROM_RUNNER=yes".into(), "OVERRIDDEN=runner".into()];
+        // As in gitlab-runner, the job's variables and the ones the runner
+        // defines override `environment`
+        config.environment = vec![
+            "FROM_RUNNER=yes".into(),
+            "OVERRIDDEN=runner".into(),
+            "CI_CONCURRENT_ID=99".into(),
+        ];
         config.pre_get_sources_script = Some("echo pre-sources".into());
         config.post_get_sources_script = Some("echo post-sources".into());
         config.pre_build_script = Some("echo pre-build".into());
@@ -2259,7 +2269,7 @@ mod tests {
             "variables": [{"key": "OVERRIDDEN", "value": "job"}],
             "steps": [{"name": "script", "when": "on_success",
                        "before_script": ["echo before"],
-                       "script": ["echo env=$FROM_RUNNER/$OVERRIDDEN"]}]
+                       "script": ["echo env=$FROM_RUNNER/$OVERRIDDEN/$CI_CONCURRENT_ID"]}]
         }))
         .unwrap();
 
@@ -2271,7 +2281,7 @@ mod tests {
             "post-sources",
             "pre-build",
             "before",
-            "env=yes/runner",
+            "env=yes/job/0",
             "post-build",
         ]
         .iter()
@@ -2356,15 +2366,22 @@ mod tests {
     }
 
     #[test]
-    fn runner_proxy_comes_before_job_variables_and_environment_after() {
+    fn runner_proxy_and_environment_come_before_job_variables() {
         let mut job: Job = serde_json::from_value(serde_json::json!({
             "id": 1, "token": "t",
-            "variables": [{"key": "JOB", "value": "x"}]
+            "variables": [
+                {"key": "JOB", "value": "x"},
+                {"key": "GIT_STRATEGY", "value": "fetch"}
+            ]
         }))
         .unwrap();
         let config = config::RunnerConfig {
             proxy: Some("http://proxy:3128".to_string()),
-            environment: vec!["ENV = y".to_string()],
+            environment: vec![
+                "ENV = y".to_string(),
+                "GIT_STRATEGY=clone".to_string(),
+                "HTTP_PROXY=http://env-proxy:3128".to_string(),
+            ],
             ..config::RunnerConfig::default()
         };
 
@@ -2380,13 +2397,33 @@ mod tests {
                 "http_proxy",
                 "HTTPS_PROXY",
                 "HTTP_PROXY",
+                "ENV",
+                "GIT_STRATEGY",
+                "HTTP_PROXY",
                 "JOB",
-                "ENV"
+                "GIT_STRATEGY"
             ]
         );
         assert!(job.variables[..6].iter().all(|v| v.raw && v.internal));
-        assert_eq!(job.variables[7].value.as_deref(), Some(" y"));
-        assert!(!job.variables[7].raw);
+        // The value as written, as gitlab-runner
+        assert_eq!(job.variables[6].value.as_deref(), Some(" y"));
+        assert!(!job.variables[6].raw);
+        // Last wins: the job's GIT_STRATEGY, the environment's HTTP_PROXY
+        let values = job_variables(&job);
+        assert_eq!(values["GIT_STRATEGY"], "fetch");
+        assert_eq!(values["HTTP_PROXY"], "http://env-proxy:3128");
+        assert_eq!(values["ENV"], " y");
+        assert_eq!(
+            git::strategy(&job.variables, false),
+            git::GitStrategy::Fetch
+        );
+
+        // The workspace setting reaches the job
+        assert!(!job.share_workspace_across_protection);
+        let mut config = config;
+        config.executor.share_workspace_across_protection = true;
+        apply_runner_config(&mut job, &config);
+        assert!(job.share_workspace_across_protection);
     }
 
     #[test]
@@ -3484,6 +3521,38 @@ mod tests {
             .contains("turboci_workspaces_size_bytes"));
     }
 
+    #[tokio::test]
+    async fn workspaces_past_their_age_are_only_renamed_while_jobs_wait() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let builds = dir.path().join("builds");
+        old_workspace(&builds, "project-1-0", 10, 1);
+        old_workspace(&builds, "project-2-0", 10, 8 * 24);
+
+        // What runs under the eviction lock: a rename, whatever the size
+        daemon
+            .executor
+            .evict_workspaces(Duration::from_secs(7 * 86400), &Default::default())
+            .await;
+        let names = entries(&builds);
+        assert_eq!(names.len(), 2, "{:?}", names);
+        assert_eq!(names[1], "project-1-0");
+        assert!(
+            names[0].starts_with(".turboci-evicted-project-2-0-"),
+            "{:?}",
+            names
+        );
+        // A renamed one is not evicted again; deleting it comes after the lock
+        daemon
+            .executor
+            .evict_workspaces(Duration::ZERO, &[builds.join("project-1-0")].into())
+            .await;
+        assert_eq!(entries(&builds), names);
+        housekeeping::remove_detached(&builds);
+        assert_eq!(entries(&builds), ["project-1-0"]);
+    }
+
     #[test]
     fn retry_after_from_gitlab_lengthens_the_wait_but_never_shortens_it() {
         let limited = anyhow::anyhow!("Job request failed: 429")
@@ -3528,38 +3597,6 @@ mod tests {
         slow.failed();
         slow.failed();
         assert_eq!(slow.ceiling(), Duration::from_secs(120));
-    }
-
-    #[tokio::test]
-    async fn workspaces_past_their_age_are_only_renamed_while_jobs_wait() {
-        let server = MockServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let daemon = daemon(&server, dir.path()).await;
-        let builds = dir.path().join("builds");
-        old_workspace(&builds, "project-1-0", 10, 1);
-        old_workspace(&builds, "project-2-0", 10, 8 * 24);
-
-        // What runs under the eviction lock: a rename, whatever the size
-        daemon
-            .executor
-            .evict_workspaces(Duration::from_secs(7 * 86400), &Default::default())
-            .await;
-        let names = entries(&builds);
-        assert_eq!(names.len(), 2, "{:?}", names);
-        assert_eq!(names[1], "project-1-0");
-        assert!(
-            names[0].starts_with(".turboci-evicted-project-2-0-"),
-            "{:?}",
-            names
-        );
-        // A renamed one is not evicted again; deleting it comes after the lock
-        daemon
-            .executor
-            .evict_workspaces(Duration::ZERO, &[builds.join("project-1-0")].into())
-            .await;
-        assert_eq!(entries(&builds), names);
-        housekeeping::remove_detached(&builds);
-        assert_eq!(entries(&builds), ["project-1-0"]);
     }
 
     #[test]

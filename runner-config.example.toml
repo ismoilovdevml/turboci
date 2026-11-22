@@ -41,8 +41,9 @@ state_dir = "/var/lib/turboci"
 # Output past it is dropped while the job keeps running.
 # output_limit = 4096
 
-# Variables added to every job (they override the job's own), and scripts run
-# for every job, as in gitlab-runner's [[runners]] section
+# Variables added to every job, as defaults: the job's own variables override
+# them (as in gitlab-runner). Scripts run for every job, as in gitlab-runner's
+# [[runners]] section
 # environment = ["KEY=value"]
 # pre_get_sources_script = "echo before the checkout"
 # post_get_sources_script = "echo after the checkout"
