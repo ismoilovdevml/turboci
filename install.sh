@@ -688,7 +688,12 @@ ExecStart=$INSTALL_DIR/$BIN_NAME runner-start -c $CONFIG_FILE
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=10
-# SIGTERM stops running jobs and reports them; give that time before SIGKILL
+# systemctl stop sends SIGTERM to the runner only: it stops running jobs,
+# cleans them up and reports them (up to 2 minutes for a Docker workspace's
+# ownership reset). What is left of the jobs gets SIGKILL once the runner is
+# gone, or after TimeoutStopSec. Signal the runner, never the whole unit:
+# systemctl kill --kill-whom=main (--kill-who= before systemd 252).
+KillMode=mixed
 TimeoutStopSec=180
 StandardOutput=journal
 StandardError=journal
@@ -715,6 +720,20 @@ EOF
     echo -e "${GREEN}✓${NC} Systemd reloaded"
 }
 
+# Send a signal to the runner, the service's main process, only. Plain
+# `systemctl kill` signals every process of the service: the jobs' shells and
+# commands too, which SIGQUIT or SIGHUP kills. systemd 252 renamed
+# --kill-who= to --kill-whom=.
+signal_runner() {
+    local version
+    version=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }')
+    if [[ "$version" =~ ^[0-9]+$ ]] && [ "$version" -lt 252 ]; then
+        systemctl kill --kill-who=main -s "$1" "$SERVICE_NAME"
+    else
+        systemctl kill --kill-whom=main -s "$1" "$SERVICE_NAME"
+    fi
+}
+
 # Enable the service; start it when a token was given
 enable_service() {
     echo -e "\n${YELLOW}🎬 Enabling service...${NC}"
@@ -728,7 +747,7 @@ enable_service() {
             # Upgrade of a configured runner. SIGQUIT lets running jobs finish
             # (no new ones are taken); systemd then starts the new binary
             # (Restart=always). A plain restart would fail running jobs.
-            systemctl kill -s SIGQUIT $SERVICE_NAME
+            signal_runner SIGQUIT
             DRAINING=1
             echo -e "${GREEN}✓${NC} Service draining: running jobs finish, then it restarts with the new binary"
             echo -e "   Follow it with: ${BLUE}journalctl -u $SERVICE_NAME -f${NC}"

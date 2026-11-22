@@ -70,15 +70,22 @@ curl -sSL https://raw.githubusercontent.com/ismoilovdevml/turboci/main/install.s
 
 Run the same command again. With a token the config is replaced and the old
 one is kept as `/etc/turboci-runner.toml.bak.<date>`; without a token the
-existing config is kept. A running service is restarted on the new binary.
+existing config is kept. Without a token a running service is drained: its
+running jobs finish, then systemd starts it on the new binary. With a token
+it is restarted, which stops running jobs. The unit is written again either
+way, so an upgrade also brings the current unit settings.
 
 Alternatively, on the host:
 
 ```bash
-sudo turboci upgrade && sudo systemctl restart turboci
+sudo turboci upgrade
+# let running jobs finish, then systemd starts the new binary
+sudo systemctl kill --kill-whom=main -s SIGQUIT turboci   # --kill-who=main before systemd 252
 ```
 
-`turboci upgrade` also verifies the download against `SHA256SUMS`.
+`turboci upgrade` also verifies the download against `SHA256SUMS`. It does
+not rewrite the unit; see [stopping](operations.md#stopping) for why the
+signal must go to the main process only.
 
 ### A shell runner next to a docker runner
 
@@ -152,7 +159,7 @@ executor and the registry options are Linux only.
 |---|---|
 | `/usr/local/bin/turboci` | The binary |
 | `/etc/turboci-runner.toml` | Configuration, including the runner token |
-| `/etc/systemd/system/turboci.service` | Service unit (hardened: `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`, ...; `systemctl reload` sends `SIGHUP`) |
+| `/etc/systemd/system/turboci.service` | Service unit (hardened: `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`, ...; `systemctl reload` sends `SIGHUP`; `KillMode=mixed`, so `systemctl stop` sends `SIGTERM` to the runner, not to its jobs) |
 | `/var/lib/turboci` | State: local cache, job workspaces (`builds/`), rotated token |
 
 The service gets a `/tmp` of its own (`PrivateTmp=true`), emptied when it

@@ -1,7 +1,9 @@
 #!/bin/bash
 # Installs a shell runner from a local binary without a token (configured, not
 # started), checks what install.sh wrote, then removes it with uninstall.sh and
-# checks that nothing is left. CI runs it on Linux and macOS.
+# checks that nothing is left. Where systemd runs, it also checks that an
+# upgrade's drain and `systemctl stop` signal the runner, not its jobs. CI
+# runs it on Linux and macOS.
 #
 #   sudo bash e2e/installer-smoke.sh target/release/turboci
 set -euo pipefail
@@ -38,6 +40,9 @@ else
     ! grep -q '/tmp' "$UNIT" || fail "unit still uses the host's /tmp"
     # shellcheck disable=SC2016 # $MAINPID is systemd's, not the shell's
     grep -qx 'ExecReload=/bin/kill -HUP $MAINPID' "$UNIT" || fail "unit cannot reload"
+    grep -qx 'KillMode=mixed' "$UNIT" || fail "systemctl stop signals the jobs too"
+    # Every signal the installer sends goes to the runner only
+    ! grep -Eq 'systemctl kill (-s|--signal)' install.sh || fail "install.sh signals the whole unit"
     [ ! -e "$TMPFILES" ] || fail "old tmpfiles rule kept"
     if command -v systemd-analyze > /dev/null 2>&1; then
         systemd-analyze verify "$UNIT" || fail "systemd rejects the unit"
@@ -46,6 +51,47 @@ else
     LEFT_BEHIND=("$UNIT" "$STATE" "$TMPFILES")
 fi
 [ -d "$STATE/builds" ] || fail "no builds directory in $STATE"
+
+# With systemd running: a stand-in for the runner with one job, started from
+# the installed unit. The drain the installer sends on an upgrade must reach
+# the runner only, and `systemctl stop` must not SIGTERM the job.
+if [ "$(uname -s)" = "Linux" ] && [ -d /run/systemd/system ]; then
+    DROPIN_DIR="/etc/systemd/system/$NAME.service.d"
+    # Like a shell job: a process group of its own in the service's cgroup
+    cat > "$STATE/fake-runner.sh" << 'EOF'
+#!/bin/bash
+setsid bash -c 'trap "echo QUIT >> job.signals" QUIT; trap "echo TERM >> job.signals" TERM
+    echo $$ > job.pid; while :; do sleep 1 & wait $!; done' &
+trap 'echo QUIT >> runner.signals' QUIT
+trap 'echo TERM >> runner.signals; exit 0' TERM
+while :; do sleep 1 & wait $!; done
+EOF
+    chown "$SUDO_USER" "$STATE/fake-runner.sh"
+    mkdir -p "$DROPIN_DIR"
+    printf '[Service]\nExecStart=\nExecStart=/bin/bash %s/fake-runner.sh\n' "$STATE" > "$DROPIN_DIR/smoke.conf"
+    systemctl daemon-reload
+    systemctl start "$NAME"
+    for _ in $(seq 1 20); do [ -s "$STATE/job.pid" ] && break; sleep 0.5; done
+    JOB_PID=$(cat "$STATE/job.pid" 2> /dev/null) || fail "the stand-in job did not start"
+
+    # An upgrade of a running runner (no token: the config is kept) drains it.
+    # No terminal, so the installer does not ask to overwrite the config.
+    setsid -w bash install.sh --binary "$BINARY" --executor shell --name "$NAME" --user "$SUDO_USER" < /dev/null
+    sleep 1
+    grep -qx QUIT "$STATE/runner.signals" || fail "the drain did not reach the runner"
+    [ ! -e "$STATE/job.signals" ] || fail "the drain signalled the job: $(cat "$STATE/job.signals")"
+    kill -0 "$JOB_PID" || fail "the drain killed the job"
+    grep -qx 'KillMode=mixed' "$UNIT" || fail "the upgrade dropped KillMode=mixed"
+
+    systemctl stop "$NAME"
+    grep -qx TERM "$STATE/runner.signals" || fail "systemctl stop did not SIGTERM the runner"
+    [ ! -e "$STATE/job.signals" ] || fail "systemctl stop signalled the job: $(cat "$STATE/job.signals")"
+    ! kill -0 "$JOB_PID" 2> /dev/null || fail "the job outlived the stopped service"
+
+    rm -rf "$DROPIN_DIR"
+    systemctl daemon-reload
+    echo "drain and stop reach the runner only"
+fi
 
 bash uninstall.sh --name "$NAME"
 

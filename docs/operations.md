@@ -23,12 +23,25 @@ A healthy start ends with:
 | `SIGTERM`, `SIGINT` | Take no new jobs, stop running jobs, clean them up and report them as failed (*runner system failure*), then exit |
 | `SIGHUP` | [Reload the config](#reloading-the-config); the runner keeps running |
 
-`systemctl stop` and `restart` send `SIGTERM`; the unit allows 180 seconds for
-the cleanup. To drain the runner before maintenance:
+`systemctl stop` and `restart` send `SIGTERM` to the runner only
+(`KillMode=mixed`); the unit allows 180 seconds for the cleanup, after which
+systemd kills whatever is left. To drain the runner before maintenance:
 
 ```bash
-sudo systemctl kill -s SIGQUIT turboci
+sudo systemctl kill --kill-whom=main -s SIGQUIT turboci
+# systemd older than 252 (RHEL 8, Debian 11, Ubuntu 22.04): --kill-who=main
 ```
+
+Always signal the main process. A plain `systemctl kill -s SIGQUIT turboci`
+(or `-s SIGHUP`) sends the signal to every process of the service, the
+shells and commands of shell jobs included, and kills them. Reload with
+`systemctl reload`, which signals the runner only. On macOS,
+`launchctl kill SIGQUIT gui/<uid>/io.github.ismoilovdevml.turboci` signals the
+runner only.
+
+Units written by installers up to 0.12.1 have no `KillMode=mixed`:
+`systemctl stop` then sends `SIGTERM` to the jobs too. Running the installer
+again rewrites the unit (it drains the running runner the right way).
 
 ## Reloading the config
 
