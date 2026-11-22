@@ -4479,6 +4479,45 @@ mod tests {
     }
 
     /// An executor whose Docker client is never used: it points nowhere
+    #[test]
+    fn jobs_without_git_get_an_empty_workspace_of_their_own() {
+        let docker = ExecutorType::Docker(offline(DockerConfig::default()));
+        let shell = ExecutorType::Shell(crate::runner_daemon::executor::ShellExecutor::new(Some(
+            "/tmp/turboci-shell-test".to_string(),
+        )));
+        let with_strategy = |strategy: Option<&str>| {
+            let variables: Vec<serde_json::Value> = strategy
+                .map(|s| vec![serde_json::json!({"key": "GIT_STRATEGY", "value": s})])
+                .unwrap_or_default();
+            job(serde_json::json!({
+                "id": 77, "token": "t",
+                "job_info": {"name": "deploy", "stage": "deploy", "project_id": 5, "project_name": "p"},
+                "git_info": {
+                    "repo_url": "https://example.com/g/p.git", "ref": "main", "ref_type": "branch",
+                    "sha": "0123456789abcdef0123456789abcdef01234567", "before_sha": "",
+                    "refspecs": [], "protected": false
+                },
+                "variables": variables
+            }))
+        };
+        let leaf = |executor: &ExecutorType, j: &Job| {
+            executor
+                .job_dir(j)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // A deploy job that clones another repository must not find the clone
+        // an earlier job of the project left in the kept workspace
+        assert_eq!(leaf(&docker, &with_strategy(Some("none"))), "job-77");
+        assert_eq!(leaf(&docker, &with_strategy(Some("fetch"))), "project-5-0");
+        assert_eq!(leaf(&docker, &with_strategy(None)), "project-5-0");
+        // gitlab-runner's shell executor shares the project directory
+        assert_eq!(leaf(&shell, &with_strategy(Some("none"))), "project-5-0");
+    }
+
     fn offline(config: DockerConfig) -> DockerExecutor {
         let docker = Docker::with_socket("/nonexistent/turboci-test/docker.sock");
         DockerExecutor {

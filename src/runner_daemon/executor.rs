@@ -112,10 +112,27 @@ impl ExecutorType {
         }
     }
 
+    /// The job's workspace name and whether it is kept, as `workspace`, except
+    /// that a Docker job with GIT_STRATEGY=none gets an empty workspace of its
+    /// own: it runs no checkout and no `git clean`, so in a kept workspace it
+    /// would see what the project's earlier jobs left (a `git clone` of a
+    /// directory one of them cloned fails), and leave its own files for the
+    /// next. The shell executor keeps gitlab-runner's behaviour, where such a
+    /// job shares the project's directory.
+    fn workspace(&self, job: &Job) -> (String, bool) {
+        let isolated = matches!(self, ExecutorType::Docker(_))
+            && git::strategy(&job.variables, job.allow_git_fetch) == GitStrategy::None;
+        if isolated {
+            (format!("job-{}", job.id), false)
+        } else {
+            workspace(job)
+        }
+    }
+
     /// Host directory of the job's workspace (its builds directory); the
     /// project is checked out in `<job_dir>/project`
     pub fn job_dir(&self, job: &Job) -> PathBuf {
-        self.builds_root().join(workspace(job).0)
+        self.builds_root().join(self.workspace(job).0)
     }
 
     /// Check out sources and run the job's steps, writing output to `trace`
@@ -221,7 +238,7 @@ impl ExecutorType {
     /// workspace is kept for the project's next job, the whole workspace
     pub async fn cleanup(&self, job: &Job, keep_workspace: bool) {
         let dir = self.job_dir(job);
-        if keep_workspace && workspace(job).1 {
+        if keep_workspace && self.workspace(job).1 {
             remove_dir(&variables_dir(&dir, job)).await;
         } else if remove_dir(&dir).await {
             info!("💾 Removed workspace {}", dir.display());
