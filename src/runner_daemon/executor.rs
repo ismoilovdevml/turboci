@@ -943,6 +943,48 @@ mod tests {
         assert!(!log.contains("\nnever-printed"), "{}", log);
     }
 
+    /// A job step showing how SIGPIPE reaches job processes: their ignored
+    /// signal mask (Linux) and the exit code of a writer whose reader quit
+    pub(crate) const PIPE_CHECK: &str = "grep SigIgn /proc/self/status 2>/dev/null || true; \
+        (set +e; yes; echo \"yes-exit=$?\" >&2) | head -1 >/dev/null";
+
+    /// Checks a job log produced by `PIPE_CHECK`
+    pub(crate) fn assert_default_sigpipe(log: &str) {
+        // Killed by SIGPIPE (128 + 13), not ended by an EPIPE error (1)
+        assert!(log.contains("yes-exit=141"), "{}", log);
+        let line = log.lines().find(|l| l.starts_with("SigIgn:"));
+        // Jobs on Linux (and in containers) have /proc: the mask must be there
+        if cfg!(target_os = "linux") {
+            assert!(line.is_some(), "no SigIgn line in the job log:\n{}", log);
+        }
+        if let Some(line) = line {
+            let mask = u64::from_str_radix(line["SigIgn:".len()..].trim(), 16).unwrap();
+            assert_eq!(
+                mask & (1 << 12),
+                0,
+                "SIGPIPE is ignored in the job: {}",
+                line
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_jobs_die_quietly_on_a_closed_pipe() {
+        // `yes` must be killed by SIGPIPE (exit 141) when `head` stops reading,
+        // as in a terminal or gitlab-runner, not get EPIPE because the runner
+        // (Rust ignores SIGPIPE) passed SIG_IGN down to the job
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(serde_json::json!({
+            "id": 31, "token": "t",
+            "steps": steps(&[PIPE_CHECK], &[])
+        }));
+
+        let (outcome, log) = run_shell(&j, dir.path()).await;
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert_default_sigpipe(&log);
+    }
+
     #[tokio::test]
     async fn timeout_kills_script_and_reports_timeout() {
         let dir = tempfile::tempdir().unwrap();

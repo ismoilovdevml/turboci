@@ -3356,6 +3356,34 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_jobs_die_quietly_on_a_closed_pipe() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let job_id = 941_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "alpine:3.20"},
+            "steps": steps(&[crate::runner_daemon::executor::tests::PIPE_CHECK], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        crate::runner_daemon::executor::tests::assert_default_sigpipe(&log);
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
     async fn docker_uses_bash_and_expands_image_variables() {
         let executor = ExecutorType::Docker(
             DockerExecutor::new(DockerConfig {
