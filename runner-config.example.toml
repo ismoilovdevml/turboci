@@ -100,9 +100,14 @@ workspace_max_age_days = 7
 # beyond it the least recently used are deleted, never one a job is using.
 # Checked at start and every hour. Unset or "0": no limit
 # workspace_max_size = "100g"
+# Protected branches and tags get workspaces of their own, which jobs of
+# unprotected branches cannot leave files or git hooks in. true: one workspace
+# per project and slot for every ref, as gitlab-runner
+# share_workspace_across_protection = false
 
 # Shell executor configuration (used when executor_type = "shell")
 [executor.shell]
+# Default: <state_dir>/builds
 work_dir = "/var/lib/turboci/builds"
 
 # Docker executor configuration (used when executor_type = "docker")

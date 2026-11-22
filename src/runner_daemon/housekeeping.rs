@@ -168,6 +168,12 @@ pub fn detach(workspace: &Path) -> bool {
     }
 }
 
+/// Whether `path` is a workspace `detach` moved out of the way
+pub fn is_detached(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(EVICTED))
+}
+
 /// Delete the evicted workspaces in `root`, including those an interrupted
 /// run left behind
 pub fn remove_detached(root: &Path) {

@@ -802,6 +802,10 @@ pub struct Job {
     /// its project (`CI_CONCURRENT_PROJECT_ID`), which picks its workspace
     #[serde(skip)]
     pub project_slot: u32,
+    /// Set by the runner from its config, never by GitLab: protected and
+    /// unprotected refs use the same workspaces
+    #[serde(skip)]
+    pub share_workspace_across_protection: bool,
 }
 
 impl Job {

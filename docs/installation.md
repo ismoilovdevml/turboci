@@ -168,8 +168,9 @@ workspaces in `/tmp/turboci-builds`, recreated by
 `/etc/tmpfiles.d/turboci.conf`: an upgrade removes that rule and leaves the
 directory to you (`sudo rm -rf /tmp/turboci-builds` once no old runner is
 draining), and the uninstaller removes both. A kept config that sets
-`builds_dir` under `/tmp` keeps the host's `/tmp` (`PrivateTmp=false`), with
-a warning. The installer installs v0.10.0 or newer for the docker executor;
+`builds_dir` under `/tmp`, or a shell runner's `work_dir`, keeps the host's
+`/tmp` (`PrivateTmp=false`), with a warning: workspaces in the service's own
+`/tmp` would be gone after every restart. The installer installs v0.10.0 or newer for the docker executor;
 for an older `--version` use the `install.sh` of that release.
 
 ## Manual installation

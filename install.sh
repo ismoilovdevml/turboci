@@ -661,15 +661,26 @@ ProtectHome=true
 ReadWritePaths=$STATE_DIR"
     fi
     # The runner and its shell jobs get a /tmp of their own, emptied when the
-    # service stops. Docker workspaces must not be in it: dockerd bind-mounts
-    # them from the host's /tmp, so a kept config that puts them there keeps
-    # the host's /tmp.
+    # service stops. Workspaces must not be in it: dockerd bind-mounts Docker
+    # workspaces from the host's /tmp, and shell workspaces kept for the next
+    # job would be gone after every restart. A kept config that puts them
+    # there keeps the host's /tmp.
     PRIVATE_TMP="PrivateTmp=true"
-    if [ -f "$CONFIG_FILE" ] && grep -Eq '^[[:space:]]*builds_dir[[:space:]]*=[[:space:]]*"/tmp(/|")' "$CONFIG_FILE"; then
+    TMP_KEY=""
+    TMP_PATH='^[[:space:]]*KEY[[:space:]]*=[[:space:]]*"/tmp(/|")'
+    if [ -f "$CONFIG_FILE" ]; then
+        if grep -Eq "${TMP_PATH/KEY/builds_dir}" "$CONFIG_FILE"; then
+            TMP_KEY="builds_dir"
+        elif grep -Eq '^[[:space:]]*executor_type[[:space:]]*=[[:space:]]*"shell"' "$CONFIG_FILE" \
+            && grep -Eq "${TMP_PATH/KEY/work_dir}" "$CONFIG_FILE"; then
+            TMP_KEY="work_dir"
+        fi
+    fi
+    if [ -n "$TMP_KEY" ]; then
         PRIVATE_TMP="PrivateTmp=false"
         [ "$EXECUTOR" = "shell" ] || PROTECT="$PROTECT /tmp"
-        echo -e "${YELLOW}⚠️  $CONFIG_FILE puts builds_dir in /tmp: the service keeps the host's /tmp.${NC}"
-        echo -e "${YELLOW}   Remove builds_dir (default $STATE_DIR/builds) and run the installer again.${NC}"
+        echo -e "${YELLOW}⚠️  $CONFIG_FILE puts $TMP_KEY in /tmp: the service keeps the host's /tmp.${NC}"
+        echo -e "${YELLOW}   Remove $TMP_KEY (default $STATE_DIR/builds) and run the installer again.${NC}"
     fi
 
     cat > "$SERVICE_FILE" << EOF

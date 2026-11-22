@@ -659,24 +659,39 @@ and ignored files (`GIT_CLEAN_FLAGS`, default `-ffdx`).
 |---|---|---|
 | `[executor] workspace_max_age_days` | `7` | Workspaces no job used for this many days are deleted. `0` deletes every workspace when its job ends, so every job clones |
 | `[executor] workspace_max_size` | unset | Total size of the kept workspaces of all projects (`"512m"`, `"50g"`, bytes). Beyond it the least recently used workspaces are deleted, never one a job is using. Unset or `"0"`: no limit |
+| `[executor] share_workspace_across_protection` | `false` | `true`: protected and unprotected refs of a project share its workspaces, as in gitlab-runner. `false`: protected refs get workspaces of their own |
 
 Both limits are applied when the runner starts and then every hour, for every
 project, whether or not it still has jobs. A workspace that a job is using is
 never deleted, even when the workspaces in use alone exceed
 `workspace_max_size` (the runner then logs a warning). Workspaces are
-measured without blocking jobs; a deleted workspace is first renamed, so a
-job that starts meanwhile gets a fresh one and clones.
+measured and deleted without blocking jobs: a workspace to delete is first
+renamed, so a job that starts meanwhile gets a fresh one and clones.
 
 - Each project has one workspace per job running at the same time
-  (`CI_CONCURRENT_PROJECT_ID`), and protected branches and tags never share
-  a workspace with unprotected ones. They live in
+  (`CI_CONCURRENT_PROJECT_ID`). They live in
   `<builds directory>/project-<id>-<slot>[-protected]`.
+- By default protected branches and tags never share a workspace with
+  unprotected ones: a job can leave files, git config or hooks in its
+  workspace, and a job of an unprotected branch (which anyone who can push
+  a branch can write) must not be able to plant them for a job of a
+  protected ref, which may hold deploy secrets. gitlab-runner keeps one
+  workspace per project and slot for every ref; set
+  `share_workspace_across_protection = true` to do the same and fetch less
+  when a project alternates between protected and unprotected refs.
 - An earlier job may have changed the repository, so its git config and
   hooks are replaced before the checkout. Repositories with submodules
   (`GIT_SUBMODULE_STRATEGY`) are always cloned, and a checkout that cannot be
   updated (for example after a job was killed mid-fetch) is cloned again.
-- When GitLab does not say whether the ref is protected, the job gets a
-  workspace of its own that is deleted when it ends.
+- When GitLab does not say whether the ref is protected (older GitLab
+  versions), the job uses the unprotected workspace, as gitlab-runner does:
+  the runner cannot tell it from an unprotected job, and the protected
+  workspace stays reserved for jobs GitLab marks protected. Up to 0.12.1
+  such a job got a workspace of its own and always cloned.
+- A Docker job with `GIT_STRATEGY: none` gets an empty workspace of its own
+  that is deleted when it ends: nothing checks out or cleans it, so it would
+  see what earlier jobs left. A shell job with `GIT_STRATEGY: none` uses the
+  project's workspace, as in gitlab-runner.
 
 ### Shell
 
@@ -687,7 +702,7 @@ job that starts meanwhile gets a fresh one and clones.
 
 | Key | Default | Description |
 |---|---|---|
-| `work_dir` | `/var/lib/turboci/builds` | Where job workspaces are created |
+| `work_dir` | `<state_dir>/builds` | Where job workspaces are created. Up to 0.12.1 the default was `/tmp/turboci-builds`, which the service's private `/tmp` loses on every restart; a config that sets it keeps its value |
 
 Jobs run with `bash` when it is installed, otherwise `sh`, as the service
 user. To run them as a user that already has the tools (SDKs in its home, for

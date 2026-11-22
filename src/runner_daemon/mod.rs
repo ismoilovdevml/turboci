@@ -47,8 +47,10 @@ fn attempts(job: &Job, key: &str) -> u32 {
         .clamp(1, 10)
 }
 
-/// Add the runner config's proxy, `environment` and hook scripts to a job
+/// Add the runner config's proxy, `environment`, hook scripts and workspace
+/// sharing to a job
 fn apply_runner_config(job: &mut Job, config: &config::RunnerConfig) {
+    job.share_workspace_across_protection = config.executor.share_workspace_across_protection;
     if let Some(proxy) = &config.proxy {
         // Service aliases only exist on the job's network, never behind the proxy
         let values = job_variables(job);
@@ -3526,6 +3528,38 @@ mod tests {
         slow.failed();
         slow.failed();
         assert_eq!(slow.ceiling(), Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn workspaces_past_their_age_are_only_renamed_while_jobs_wait() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let builds = dir.path().join("builds");
+        old_workspace(&builds, "project-1-0", 10, 1);
+        old_workspace(&builds, "project-2-0", 10, 8 * 24);
+
+        // What runs under the eviction lock: a rename, whatever the size
+        daemon
+            .executor
+            .evict_workspaces(Duration::from_secs(7 * 86400), &Default::default())
+            .await;
+        let names = entries(&builds);
+        assert_eq!(names.len(), 2, "{:?}", names);
+        assert_eq!(names[1], "project-1-0");
+        assert!(
+            names[0].starts_with(".turboci-evicted-project-2-0-"),
+            "{:?}",
+            names
+        );
+        // A renamed one is not evicted again; deleting it comes after the lock
+        daemon
+            .executor
+            .evict_workspaces(Duration::ZERO, &[builds.join("project-1-0")].into())
+            .await;
+        assert_eq!(entries(&builds), names);
+        housekeeping::remove_detached(&builds);
+        assert_eq!(entries(&builds), ["project-1-0"]);
     }
 
     #[test]

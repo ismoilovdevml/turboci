@@ -138,6 +138,10 @@ pub struct ExecutorConfig {
     /// used are deleted beyond it, never one in use (unset or "0" = no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_max_size: Option<String>,
+    /// One workspace per project and slot for protected and unprotected refs
+    /// alike, as gitlab-runner. Off: protected refs get workspaces of their
+    /// own, which jobs of unprotected refs cannot leave files or hooks in.
+    pub share_workspace_across_protection: bool,
     #[serde(default)]
     pub docker: DockerConfig,
     #[serde(default)]
@@ -901,6 +905,7 @@ impl DockerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
+    /// Host directory of the job workspaces. Default: `<state_dir>/builds`
     pub work_dir: String,
 }
 
@@ -943,7 +948,8 @@ fn unknown_table_keys(given: &toml::Table, config: &RunnerConfig) -> Vec<String>
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
-            work_dir: "/tmp/turboci-builds".to_string(),
+            // `finish` puts it in the config's state_dir
+            work_dir: "/var/lib/turboci/builds".to_string(),
         }
     }
 }
@@ -990,6 +996,7 @@ impl Default for ExecutorConfig {
             executor_type: "docker".to_string(),
             workspace_max_age_days: 7,
             workspace_max_size: None,
+            share_workspace_across_protection: false,
             docker: DockerConfig::default(),
             shell: ShellConfig::default(),
         }
@@ -1072,15 +1079,23 @@ impl RunnerConfig {
         for key in unknown_table_keys(given, &self) {
             tracing::warn!("Ignoring unknown config key `{}`{}", key, place);
         }
-        // On disk with the runner's state: a /tmp cleaner (or tmpfs) must not
-        // remove parts of workspaces kept between jobs
+        // On disk with the runner's state: a /tmp cleaner (or tmpfs, or the
+        // service's PrivateTmp, emptied on every restart) must not remove
+        // parts of workspaces kept between jobs
+        let builds = Path::new(&self.state_dir)
+            .join("builds")
+            .to_string_lossy()
+            .into_owned();
         if self.executor.docker.builds_dir.is_none() {
-            self.executor.docker.builds_dir = Some(
-                Path::new(&self.state_dir)
-                    .join("builds")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            self.executor.docker.builds_dir = Some(builds.clone());
+        }
+        let work_dir_given = given
+            .get("executor")
+            .and_then(|executor| executor.get("shell"))
+            .and_then(|shell| shell.get("work_dir"))
+            .is_some();
+        if !work_dir_given {
+            self.executor.shell.work_dir = builds;
         }
         self
     }
@@ -1591,6 +1606,39 @@ mod tests {
         assert_eq!(config.gitlab_url, "https://gitlab.com");
         assert_eq!(config.executor.executor_type, "docker");
         assert_eq!(config.check_interval, 3);
+        assert!(!config.executor.share_workspace_across_protection);
+    }
+
+    #[test]
+    fn shell_workspaces_default_to_the_state_dir() {
+        let shell =
+            "runner_token = \"t\"\nstate_dir = \"/srv/ci\"\n[executor]\nexecutor_type = \"shell\"";
+        let config = RunnerConfig::parse(shell).unwrap();
+        assert_eq!(config.builds_root(), "/srv/ci/builds");
+        // Not in the service's private /tmp by default
+        let config = RunnerConfig::parse("runner_token = \"t\"").unwrap();
+        assert_eq!(config.executor.shell.work_dir, "/var/lib/turboci/builds");
+        // A config that names it keeps it, /tmp included
+        let config = RunnerConfig::parse(&format!(
+            "{}\n[executor.shell]\nwork_dir = \"/tmp/turboci-builds\"",
+            shell
+        ))
+        .unwrap();
+        assert_eq!(config.builds_root(), "/tmp/turboci-builds");
+    }
+
+    #[test]
+    fn workspace_sharing_is_a_setting() {
+        let config = RunnerConfig::parse(
+            "runner_token = \"t\"\n[executor]\nshare_workspace_across_protection = true",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.executor.share_workspace_across_protection);
+        assert!(RunnerConfig::parse(
+            "runner_token = \"t\"\n[executor]\nshare_workspace_across_protection = \"yes\""
+        )
+        .is_err());
     }
 
     #[test]

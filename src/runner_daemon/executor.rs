@@ -53,25 +53,32 @@ const LAST_USED: &str = ".turboci-last-used";
 
 /// Directory name of the workspace a job uses, below the builds root, and
 /// whether a later job may reuse it. Jobs of a project share workspaces, one
-/// per concurrency slot so concurrent jobs never share one. Protected refs
-/// never share one with unprotected refs: a job can leave files, git config
-/// or hooks behind for the next job in its workspace. Both come from the
-/// runner and GitLab, never from variables a pipeline could set; when GitLab
-/// does not say whether the ref is protected, the job gets a workspace of its own.
+/// per concurrency slot so concurrent jobs never share one. Unless the runner
+/// shares them (`share_workspace_across_protection`, as gitlab-runner),
+/// protected refs never share one with unprotected refs: a job can leave
+/// files, git config or hooks behind for the next job in its workspace. All
+/// of it comes from the runner and GitLab, never from variables a pipeline
+/// could set. When GitLab does not say whether the ref is protected, the job
+/// uses the unprotected workspace, as gitlab-runner: the runner cannot tell
+/// it apart from unprotected jobs, and the protected workspace stays reserved
+/// for jobs GitLab marks protected. A job without a project ID, or without
+/// git info (nothing checks out and cleans what an earlier job left), gets a
+/// workspace of its own.
 pub fn workspace(job: &Job) -> (String, bool) {
-    let project = job.job_info.as_ref().map_or(0, |info| info.project_id);
-    match job.git_info.as_ref().and_then(|info| info.protected) {
-        Some(protected) => (
-            format!(
-                "project-{}-{}{}",
-                project,
-                job.project_slot,
-                if protected { "-protected" } else { "" }
-            ),
-            true,
-        ),
-        None => (format!("job-{}", job.id), false),
-    }
+    let (Some(info), Some(git)) = (job.job_info.as_ref(), job.git_info.as_ref()) else {
+        return (format!("job-{}", job.id), false);
+    };
+    let project = info.project_id;
+    let protected = git.protected.unwrap_or(false);
+    let suffix = if protected && !job.share_workspace_across_protection {
+        "-protected"
+    } else {
+        ""
+    };
+    (
+        format!("project-{}-{}{}", project, job.project_slot, suffix),
+        true,
+    )
 }
 
 /// Why a job did not succeed
@@ -245,7 +252,10 @@ impl ExecutorType {
         }
     }
 
-    /// Remove workspaces no job used for `max_age`, except those in `in_use`
+    /// Move workspaces no job used for `max_age` out of the way, except those
+    /// in `in_use`. Runs while jobs cannot claim workspaces, so it only
+    /// renames them (see `housekeeping::detach`); `remove_detached` deletes
+    /// them afterwards.
     pub async fn evict_workspaces(
         &self,
         max_age: Duration,
@@ -257,7 +267,10 @@ impl ExecutorType {
         let now = std::time::SystemTime::now();
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if in_use.contains(&path) || !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+            if in_use.contains(&path)
+                || super::housekeeping::is_detached(&path)
+                || !entry.file_type().await.is_ok_and(|t| t.is_dir())
+            {
                 continue;
             }
             // Directories of older versions (job-<id>) have no marker
@@ -269,9 +282,9 @@ impl ExecutorType {
                 .ok()
                 .and_then(|used| now.duration_since(used).ok())
                 .unwrap_or_default();
-            if idle > max_age && remove_dir(&path).await {
+            if idle > max_age && super::housekeeping::detach(&path) {
                 info!(
-                    "💾 Removed workspace {} (unused for {} days)",
+                    "💾 Removing workspace {} (unused for {} days)",
                     path.display(),
                     idle.as_secs() / 86400
                 );
@@ -912,6 +925,49 @@ mod tests {
             {"name": "after_script", "script": after, "when": "always",
              "allow_failure": true, "timeout": 5}
         ])
+    }
+
+    #[test]
+    fn workspaces_split_by_protection_unless_shared() {
+        let with = |protected: serde_json::Value, slot: u32, shared: bool| {
+            let mut git_info = serde_json::json!({
+                "repo_url": "https://example.com/g/p.git", "ref": "main",
+                "ref_type": "branch", "sha": "a".repeat(40), "before_sha": "", "refspecs": []
+            });
+            if !protected.is_null() {
+                git_info["protected"] = protected;
+            }
+            let mut j = job(serde_json::json!({
+                "id": 41, "token": "t",
+                "job_info": {"name": "b", "stage": "s", "project_id": 5, "project_name": "p"},
+                "git_info": git_info
+            }));
+            j.project_slot = slot;
+            j.share_workspace_across_protection = shared;
+            workspace(&j)
+        };
+        let kept = |name: &str| (name.to_string(), true);
+
+        assert_eq!(with(true.into(), 0, false), kept("project-5-0-protected"));
+        assert_eq!(with(false.into(), 1, false), kept("project-5-1"));
+        // GitLab does not say: the unprotected workspace, as gitlab-runner
+        assert_eq!(with(serde_json::Value::Null, 0, false), kept("project-5-0"));
+        // Shared, as gitlab-runner: one workspace per project and slot
+        assert_eq!(with(true.into(), 0, true), kept("project-5-0"));
+        assert_eq!(with(false.into(), 2, true), kept("project-5-2"));
+
+        // Without a project or git info: a workspace of the job's own
+        let no_project = job(serde_json::json!({
+            "id": 42, "token": "t",
+            "git_info": {"repo_url": "u", "ref": "main", "ref_type": "branch",
+                         "sha": "a", "before_sha": "", "protected": false}
+        }));
+        assert_eq!(workspace(&no_project), ("job-42".to_string(), false));
+        let no_git = job(serde_json::json!({
+            "id": 43, "token": "t",
+            "job_info": {"name": "b", "stage": "s", "project_id": 5, "project_name": "p"}
+        }));
+        assert_eq!(workspace(&no_git), ("job-43".to_string(), false));
     }
 
     #[tokio::test]
