@@ -188,7 +188,8 @@ Histogram buckets are 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300 and
 | `ownership` | Docker: stopping the job container and giving its files to the runner's user before cache and artifacts are read |
 | `archive_cache`, `upload_artifacts` | Saving the cache, uploading artifacts |
 | `cleanup` | Removing the job's file variables |
-| `report` | Sending the rest of the log and the final state to GitLab |
+| `upload_trace` | Sending the rest of the log to GitLab |
+| `report` | Sending the final state to GitLab; retries are logged |
 | `teardown` | After the final update: removing the job's containers, network and volumes, handing the workspace back, removing a workspace that is not kept. The job's slot stays taken until it is done. |
 
 The Docker executor checks out sources while it pulls images and starts the
@@ -197,7 +198,7 @@ services and the job container, so `pull`, `services` and `container` overlap
 also logs its phases when it has been reported:
 
 ```text
-⏱️  Job #123 took 3.21s until reported: claim=0.00s prepare=1.12s pull=0.01s container=0.31s helper=0.42s get_sources=0.65s script=1.02s ownership=0.09s archive_cache=0.40s cleanup=0.00s report=0.05s teardown=0.61s
+⏱️  Job #123 took 3.21s until reported: claim=0.00s prepare=1.12s pull=0.01s container=0.31s helper=0.42s get_sources=0.65s script=1.02s ownership=0.09s archive_cache=0.40s cleanup=0.00s upload_trace=0.03s report=0.05s teardown=0.61s
 ```
 
 Alerts worth having:

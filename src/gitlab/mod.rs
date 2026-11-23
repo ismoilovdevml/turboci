@@ -358,6 +358,10 @@ impl GitLabClient {
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
                 let delay = Duration::from_millis(250 * 2u64.pow((attempt - 1).min(4)));
+                info!(
+                    "Job #{} update attempt {} failed ({:#}), retrying in {:?}",
+                    job_id, attempt, last_error, delay
+                );
                 tokio::time::sleep(delay).await;
             }
             let response = match self.client.put(&url).json(&body).send().await {

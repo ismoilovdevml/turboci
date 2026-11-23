@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
 use tokio::time::Sleep;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::cancel::CancelSignal;
 use crate::gitlab::{GitLabClient, RemoteState};
@@ -286,7 +286,14 @@ impl<'a> TraceWriter<'a> {
                 if self.flush().await {
                     return true;
                 }
-                tokio::time::sleep(Duration::from_millis(200 * 2u64.pow(attempt))).await;
+                let delay = Duration::from_millis(200 * 2u64.pow(attempt));
+                info!(
+                    "Job #{} trace not complete in GitLab yet (attempt {}), sending again in {:?}",
+                    self.job_id,
+                    attempt + 1,
+                    delay
+                );
+                tokio::time::sleep(delay).await;
             }
             false
         })

@@ -1096,8 +1096,8 @@ impl RunnerDaemon {
                 (JobState::Failed, Some(failure.reason), failure.exit_code)
             }
         };
+        metrics::timed(metrics::Phase::UploadTrace, trace.finish()).await;
         let reporting = std::time::Instant::now();
-        trace.finish().await;
 
         let (end, reported) = if cancel.state() == RemoteState::Aborted && !stopped_by_shutdown {
             // Canceled in GitLab: it already has the final state and rejects updates

@@ -116,7 +116,9 @@ pub enum Phase {
     UploadArtifacts,
     /// Removing the job's file variables
     Cleanup,
-    /// Sending the rest of the log and the final state to GitLab
+    /// Sending the rest of the log to GitLab
+    UploadTrace,
+    /// Sending the final state to GitLab
     Report,
     /// After the final update: removing containers, network and volumes,
     /// handing the workspace back, removing a workspace that is not kept
@@ -124,7 +126,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub const ALL: [Phase; 19] = [
+    pub const ALL: [Phase; 20] = [
         Phase::Claim,
         Phase::Prepare,
         Phase::Pull,
@@ -142,6 +144,7 @@ impl Phase {
         Phase::ArchiveCache,
         Phase::UploadArtifacts,
         Phase::Cleanup,
+        Phase::UploadTrace,
         Phase::Report,
         Phase::Teardown,
     ];
@@ -166,6 +169,7 @@ impl Phase {
             Phase::ArchiveCache => "archive_cache",
             Phase::UploadArtifacts => "upload_artifacts",
             Phase::Cleanup => "cleanup",
+            Phase::UploadTrace => "upload_trace",
             Phase::Report => "report",
             Phase::Teardown => "teardown",
         }
