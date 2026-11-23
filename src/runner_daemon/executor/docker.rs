@@ -1879,14 +1879,13 @@ impl DockerExecutor {
     /// bare container path (e.g. "/cache") as a volume that persists between
     /// the project's jobs, like gitlab-runner's cache volumes. Each concurrent
     /// slot of a project gets its own, so parallel jobs do not share one.
+    /// The volumes are looked up (and created) at the same time.
     async fn job_volumes(&self, job: &Job) -> Result<Vec<String>> {
         let project = job.job_info.as_ref().map_or(0, |info| info.project_id);
         let slot = variable_value(job, "CI_CONCURRENT_PROJECT_ID").unwrap_or("0");
-        let mut binds = Vec::new();
-        for volume in &self.config.volumes {
+        let binds = self.config.volumes.iter().map(|volume| async move {
             if volume.contains(':') {
-                binds.push(volume.clone());
-                continue;
+                return Ok(volume.clone());
             }
             let hash = blake3::hash(volume.as_bytes()).to_hex();
             let name = format!("turboci-cache-p{}-c{}-{}", project, slot, &hash[..12]);
@@ -1901,9 +1900,13 @@ impl DockerExecutor {
                     .await
                     .with_context(|| format!("Failed to create volume for {}", volume))?;
             }
-            binds.push(format!("{}:{}", name, volume));
-        }
-        Ok(binds)
+            Ok(format!("{}:{}", name, volume))
+        });
+        // In the configured order; the first failure is the job's
+        futures_util::future::join_all(binds)
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Registry login for `image`, in gitlab-runner's order: the job's
@@ -2016,24 +2019,39 @@ impl DockerExecutor {
     /// pull fails. The policies are tried in order, like gitlab-runner: one
     /// that is satisfied by an image already present ends the search, one
     /// that pulls is planned, and `never` without the image moves on to the
-    /// next. Fails when an image may not be pulled and is missing.
+    /// next. Fails when an image may not be pulled and is missing. Whether
+    /// the images are present is asked of dockerd for all of them at once.
     async fn plan_pulls<'i>(
         &self,
         images: &[&ImageNeed<'i>],
         trace: &mut TraceWriter<'_>,
     ) -> std::result::Result<Vec<PlannedPull<'i>>, JobFailure> {
-        let mut pulls: Vec<PlannedPull> = Vec::new();
-        for need in images {
-            let policies = match need.policies {
+        let resolved: Vec<std::result::Result<Vec<PullPolicy>, String>> = images
+            .iter()
+            .map(|need| match need.policies {
                 // The runner's own helper image
-                None => vec![PullPolicy::IfNotPresent],
+                None => Ok(vec![PullPolicy::IfNotPresent]),
                 Some(policies) => PullPolicy::resolve(
                     policies,
                     &self.config.pull_policy,
                     &self.config.allowed_pull_policies,
-                )
-                .map_err(pull_failure)?,
-            };
+                ),
+            })
+            .collect();
+        // `always` pulls whether the image is present or not: an image only
+        // `always` is tried for is not looked up
+        let present = futures_util::future::join_all(images.iter().zip(&resolved).map(
+            |(need, policies)| async move {
+                let looked_up = policies
+                    .as_ref()
+                    .is_ok_and(|policies| policies.iter().any(|&p| p != PullPolicy::Always));
+                looked_up && self.present(need.name, need.platform).await
+            },
+        ))
+        .await;
+        let mut pulls: Vec<PlannedPull> = Vec::new();
+        for ((need, policies), present) in images.iter().zip(resolved).zip(present) {
+            let policies = policies.map_err(pull_failure)?;
             let mut notes = String::new();
             let mut planned = None;
             for (index, &policy) in policies.iter().enumerate() {
@@ -2041,8 +2059,7 @@ impl DockerExecutor {
                 if attempt > 1 {
                     notes.push_str(&attempt_note(attempt, policy));
                 }
-                // `always` pulls whether the image is present or not
-                if policy != PullPolicy::Always && self.present(need.name, need.platform).await {
+                if policy != PullPolicy::Always && present {
                     notes.push_str(&format!("Using locally found image {}\n", need.name));
                     break;
                 }
