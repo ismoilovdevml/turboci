@@ -2,10 +2,23 @@
 //! and a minimal HTTP/1.1 server answers `GET /metrics` with the text format;
 //! every other request gets 404. Each runner has its own counters, rendered
 //! with a `runner` label; a few belong to the whole process.
+//!
+//! Durations go to a [`Histogram`] (fixed [`DURATION_BUCKETS`], lock-free):
+//! `Histogram::observe` records one, and `histogram_family` renders a set of
+//! them with their labels. A new duration metric is a `Histogram` (or an
+//! array of them, one per label value) in `Metrics`, an `observe_*` method
+//! that records into it, and a `histogram_family` call in `render`; see
+//! `observe_phase` and `turboci_job_phase_duration_seconds`.
+//!
+//! Where a job spends its time is collected while it runs in its
+//! [`JobTimings`]: code on the job's path calls [`record`] or [`timed`] with
+//! a [`Phase`], which go to the timings of the job whose task runs them (see
+//! `JobTimings::scope`) and do nothing outside a job. When the job has
+//! ended, `Metrics::record_job` turns them into the histograms.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -68,6 +81,252 @@ pub enum ConfigReload {
 }
 const CONFIG_RELOADS: [&str; 2] = ["success", "failure"];
 
+/// Where a job spends its time. Phases of the Docker executor's two setup
+/// branches (sources: helper, workspace_check, get_sources; containers:
+/// pull, services, container) overlap; `prepare` is the time until the
+/// job could start restoring and running its scripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Waiting for the workspace (a running eviction) and preparing it
+    Claim,
+    /// From the job's start until restoring cache and artifacts can begin
+    Prepare,
+    /// Docker: checking and pulling the job and service images
+    Pull,
+    /// Docker: the services' network, starting them and waiting for their ports
+    Services,
+    /// Docker: creating and starting the job container
+    Container,
+    /// Docker: pulling and starting the helper container that checks out sources
+    Helper,
+    /// Docker: walking the workspace for files of other users before the checkout
+    WorkspaceCheck,
+    GetSources,
+    /// Docker: waiting for the job container and services after getting sources
+    SetupWait,
+    RestoreCache,
+    DownloadArtifacts,
+    /// The script steps (before_script and script)
+    Script,
+    AfterScript,
+    /// Docker: stopping the job container and giving its files to the
+    /// runner's user, so cache and artifacts can be read
+    Ownership,
+    ArchiveCache,
+    UploadArtifacts,
+    /// Removing the job's file variables
+    Cleanup,
+    /// Sending the rest of the log and the final state to GitLab
+    Report,
+    /// After the final update: removing containers, network and volumes,
+    /// handing the workspace back, removing a workspace that is not kept
+    Teardown,
+}
+
+impl Phase {
+    pub const ALL: [Phase; 19] = [
+        Phase::Claim,
+        Phase::Prepare,
+        Phase::Pull,
+        Phase::Services,
+        Phase::Container,
+        Phase::Helper,
+        Phase::WorkspaceCheck,
+        Phase::GetSources,
+        Phase::SetupWait,
+        Phase::RestoreCache,
+        Phase::DownloadArtifacts,
+        Phase::Script,
+        Phase::AfterScript,
+        Phase::Ownership,
+        Phase::ArchiveCache,
+        Phase::UploadArtifacts,
+        Phase::Cleanup,
+        Phase::Report,
+        Phase::Teardown,
+    ];
+
+    /// The `phase` label
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Claim => "claim",
+            Phase::Prepare => "prepare",
+            Phase::Pull => "pull",
+            Phase::Services => "services",
+            Phase::Container => "container",
+            Phase::Helper => "helper",
+            Phase::WorkspaceCheck => "workspace_check",
+            Phase::GetSources => "get_sources",
+            Phase::SetupWait => "setup_wait",
+            Phase::RestoreCache => "restore_cache",
+            Phase::DownloadArtifacts => "download_artifacts",
+            Phase::Script => "script",
+            Phase::AfterScript => "after_script",
+            Phase::Ownership => "ownership",
+            Phase::ArchiveCache => "archive_cache",
+            Phase::UploadArtifacts => "upload_artifacts",
+            Phase::Cleanup => "cleanup",
+            Phase::Report => "report",
+            Phase::Teardown => "teardown",
+        }
+    }
+}
+
+/// What getting sources did with the checkout an earlier job left in the
+/// workspace
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceReuse {
+    /// Updated it (GIT_STRATEGY=fetch)
+    Fetch,
+    /// Threw it away and cloned again: GIT_STRATEGY=clone, submodules, or
+    /// updating it failed
+    Clone,
+    /// There was none: the workspace's first job, or one of its own
+    Fresh,
+    /// No checkout: GIT_STRATEGY none or empty
+    None,
+}
+const WORKSPACE_REUSES: [&str; 4] = ["fetch", "clone", "fresh", "none"];
+
+/// Upper bounds of the duration histograms' buckets, in seconds
+pub const DURATION_BUCKETS: [f64; 13] = [
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
+
+/// A Prometheus histogram of durations with `DURATION_BUCKETS`; observing
+/// is a few atomic additions
+#[derive(Debug, Default)]
+pub struct Histogram {
+    /// Observations per bucket (not cumulative); the last one is +Inf
+    buckets: [AtomicU64; DURATION_BUCKETS.len() + 1],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+}
+
+impl Histogram {
+    pub fn observe(&self, took: Duration) {
+        let secs = took.as_secs_f64();
+        let bucket = DURATION_BUCKETS
+            .iter()
+            .position(|bound| secs <= *bound)
+            .unwrap_or(DURATION_BUCKETS.len());
+        self.buckets[bucket].fetch_add(1, Relaxed);
+        self.count.fetch_add(1, Relaxed);
+        let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        self.sum_micros.fetch_add(micros, Relaxed);
+    }
+
+    fn count(&self) -> u64 {
+        self.count.load(Relaxed)
+    }
+}
+
+/// Durations of one job's phases, collected while it runs. Code on the
+/// job's path records into the timings of the job whose task it runs in
+/// (see `scope`, `record` and `timed`), so it needs no handle to them.
+#[derive(Debug)]
+pub struct JobTimings {
+    started: Instant,
+    /// Microseconds per phase (`Phase::ALL` order), added up when a phase
+    /// happens more than once (e.g. several script steps)
+    micros: [AtomicU64; Phase::ALL.len()],
+    /// Bit per phase that was recorded
+    seen: AtomicU32,
+    /// `WorkspaceReuse` as 1 + its index; 0 before getting sources
+    reuse: AtomicU8,
+}
+
+tokio::task_local! {
+    static JOB_TIMINGS: Arc<JobTimings>;
+}
+
+impl Default for JobTimings {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            micros: Default::default(),
+            seen: AtomicU32::new(0),
+            reuse: AtomicU8::new(0),
+        }
+    }
+}
+
+impl JobTimings {
+    /// Run `work` with these timings as the current job's
+    pub async fn scope<T>(self: Arc<Self>, work: impl std::future::Future<Output = T>) -> T {
+        JOB_TIMINGS.scope(self, work).await
+    }
+
+    /// Time since the job started (these timings were created)
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn add(&self, phase: Phase, took: Duration) {
+        let index = phase as usize;
+        let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        self.micros[index].fetch_add(micros, Relaxed);
+        self.seen.fetch_or(1 << index, Relaxed);
+    }
+
+    /// How long `phase` took, if it happened
+    pub fn get(&self, phase: Phase) -> Option<Duration> {
+        let index = phase as usize;
+        (self.seen.load(Relaxed) & (1 << index) != 0)
+            .then(|| Duration::from_micros(self.micros[index].load(Relaxed)))
+    }
+
+    pub fn reuse(&self) -> Option<WorkspaceReuse> {
+        match self.reuse.load(Relaxed) {
+            1 => Some(WorkspaceReuse::Fetch),
+            2 => Some(WorkspaceReuse::Clone),
+            3 => Some(WorkspaceReuse::Fresh),
+            4 => Some(WorkspaceReuse::None),
+            _ => None,
+        }
+    }
+
+    /// `name=1.23s` for every phase that happened, in `Phase::ALL` order
+    pub fn summary(&self) -> String {
+        Phase::ALL
+            .iter()
+            .filter_map(|&phase| {
+                self.get(phase)
+                    .map(|took| format!("{}={:.2}s", phase.name(), took.as_secs_f64()))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Add `took` to `phase` of the current job (nothing outside a job)
+pub fn record(phase: Phase, took: Duration) {
+    let _ = JOB_TIMINGS.try_with(|timings| timings.add(phase, took));
+}
+
+/// Run `work` and add how long it took to `phase` of the current job
+pub async fn timed<T>(phase: Phase, work: impl std::future::Future<Output = T>) -> T {
+    let started = Instant::now();
+    let output = work.await;
+    record(phase, started.elapsed());
+    output
+}
+
+/// Record what getting sources did with the workspace's checkout
+pub fn record_reuse(reuse: WorkspaceReuse) {
+    let _ = JOB_TIMINGS.try_with(|timings| timings.reuse.store(reuse as u8 + 1, Relaxed));
+}
+
+/// The timings of the current job, if there is one
+pub fn current_job() -> Option<Arc<JobTimings>> {
+    JOB_TIMINGS.try_with(Arc::clone).ok()
+}
+
+/// The time since the current job started, if there is one
+pub fn job_elapsed() -> Option<Duration> {
+    JOB_TIMINGS.try_with(|timings| timings.elapsed()).ok()
+}
+
 /// Counters of the whole process
 #[derive(Debug)]
 pub struct Process {
@@ -108,6 +367,11 @@ pub struct Metrics {
     /// first one, or without `workspace_max_size` (they are not measured)
     workspaces_size: AtomicU64,
     workspaces_evicted: AtomicU64,
+    /// Per `Phase`
+    phase_durations: [Histogram; Phase::ALL.len()],
+    /// Per `JobEnd`: from the job's start until its final update was sent
+    job_durations: [Histogram; 3],
+    workspace_reuses: [AtomicU64; 4],
 }
 
 impl Default for Metrics {
@@ -122,6 +386,9 @@ impl Default for Metrics {
             cache_s3_errors: AtomicU64::new(0),
             workspaces_size: AtomicU64::new(u64::MAX),
             workspaces_evicted: AtomicU64::new(0),
+            phase_durations: Default::default(),
+            job_durations: Default::default(),
+            workspace_reuses: Default::default(),
         }
     }
 }
@@ -185,6 +452,31 @@ impl Metrics {
     pub fn workspaces_swept(&self, size: u64, evicted: u64) {
         self.workspaces_size.store(size, Relaxed);
         self.workspaces_evicted.fetch_add(evicted, Relaxed);
+    }
+
+    pub fn observe_phase(&self, phase: Phase, took: Duration) {
+        self.phase_durations[phase as usize].observe(took);
+    }
+
+    /// A job's duration until its final update was sent, by how it ended
+    pub fn observe_job(&self, end: JobEnd, took: Duration) {
+        self.job_durations[end as usize].observe(took);
+    }
+
+    pub fn workspace_reuse(&self, reuse: WorkspaceReuse) {
+        self.workspace_reuses[reuse as usize].fetch_add(1, Relaxed);
+    }
+
+    /// Observe the phases a job went through and what it did with its workspace
+    pub fn record_job(&self, timings: &JobTimings) {
+        for phase in Phase::ALL {
+            if let Some(took) = timings.get(phase) {
+                self.observe_phase(phase, took);
+            }
+        }
+        if let Some(reuse) = timings.reuse() {
+            self.workspace_reuse(reuse);
+        }
     }
 }
 
@@ -347,6 +639,36 @@ pub fn render(process: &Process, concurrent: u64, runners: &[Runner]) -> String 
     }
     family(
         &mut out,
+        "turboci_workspace_reuse_total",
+        "counter",
+        "Jobs by what getting sources did with the checkout an earlier job left in the workspace",
+        per_runner(&|runner| {
+            labeled(
+                "result",
+                &WORKSPACE_REUSES,
+                &runner.metrics.workspace_reuses,
+            )
+        }),
+    );
+    let phases: Vec<&str> = Phase::ALL.iter().map(|phase| phase.name()).collect();
+    histogram_family(
+        &mut out,
+        "turboci_job_phase_duration_seconds",
+        "Time jobs spent in each phase (some phases of the Docker executor overlap)",
+        duration_series(runners, "phase", &phases, |metrics| {
+            metrics.phase_durations.as_slice()
+        }),
+    );
+    histogram_family(
+        &mut out,
+        "turboci_job_duration_seconds",
+        "Time from a job's start in the runner until its final update was sent, by result",
+        duration_series(runners, "result", &JOB_ENDS, |metrics| {
+            metrics.job_durations.as_slice()
+        }),
+    );
+    family(
+        &mut out,
         "process_start_time_seconds",
         "gauge",
         "Start time of the process since the epoch, in seconds",
@@ -382,6 +704,73 @@ fn family(
         } else {
             let _ = writeln!(out, "{}{{{}}} {}", name, labels, value);
         }
+    }
+}
+
+/// The histograms `of` each runner's metrics that have observations, one
+/// per label value in `names`, labeled with the runner, its executor and
+/// `label`
+fn duration_series<'a>(
+    runners: &'a [Runner<'a>],
+    label: &str,
+    names: &[&str],
+    of: fn(&'a Metrics) -> &'a [Histogram],
+) -> Vec<(String, &'a Histogram)> {
+    let mut series = Vec::new();
+    for runner in runners {
+        for (name, histogram) in names.iter().zip(of(runner.metrics)) {
+            if histogram.count() > 0 {
+                let labels = format!(
+                    "runner=\"{}\",executor=\"{}\",{}=\"{}\"",
+                    escape(runner.name),
+                    escape(&runner.gauges.executor),
+                    label,
+                    name
+                );
+                series.push((labels, histogram));
+            }
+        }
+    }
+    series
+}
+
+/// Append a histogram family: HELP and TYPE, then for each histogram (with
+/// its labels, without braces) its cumulative buckets, sum and count
+pub fn histogram_family<'a>(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    series: impl IntoIterator<Item = (String, &'a Histogram)>,
+) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "# HELP {} {}", name, help);
+    let _ = writeln!(out, "# TYPE {} histogram", name);
+    for (labels, histogram) in series {
+        let sep = if labels.is_empty() { "" } else { "," };
+        let mut cumulative = 0;
+        for (bucket, bound) in histogram.buckets.iter().zip(DURATION_BUCKETS) {
+            cumulative += bucket.load(Relaxed);
+            let _ = writeln!(
+                out,
+                "{}_bucket{{{}{}le=\"{}\"}} {}",
+                name, labels, sep, bound, cumulative
+            );
+        }
+        cumulative += histogram.buckets[DURATION_BUCKETS.len()].load(Relaxed);
+        let _ = writeln!(
+            out,
+            "{}_bucket{{{}{}le=\"+Inf\"}} {}",
+            name, labels, sep, cumulative
+        );
+        let sum = histogram.sum_micros.load(Relaxed) as f64 / 1e6;
+        let braced = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("{{{}}}", labels)
+        };
+        let _ = writeln!(out, "{}_sum{} {:.6}", name, braced, sum);
+        // The buckets' total, so the count always matches +Inf
+        let _ = writeln!(out, "{}_count{} {}", name, braced, cumulative);
     }
 }
 
@@ -539,6 +928,9 @@ mod tests {
         process.config_reload(ConfigReload::Failure);
         assert!(!render_one(&process, &metrics).contains("turboci_workspaces_size_bytes"));
         metrics.workspaces_swept(4096, 2);
+        metrics.workspace_reuse(WorkspaceReuse::Fetch);
+        metrics.observe_phase(Phase::GetSources, Duration::from_millis(700));
+        metrics.observe_job(JobEnd::Success, Duration::from_secs(3));
 
         let text = render_one(&process, &metrics);
         for line in [
@@ -562,6 +954,17 @@ mod tests {
             "turboci_config_reloads_total{result=\"failure\"} 1",
             "turboci_workspaces_evicted_total{runner=\"default\"} 2",
             "turboci_workspaces_size_bytes{runner=\"default\"} 4096",
+            "turboci_workspace_reuse_total{runner=\"default\",result=\"fetch\"} 1",
+            "turboci_workspace_reuse_total{runner=\"default\",result=\"none\"} 0",
+            "# TYPE turboci_job_phase_duration_seconds histogram",
+            "turboci_job_phase_duration_seconds_bucket{runner=\"default\",executor=\"docker\",phase=\"get_sources\",le=\"0.5\"} 0",
+            "turboci_job_phase_duration_seconds_bucket{runner=\"default\",executor=\"docker\",phase=\"get_sources\",le=\"1\"} 1",
+            "turboci_job_phase_duration_seconds_bucket{runner=\"default\",executor=\"docker\",phase=\"get_sources\",le=\"+Inf\"} 1",
+            "turboci_job_phase_duration_seconds_sum{runner=\"default\",executor=\"docker\",phase=\"get_sources\"} 0.700000",
+            "turboci_job_phase_duration_seconds_count{runner=\"default\",executor=\"docker\",phase=\"get_sources\"} 1",
+            "turboci_job_duration_seconds_bucket{runner=\"default\",executor=\"docker\",result=\"success\",le=\"2.5\"} 0",
+            "turboci_job_duration_seconds_bucket{runner=\"default\",executor=\"docker\",result=\"success\",le=\"5\"} 1",
+            "turboci_job_duration_seconds_count{runner=\"default\",executor=\"docker\",result=\"success\"} 1",
         ] {
             assert!(
                 text.lines().any(|l| l == line),
@@ -578,15 +981,101 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(text.contains("\nprocess_resident_memory_bytes "));
         }
+        // Phases and results nothing was observed for have no series
+        assert!(!text.contains("phase=\"pull\""), "{}", text);
+        assert!(!text.contains("result=\"failed\",le="), "{}", text);
 
-        // Every sample is `name{labels} value`, and every family has HELP and TYPE
+        // Every sample is `name{labels} value`, and every family has HELP and
+        // TYPE (a histogram's samples have suffixes)
         let sample =
             regex::Regex::new(r#"^[a-z_][a-z0-9_]*(\{([a-z_]+="[^"]*",?)+\})? [0-9.]+$"#).unwrap();
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             assert!(sample.is_match(line), "bad sample line {:?}", line);
-            let name = line.split(['{', ' ']).next().unwrap();
+            let mut name = line.split(['{', ' ']).next().unwrap();
+            if !text.contains(&format!("# TYPE {} ", name)) {
+                for suffix in ["_bucket", "_sum", "_count"] {
+                    name = name.strip_suffix(suffix).unwrap_or(name);
+                }
+                assert!(
+                    text.contains(&format!("# TYPE {} histogram", name)),
+                    "{}",
+                    name
+                );
+            }
             assert!(text.contains(&format!("# HELP {} ", name)), "{}", name);
             assert!(text.contains(&format!("# TYPE {} ", name)), "{}", name);
+        }
+    }
+
+    #[tokio::test]
+    async fn job_timings_collect_the_phases_of_the_job_whose_task_records_them() {
+        let timings = Arc::new(JobTimings::default());
+        let other = Arc::new(JobTimings::default());
+        // Outside a job, recording does nothing
+        record(Phase::Script, Duration::from_secs(1));
+        assert_eq!(job_elapsed(), None);
+
+        timings
+            .clone()
+            .scope(async {
+                record(Phase::Script, Duration::from_millis(1500));
+                // Concurrent branches of one job record into the same timings
+                tokio::join!(
+                    timed(Phase::Pull, tokio::time::sleep(Duration::from_millis(20))),
+                    async { record(Phase::Script, Duration::from_millis(500)) }
+                );
+                record_reuse(WorkspaceReuse::Clone);
+                assert!(job_elapsed().is_some());
+                other
+                    .clone()
+                    .scope(async { record(Phase::Teardown, Duration::from_secs(2)) })
+                    .await;
+            })
+            .await;
+
+        assert_eq!(timings.get(Phase::Script), Some(Duration::from_secs(2)));
+        assert!(timings.get(Phase::Pull).unwrap() >= Duration::from_millis(20));
+        assert_eq!(timings.get(Phase::Teardown), None);
+        assert_eq!(other.get(Phase::Teardown), Some(Duration::from_secs(2)));
+        assert_eq!(timings.reuse(), Some(WorkspaceReuse::Clone));
+        assert_eq!(other.reuse(), None);
+        let summary = timings.summary();
+        assert!(summary.starts_with("pull=0.0"), "{}", summary);
+        assert!(summary.ends_with(" script=2.00s"), "{}", summary);
+
+        let metrics = Metrics::default();
+        metrics.record_job(&timings);
+        let text = render_one(&Process::default(), &metrics);
+        assert!(text.contains(
+            "turboci_job_phase_duration_seconds_count{runner=\"default\",executor=\"docker\",phase=\"script\"} 1\n"
+        ));
+        assert!(
+            text.contains("turboci_workspace_reuse_total{runner=\"default\",result=\"clone\"} 1\n")
+        );
+    }
+
+    #[test]
+    fn histogram_buckets_hold_their_upper_bound() {
+        let histogram = Histogram::default();
+        for millis in [50, 51, 600_000, 700_000] {
+            histogram.observe(Duration::from_millis(millis));
+        }
+        let mut out = String::new();
+        histogram_family(&mut out, "d", "h", [(String::new(), &histogram)]);
+        for line in [
+            "d_bucket{le=\"0.05\"} 1",
+            "d_bucket{le=\"0.1\"} 2",
+            "d_bucket{le=\"600\"} 3",
+            "d_bucket{le=\"+Inf\"} 4",
+            "d_sum 1300.101000",
+            "d_count 4",
+        ] {
+            assert!(
+                out.lines().any(|l| l == line),
+                "missing {:?} in\n{}",
+                line,
+                out
+            );
         }
     }
 

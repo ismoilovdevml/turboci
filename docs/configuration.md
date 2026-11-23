@@ -383,8 +383,8 @@ object, are kept only locally.
 
 ### Docker
 
-Each job runs in its own container. Sources are checked out by a short-lived
-helper container, so job images need neither `git` nor any other tool. The
+Each job runs in its own container. Sources are checked out by a helper
+container, so job images need neither `git` nor any other tool. The
 helper runs as the owner of the workspace directory, so the checkout belongs
 to the runner's user; it runs as root when `pre_get_sources_script` or
 `post_get_sources_script` hooks are set (they may need root), when the
@@ -395,9 +395,16 @@ until the runner restarts). Jobs
 with `services` get their own network where each service is reachable by its
 aliases. The checkout runs while the job image is pulled and the services
 start; the log shows the services' progress after the `get_sources` section,
-as it happens once that section is closed.
+in a `prepare_containers` section, as it happens once `get_sources` is closed.
 If either fails, or the job times out or is canceled, the other is stopped
-and every container of the job is removed. Concurrent jobs that need the same image with the same registry
+and every container of the job is removed.
+
+Once the scripts have ended, the job container is stopped and the helper
+gives the files the job created (as root, usually) to the runner's user, so
+the runner can read them for the cache and artifacts. The job's containers,
+its network and the job container's volumes (a `docker:dind` service's
+images) are removed after the job has been reported to GitLab; until then the
+job keeps its slot and its workspace, so no other job starts in it early. Concurrent jobs that need the same image with the same registry
 login wait for one pull of it; a job never shares the pull of a job that
 logged in differently.
 

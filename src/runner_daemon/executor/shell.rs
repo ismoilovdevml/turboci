@@ -44,22 +44,15 @@ impl ShellExecutor {
         PathBuf::from(&self.work_dir)
     }
 
-    pub(super) async fn execute(
-        &self,
-        job: &Job,
-        deadline: Instant,
-        trace: &mut TraceWriter<'_>,
-        restore: &impl Restore,
-    ) -> JobOutcome {
-        trace.write("Using Shell executor...\n").await;
-
+    /// The job's directories and environment, its project directory and
+    /// file variables created
+    async fn prepare(&self, job: &Job) -> std::result::Result<(JobDirs, JobEnv), JobFailure> {
         let job_dir = self.builds_root().join(workspace(job).0);
+        let project = job_dir.join(script::project_subdir(job).map_err(JobFailure::system)?);
         let dirs = JobDirs {
             builds: job_dir.to_string_lossy().into_owned(),
-            project: job_dir
-                .join(script::project_subdir(job).map_err(JobFailure::system)?)
-                .to_string_lossy()
-                .into_owned(),
+            project: project.to_string_lossy().into_owned(),
+            host_project: project,
         };
         tokio::fs::create_dir_all(&dirs.project)
             .await
@@ -77,7 +70,23 @@ impl ShellExecutor {
         write_variable_files(&env)
             .await
             .map_err(JobFailure::system)?;
+        Ok((dirs, env))
+    }
 
+    pub(super) async fn execute(
+        &self,
+        job: &Job,
+        deadline: Instant,
+        trace: &mut TraceWriter<'_>,
+        restore: &impl Restore,
+    ) -> JobOutcome {
+        trace
+            .section_start("prepare_executor", "Preparing the \"shell\" executor")
+            .await;
+        trace.write("Using Shell executor...\n").await;
+        let prepared = self.prepare(job).await;
+        trace.section_end("prepare_executor").await;
+        let (dirs, env) = prepared?;
         let runner = ShellRunner { env: env.vars };
         run_job_steps(job, deadline, &runner, &runner, trace, &dirs, restore).await
     }

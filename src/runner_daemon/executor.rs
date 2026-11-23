@@ -17,6 +17,7 @@ use super::config::DockerConfig;
 use super::docker_api::{self, ContainerCreateBody, Docker, ExecConfig, HostConfig, LogOutput};
 use super::git::{self, GitStrategy};
 use super::image::{self, PullPolicy};
+use super::metrics::{self, Phase, WorkspaceReuse};
 use super::script::{self, JobEnv};
 use super::trace::{FlushTimer, TraceWriter};
 use crate::gitlab::{FailureReason, Job, RemoteState};
@@ -142,24 +143,45 @@ impl ExecutorType {
         self.builds_root().join(self.workspace(job).0)
     }
 
-    /// Check out sources and run the job's steps, writing output to `trace`
+    /// Check out sources and run the job's steps, writing output to `trace`,
+    /// then remove what the job left running (see `Teardown::finish`)
+    #[cfg(test)]
     pub async fn execute(
         &self,
         job: &Job,
         trace: &mut TraceWriter<'_>,
         restore: &impl Restore,
     ) -> JobOutcome {
+        let (outcome, teardown) = self.execute_deferred(job, trace, restore).await;
+        teardown.finish().await;
+        outcome
+    }
+
+    /// Check out sources and run the job's steps, writing output to `trace`.
+    /// What the job leaves (Docker: its stopped and idle containers, network
+    /// and volumes) is in the returned `Teardown`: `prepare_uploads` makes
+    /// the workspace ready for saving cache and artifacts, `finish` removes
+    /// the rest, which the caller may do after reporting the job to GitLab.
+    pub async fn execute_deferred(
+        &self,
+        job: &Job,
+        trace: &mut TraceWriter<'_>,
+        restore: &impl Restore,
+    ) -> (JobOutcome, Teardown) {
         use futures_util::FutureExt;
 
         // The job timeout covers everything from here on, image pulls and
         // service startup included, like gitlab-runner
         let deadline = Instant::now() + job_timeout(job);
+        let mut teardown = Teardown(None);
         let run = async {
             match self {
                 ExecutorType::Docker(executor) => {
-                    executor
+                    let (outcome, left) = executor
                         .execute(job, &self.job_dir(job), deadline, trace, restore)
-                        .await
+                        .await;
+                    teardown = Teardown(Some(left));
+                    outcome
                 }
                 ExecutorType::Shell(executor) => {
                     executor.execute(job, deadline, trace, restore).await
@@ -167,10 +189,11 @@ impl ExecutorType {
             }
         };
         // A bug must fail the job, not skip its cleanup and final report
-        std::panic::AssertUnwindSafe(run)
+        let outcome = std::panic::AssertUnwindSafe(run)
             .catch_unwind()
             .await
-            .unwrap_or_else(|_| Err(JobFailure::system("internal runner error")))
+            .unwrap_or_else(|_| Err(JobFailure::system("internal runner error")));
+        (outcome, teardown)
     }
 
     /// The same executor with the settings of `config`, for jobs that start
@@ -241,6 +264,11 @@ impl ExecutorType {
         Ok(())
     }
 
+    /// Remove the job's file variables (they hold secrets)
+    pub async fn remove_variables(&self, job: &Job) {
+        remove_dir(&variables_dir(&self.job_dir(job), job)).await;
+    }
+
     /// Remove the job's file variables (they hold secrets) and, unless the
     /// workspace is kept for the project's next job, the whole workspace
     pub async fn cleanup(&self, job: &Job, keep_workspace: bool) {
@@ -289,6 +317,39 @@ impl ExecutorType {
                     idle.as_secs() / 86400
                 );
             }
+        }
+    }
+}
+
+/// What a job leaves once its steps ran: for the Docker executor its
+/// containers (the job container still running its idle loop, the sources
+/// helper, the services), network and volumes. Until `finish`, the job's
+/// slot and workspace stay taken by the caller. Dropped without `finish`
+/// (a panic), it is removed in the background.
+pub struct Teardown(Option<docker::Leftovers>);
+
+impl Teardown {
+    /// Stop everything of the job that could still write to the workspace
+    /// and give the workspace to the runner's user, so cache and artifacts
+    /// can be read; `finish` does it when this was not called
+    pub async fn prepare_uploads(&mut self) {
+        if let Some(left) = &mut self.0 {
+            metrics::timed(Phase::Ownership, left.prepare_uploads()).await;
+        }
+    }
+
+    /// Remove what the job left
+    pub async fn finish(mut self) {
+        if let Some(left) = self.0.take() {
+            left.finish().await;
+        }
+    }
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        if let Some(left) = self.0.take() {
+            left.finish_later();
         }
     }
 }
@@ -407,18 +468,13 @@ trait ScriptRunner: Send + Sync {
         trace: &mut TraceWriter<'_>,
         limits: &Limits<'_>,
     ) -> impl std::future::Future<Output = Result<RunStatus>> + Send;
-
-    /// Called once getting sources has ended, after which the job's sources
-    /// runner is not used again
-    fn sources_done(&self) -> impl std::future::Future<Output = ()> + Send {
-        async {}
-    }
 }
 
-/// Directories as the job sees them
+/// Directories as the job sees them, and the project's on the host
 struct JobDirs {
     builds: String,
     project: String,
+    host_project: PathBuf,
 }
 
 /// Get sources, then run the steps GitLab sent, honouring `when`, `allow_failure`
@@ -444,7 +500,7 @@ async fn run_job_steps(
 }
 
 /// The get_sources section of the log: hooks and checkout with `sources`
-/// within `limits`, after which `sources` is released. Returns why it failed.
+/// within `limits`. Returns why it failed.
 async fn get_sources_section(
     job: &Job,
     sources: &impl ScriptRunner,
@@ -452,13 +508,80 @@ async fn get_sources_section(
     dirs: &JobDirs,
     limits: &Limits<'_>,
 ) -> Option<JobFailure> {
+    let started = std::time::Instant::now();
     trace
         .section_start("get_sources", "Getting source from Git repository")
         .await;
+    let earlier = EarlierCheckout::of(job, &dirs.host_project).await;
     let fetched = get_sources(job, sources, trace, dirs, limits).await;
-    sources.sources_done().await;
+    metrics::record_reuse(earlier.reuse(&dirs.host_project).await);
     trace.section_end("get_sources").await;
+    metrics::record(Phase::GetSources, started.elapsed());
     fetched.err().map(|e| e.failure(job))
+}
+
+/// What getting sources finds of a checkout an earlier job left in the
+/// project directory, for `metrics::WorkspaceReuse`
+enum EarlierCheckout {
+    /// No checkout is made
+    NoCheckout,
+    /// GIT_STRATEGY=clone: an earlier checkout is thrown away
+    Cloned { found: bool },
+    /// GIT_STRATEGY=fetch, and the checkout's `.git` as found (dev, inode)
+    Fetched { git_dir: Option<(u64, u64)> },
+}
+
+impl EarlierCheckout {
+    async fn of(job: &Job, host_project: &Path) -> Self {
+        if job.git_info.is_none() {
+            return Self::NoCheckout;
+        }
+        let git_dir = git_dir_identity(host_project).await;
+        match git::strategy(&job.variables, job.allow_git_fetch) {
+            GitStrategy::None | GitStrategy::Empty => Self::NoCheckout,
+            GitStrategy::Clone => Self::Cloned {
+                found: git_dir.is_some(),
+            },
+            GitStrategy::Fetch => Self::Fetched { git_dir },
+        }
+    }
+
+    /// What became of it once getting sources ended: a fetch that cloned
+    /// again (submodules, or updating failed) left another `.git`
+    async fn reuse(&self, host_project: &Path) -> WorkspaceReuse {
+        match self {
+            Self::NoCheckout => WorkspaceReuse::None,
+            Self::Cloned { found: true } => WorkspaceReuse::Clone,
+            Self::Cloned { found: false } | Self::Fetched { git_dir: None } => {
+                WorkspaceReuse::Fresh
+            }
+            Self::Fetched { git_dir } => {
+                if git_dir_identity(host_project).await == *git_dir {
+                    WorkspaceReuse::Fetch
+                } else {
+                    WorkspaceReuse::Clone
+                }
+            }
+        }
+    }
+}
+
+/// Device and inode of the project's `.git` directory, if it has one
+async fn git_dir_identity(host_project: &Path) -> Option<(u64, u64)> {
+    let meta = tokio::fs::symlink_metadata(host_project.join(".git"))
+        .await
+        .ok()
+        .filter(|meta| meta.is_dir())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Some((0, 0))
+    }
 }
 
 /// What follows getting sources (which failed with `failure`, if it did):
@@ -475,6 +598,9 @@ async fn run_steps(
     let cancel = trace.cancel();
     let canceled = || RunError::Canceled.failure(job);
     let timed_out = || RunError::TimedOut.failure(job);
+    if let Some(elapsed) = metrics::job_elapsed() {
+        metrics::record(Phase::Prepare, elapsed);
+    }
 
     let script_limits = Limits {
         deadline,
@@ -591,7 +717,13 @@ async fn run_steps(
             };
             script = format!("export CI_JOB_STATUS={}\n{}", status, script);
         }
-        let result = runner.run(&script, &dirs.project, trace, &limits).await;
+        let phase = if is_after_script {
+            Phase::AfterScript
+        } else {
+            Phase::Script
+        };
+        let result =
+            metrics::timed(phase, runner.run(&script, &dirs.project, trace, &limits)).await;
         match result {
             Ok(RunStatus::Exited(0)) => {}
             Ok(RunStatus::Exited(code)) if step.allow_failure || is_after_script => {
@@ -1534,7 +1666,7 @@ mod tests {
         assert!(outcome.is_ok());
     }
 
-    /// Records what a job does with it, as `<name>:run` and `<name>:done`
+    /// Records what a job runs with it, as `<name>:run`
     struct Recorder<'a> {
         name: &'static str,
         events: &'a std::sync::Mutex<Vec<String>>,
@@ -1554,17 +1686,10 @@ mod tests {
                 .push(format!("{}:run", self.name));
             Ok(RunStatus::Exited(0))
         }
-
-        async fn sources_done(&self) {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("{}:done", self.name));
-        }
     }
 
     #[tokio::test]
-    async fn the_sources_runner_is_released_before_the_scripts_run() {
+    async fn sources_are_got_with_the_sources_runner_and_steps_run_with_the_job_runner() {
         let j = job(serde_json::json!({
             "id": 19, "token": "t",
             "hooks": [{"name": "pre_get_sources_script", "script": ["echo hook"]}],
@@ -1584,6 +1709,7 @@ mod tests {
         let dirs = JobDirs {
             builds: "/builds".to_string(),
             project: "/builds/project".to_string(),
+            host_project: PathBuf::from("/nonexistent/project"),
         };
         let deadline = Instant::now() + Duration::from_secs(60);
 
@@ -1595,7 +1721,7 @@ mod tests {
         assert!(outcome.is_ok(), "{:?}", outcome);
         assert_eq!(
             *events.lock().unwrap(),
-            ["sources:run", "sources:done", "job:run", "job:run"]
+            ["sources:run", "job:run", "job:run"]
         );
     }
 

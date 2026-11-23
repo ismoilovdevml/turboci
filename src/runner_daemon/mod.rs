@@ -922,7 +922,28 @@ impl RunnerDaemon {
         result
     }
 
+    /// `run_timed_job` with timings of its own, or those of the task when
+    /// its caller set them (a test that reads them)
     async fn run_job(&self, job: Job) -> Result<()> {
+        // Boxed: the job's future is large, and callers (tests) may hold it
+        // on a small stack
+        match metrics::current_job() {
+            Some(timings) => Box::pin(self.run_timed_job(job, &timings)).await,
+            None => {
+                let timings = Arc::new(metrics::JobTimings::default());
+                timings
+                    .clone()
+                    .scope(Box::pin(self.run_timed_job(job, &timings)))
+                    .await
+            }
+        }
+    }
+
+    /// Run the job, save its cache and upload its artifacts, report it to
+    /// GitLab, then remove what it left (the caller keeps its slot until
+    /// then); its phases are recorded in `timings`, which must be the
+    /// task's current ones
+    async fn run_timed_job(&self, job: Job, timings: &metrics::JobTimings) -> Result<()> {
         let job_name = job
             .job_info
             .as_ref()
@@ -942,7 +963,7 @@ impl RunnerDaemon {
             .with_cancel(cancel.clone());
         // Aborted when dropped, even if the job panics, so GitLab is not told
         // forever that a dead job is running
-        let _heartbeat = AbortOnDrop(self.spawn_heartbeat(&job, cancel.clone()));
+        let heartbeat = AbortOnDrop(self.spawn_heartbeat(&job, cancel.clone()));
         trace
             .write(&format!(
                 "Running with TurboCI {}\n",
@@ -954,84 +975,101 @@ impl RunnerDaemon {
         let variables = job_variables(&job);
         let project_dir = self.project_dir(&job);
         let workspace = self.executor.job_dir(&job);
-        self.claim_workspace(&workspace).await;
-        let prepared = match self.executor.prepare(&job).await {
-            Ok(()) => tokio::fs::create_dir_all(&project_dir)
-                .await
-                .map_err(anyhow::Error::from),
-            Err(e) => Err(e),
-        };
+        let prepared = metrics::timed(metrics::Phase::Claim, async {
+            self.claim_workspace(&workspace).await;
+            self.executor.prepare(&job).await?;
+            tokio::fs::create_dir_all(&project_dir).await?;
+            anyhow::Ok(())
+        })
+        .await;
         let mut outcome = prepared
             .map_err(|e| JobFailure::system(format!("Failed to create workspace: {:#}", e)));
+        let mut teardown = None;
         if outcome.is_ok() {
-            outcome = self
-                .executor
-                .execute(
-                    &job,
-                    &mut trace,
-                    &WorkspaceRestore {
-                        daemon: self,
-                        variables: &variables,
-                    },
-                )
-                .await;
+            let restore = WorkspaceRestore {
+                daemon: self,
+                variables: &variables,
+            };
+            let (executed, left) =
+                Box::pin(self.executor.execute_deferred(&job, &mut trace, &restore)).await;
+            outcome = executed;
+            teardown = Some(left);
         }
-        // Aborted jobs (runner shutdown, or gone from GitLab) upload nothing
+        // Aborted jobs (runner shutdown, or gone from GitLab) upload nothing.
+        // Like gitlab-runner: the cache, then the artifacts, then the file
+        // variables are removed, and only then is the job reported.
         if cancel.state() != RemoteState::Aborted {
-            // An upload failure fails a job that otherwise succeeded (the next
-            // stage would miss its inputs); the job's own failure takes precedence
             let result = if outcome.is_ok() {
                 "successful"
             } else {
                 "failed"
             };
-            let section = if outcome.is_ok() {
-                "upload_artifacts_on_success"
-            } else {
-                "upload_artifacts_on_failure"
-            };
-            if job.artifacts.as_ref().is_some_and(|a| !a.is_empty()) {
-                trace
-                    .section_start(section, &format!("Uploading artifacts for {} job", result))
-                    .await;
-            }
-            let uploaded = self
-                .upload_artifacts(&job, &variables, &mut trace, outcome.is_ok())
-                .await;
-            if job.artifacts.as_ref().is_some_and(|a| !a.is_empty()) {
-                trace.section_end(section).await;
-            }
-            if outcome.is_ok() {
-                outcome = uploaded;
-            }
             let saves_cache = self.config.cache_enabled
                 && job
                     .cache
                     .iter()
                     .any(|c| c.policy == "push" || c.policy == "pull-push");
+            let uploads_artifacts = job.artifacts.as_ref().is_some_and(|a| !a.is_empty());
             if saves_cache {
-                let result = if outcome.is_ok() {
-                    "successful"
+                let section = if outcome.is_ok() {
+                    "archive_cache"
                 } else {
-                    "failed"
+                    "archive_cache_on_failure"
                 };
                 trace
-                    .section_start("archive_cache", &format!("Saving cache for {} job", result))
+                    .section_start(section, &format!("Saving cache for {} job", result))
                     .await;
-            }
-            self.upload_cache(&job, &variables, &mut trace, outcome.is_ok())
+                // The upload reads the workspace on the host, as the runner's user
+                if let Some(teardown) = teardown.as_mut() {
+                    teardown.prepare_uploads().await;
+                }
+                metrics::timed(
+                    metrics::Phase::ArchiveCache,
+                    self.upload_cache(&job, &variables, &mut trace, outcome.is_ok()),
+                )
                 .await;
-            if saves_cache {
-                trace.section_end("archive_cache").await;
+                trace.section_end(section).await;
+            }
+            if uploads_artifacts {
+                let section = if outcome.is_ok() {
+                    "upload_artifacts_on_success"
+                } else {
+                    "upload_artifacts_on_failure"
+                };
+                trace
+                    .section_start(section, &format!("Uploading artifacts for {} job", result))
+                    .await;
+                // The upload reads the workspace on the host, as the runner's user
+                if let Some(teardown) = teardown.as_mut() {
+                    teardown.prepare_uploads().await;
+                }
+                // An upload failure fails a job that otherwise succeeded (the
+                // next stage would miss its inputs); the job's own failure
+                // takes precedence
+                let uploaded = metrics::timed(
+                    metrics::Phase::UploadArtifacts,
+                    self.upload_artifacts(&job, &variables, &mut trace, outcome.is_ok()),
+                )
+                .await;
+                trace.section_end(section).await;
+                if outcome.is_ok() {
+                    outcome = uploaded;
+                }
             }
         }
-        self.executor
-            .cleanup(&job, self.config.executor.workspace_max_age_days > 0)
+        trace
+            .section_start(
+                "cleanup_file_variables",
+                "Cleaning up project directory and file based variables",
+            )
             .await;
-        if let Ok(mut in_use) = self.workspaces_in_use.lock() {
-            in_use.remove(&workspace);
-        }
-        drop(_heartbeat);
+        metrics::timed(
+            metrics::Phase::Cleanup,
+            self.executor.remove_variables(&job),
+        )
+        .await;
+        trace.section_end("cleanup_file_variables").await;
+        drop(heartbeat);
 
         // Jobs stopped by a runner shutdown are the runner's failure, not the user's
         let stopped_by_shutdown = *self.shutdown.borrow() == Shutdown::Abort;
@@ -1058,21 +1096,57 @@ impl RunnerDaemon {
                 (JobState::Failed, Some(failure.reason), failure.exit_code)
             }
         };
+        let reporting = std::time::Instant::now();
         trace.finish().await;
 
-        if cancel.state() == RemoteState::Aborted && !stopped_by_shutdown {
+        let (end, reported) = if cancel.state() == RemoteState::Aborted && !stopped_by_shutdown {
             // Canceled in GitLab: it already has the final state and rejects updates
             info!("🛑 Job #{} was canceled", job.id);
             self.metrics.job_finished(metrics::JobEnd::Canceled);
-            return Ok(());
+            (metrics::JobEnd::Canceled, Ok(()))
+        } else {
+            let end = match &outcome {
+                Ok(()) => {
+                    self.metrics.job_finished(metrics::JobEnd::Success);
+                    metrics::JobEnd::Success
+                }
+                Err(failure) => {
+                    self.metrics.job_failed(&failure.reason);
+                    metrics::JobEnd::Failed
+                }
+            };
+            let reported = self
+                .gitlab
+                .update_job(job.id, &job.token, state, reason, exit_code)
+                .await;
+            (end, reported)
+        };
+        metrics::record(metrics::Phase::Report, reporting.elapsed());
+        let total = timings.elapsed();
+        self.metrics.observe_job(end, total);
+
+        // The job's slot and workspace stay taken until its containers are
+        // gone and the workspace is handed back
+        metrics::timed(metrics::Phase::Teardown, async {
+            if let Some(teardown) = teardown {
+                teardown.finish().await;
+            }
+            self.executor
+                .cleanup(&job, self.config.executor.workspace_max_age_days > 0)
+                .await;
+        })
+        .await;
+        if let Ok(mut in_use) = self.workspaces_in_use.lock() {
+            in_use.remove(&workspace);
         }
-        match &outcome {
-            Ok(()) => self.metrics.job_finished(metrics::JobEnd::Success),
-            Err(failure) => self.metrics.job_failed(&failure.reason),
-        }
-        self.gitlab
-            .update_job(job.id, &job.token, state, reason, exit_code)
-            .await
+        self.metrics.record_job(timings);
+        info!(
+            "⏱️  Job #{} took {:.2}s until reported: {}",
+            job.id,
+            total.as_secs_f64(),
+            timings.summary()
+        );
+        reported
     }
 
     /// Mark a workspace in use, once no eviction that may remove it is running
@@ -1208,6 +1282,7 @@ impl RunnerDaemon {
             .iter()
             .any(|c| c.policy == "pull" || c.policy == "pull-push");
         if self.config.cache_enabled && pulls_cache {
+            let restoring = std::time::Instant::now();
             trace
                 .section_start("restore_cache", "Restoring cache")
                 .await;
@@ -1297,6 +1372,7 @@ impl RunnerDaemon {
                 }
             }
             trace.section_end("restore_cache").await;
+            metrics::record(metrics::Phase::RestoreCache, restoring.elapsed());
         }
 
         // Jobs without artifacts have nothing to download; a failed download
@@ -1307,9 +1383,11 @@ impl RunnerDaemon {
         trace
             .section_start("download_artifacts", "Downloading artifacts")
             .await;
-        let downloaded = self
-            .download_dependencies(job, trace, &workspace, stop)
-            .await;
+        let downloaded = metrics::timed(
+            metrics::Phase::DownloadArtifacts,
+            self.download_dependencies(job, trace, &workspace, stop),
+        )
+        .await;
         trace.section_end("download_artifacts").await;
         downloaded
     }
@@ -3740,5 +3818,203 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(capacity.running(), 0);
+    }
+
+    /// Records when GitLab got each job's final update
+    struct Reported(Arc<std::sync::Mutex<Vec<(String, std::time::Instant)>>>);
+
+    impl wiremock::Respond for Reported {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            if let Ok(mut reported) = self.0.lock() {
+                reported.push((request.url.path().to_string(), std::time::Instant::now()));
+            }
+            ResponseTemplate::new(200)
+        }
+    }
+
+    /// Median and 90th percentile of `values`
+    fn median_p90(mut values: Vec<f64>) -> (f64, f64) {
+        values.sort_by(f64::total_cmp);
+        let at =
+            |q: f64| values[((q * values.len() as f64).ceil() as usize).clamp(1, values.len()) - 1];
+        (at(0.5), at(0.9))
+    }
+
+    /// Runs the audit's Docker jobs (a noop job, a job next to a redis
+    /// service, a job writing 2000 small files to its cache) BENCH_RUNS
+    /// times each (default 10, after one warm-up) through the whole daemon
+    /// against a mock GitLab, and prints the median and 90th percentile of
+    /// every phase. Run it as a user other than root, as the runner runs in
+    /// production, so jobs leave files of another user behind:
+    /// `cargo test --release bench_docker_job_phases -- --ignored --nocapture`.
+    /// BENCH_PULL_POLICY sets the pull policy (default if-not-present).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark: needs a Docker daemon, run on its own with --nocapture"]
+    async fn bench_docker_job_phases() {
+        let runs: usize = std::env::var("BENCH_RUNS")
+            .ok()
+            .and_then(|runs| runs.parse().ok())
+            .unwrap_or(10);
+        let pull_policy =
+            std::env::var("BENCH_PULL_POLICY").unwrap_or_else(|_| "if-not-present".to_string());
+        let server = MockServer::start().await;
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (verb, route, status) in [
+            ("PATCH", r"^/api/v4/jobs/\d+/trace$", 202),
+            ("POST", r"^/api/v4/jobs/\d+/artifacts$", 201),
+        ] {
+            Mock::given(method(verb))
+                .and(wiremock::matchers::path_regex(route))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("PUT"))
+            .and(wiremock::matchers::path_regex(r"^/api/v4/jobs/\d+$"))
+            .respond_with(Reported(reported.clone()))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config::RunnerConfig {
+            runner_token: "glrt-test".to_string(),
+            gitlab_url: server.uri(),
+            cache_dir: dir.path().join("cache").to_string_lossy().into_owned(),
+            state_dir: dir.path().to_string_lossy().into_owned(),
+            ..config::RunnerConfig::default()
+        };
+        let docker = executor::DockerExecutor::new(config::DockerConfig {
+            builds_dir: Some(dir.path().join("builds").to_string_lossy().into_owned()),
+            pull_policy,
+            ..config::DockerConfig::default()
+        })
+        .unwrap()
+        .with_owner("turboci-bench");
+        let daemon = RunnerDaemon::new(
+            config,
+            GitLabClient::new(server.uri(), "glrt-test".to_string()),
+            executor::ExecutorType::Docker(docker),
+        );
+
+        let base = 990_000_000 + u64::from(std::process::id()) * 1000;
+        let cache_script = "rm -rf cache && mkdir cache && i=0; \
+            while [ $i -lt 2000 ]; do echo \"$CI_JOB_ID $i\" > cache/f$i; i=$((i+1)); done";
+        let workloads: [(&str, serde_json::Value, &str, serde_json::Value); 3] = [
+            ("noop", serde_json::json!([]), "true", serde_json::json!([])),
+            (
+                "service",
+                serde_json::json!([{"name": "redis:7-alpine", "alias": "redis"}]),
+                "true",
+                serde_json::json!([]),
+            ),
+            (
+                "cache",
+                serde_json::json!([]),
+                cache_script,
+                serde_json::json!([{"key": "bench", "paths": ["cache/"], "policy": "pull-push"}]),
+            ),
+        ];
+        let mut report = String::new();
+        for (index, (name, services, script, cache)) in workloads.into_iter().enumerate() {
+            let project = base + index as u64 * 100;
+            let job = |id: u64, sha: &str| -> Job {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "token": format!("job-token-{}", id), "allow_git_fetch": true,
+                    "image": {"name": "alpine:3.20"},
+                    "job_info": {"name": name, "stage": "test", "project_id": project, "project_name": "bench"},
+                    "git_info": {"repo_url": "file:///builds/origin.git", "ref": "main", "ref_type": "branch",
+                                 "sha": sha, "before_sha": "", "protected": false,
+                                 "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]},
+                    // Root in a helper reads the origin of the runner's user
+                    "variables": [
+                        {"key": "GIT_CONFIG_COUNT", "value": "1"},
+                        {"key": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+                        {"key": "GIT_CONFIG_VALUE_0", "value": "*"}
+                    ],
+                    "services": services,
+                    "cache": cache,
+                    "steps": [{"name": "script", "when": "on_success", "timeout": 600, "script": [script]}]
+                }))
+                .unwrap()
+            };
+            // The origin lives in the project's workspace, as /builds/origin.git
+            let workspace = daemon.executor.job_dir(&job(project, ""));
+            std::fs::create_dir_all(&workspace).unwrap();
+            let (_, sha) = origin_repo(&workspace);
+            let origin = workspace.join("origin");
+            let bare = std::process::Command::new("git")
+                .args(["clone", "-q", "--bare"])
+                .arg(&origin)
+                .arg(workspace.join("origin.git"))
+                .output()
+                .unwrap();
+            assert!(bare.status.success(), "{:?}", bare);
+
+            let mut totals = Vec::new();
+            let mut slot_free = Vec::new();
+            let mut phases: std::collections::BTreeMap<usize, Vec<f64>> = Default::default();
+            for run in 0..=runs {
+                let id = project + run as u64;
+                let timings = Arc::new(metrics::JobTimings::default());
+                let started = std::time::Instant::now();
+                timings
+                    .clone()
+                    .scope(daemon.execute_job(job(id, &sha)))
+                    .await
+                    .unwrap();
+                let ended = started.elapsed();
+                let update = final_update(&server, id).await;
+                assert_eq!(
+                    update["state"],
+                    "success",
+                    "{}",
+                    trace_of(&server, id).await
+                );
+                if run == 0 {
+                    continue; // warm-up: pulls, first clone
+                }
+                let path = format!("/api/v4/jobs/{}", id);
+                let at = reported
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(reported, _)| *reported == path)
+                    .map(|(_, at)| *at)
+                    .unwrap();
+                totals.push(at.duration_since(started).as_secs_f64());
+                slot_free.push(ended.as_secs_f64());
+                for (position, phase) in metrics::Phase::ALL.iter().enumerate() {
+                    if let Some(took) = timings.get(*phase) {
+                        phases.entry(position).or_default().push(took.as_secs_f64());
+                    }
+                }
+            }
+            let line = |label: &str, values: &Vec<f64>| {
+                let (median, p90) = median_p90(values.clone());
+                format!(
+                    "{:<8} {:<18} {:>4} {:>8.3} {:>8.3}\n",
+                    name,
+                    label,
+                    values.len(),
+                    median,
+                    p90
+                )
+            };
+            for (position, values) in &phases {
+                report.push_str(&line(metrics::Phase::ALL[*position].name(), values));
+            }
+            report.push_str(&line("REPORTED", &totals));
+            report.push_str(&line("SLOT_FREE", &slot_free));
+            let mut sorted = totals.clone();
+            sorted.sort_by(f64::total_cmp);
+            report.push_str(&format!("{:<8} reported, sorted: {:.2?}\n", name, sorted));
+            daemon
+                .executor
+                .cleanup(&job(project + runs as u64, &sha), false)
+                .await;
+        }
+        println!(
+            "\nworkload phase              runs   median      p90  (seconds)\n{}",
+            report
+        );
     }
 }

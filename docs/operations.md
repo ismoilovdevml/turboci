@@ -163,8 +163,42 @@ metrics belong to the whole process and have none.
 | `turboci_config_reloads_total{result}` | counter | [Config reloads](#reloading-the-config): `success`, `failure` |
 | `turboci_workspaces_evicted_total` | counter | Workspaces deleted to stay within `workspace_max_size` |
 | `turboci_workspaces_size_bytes` | gauge | Size of the kept workspaces at the last hourly sweep (only with `workspace_max_size`) |
+| `turboci_workspace_reuse_total{result}` | counter | What getting sources did with the checkout an earlier job left: `fetch` (updated it), `clone` (threw it away: `GIT_STRATEGY=clone`, submodules, or the update failed), `fresh` (there was none: the workspace's first job, or a workspace of its own), `none` (no checkout: `GIT_STRATEGY` `none` or `empty`) |
+| `turboci_job_duration_seconds{executor,result}` | histogram | From the job's start in the runner until its final update was sent, by `success`, `failed`, `canceled` |
+| `turboci_job_phase_duration_seconds{executor,phase}` | histogram | Time jobs spent in each phase (see below) |
 | `process_start_time_seconds` | gauge | Start of the runner process (Unix time) |
 | `process_resident_memory_bytes` | gauge | Resident memory of the runner (Linux) |
+
+Histogram buckets are 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300 and
+600 seconds; a series appears with its first observation. The phases:
+
+| Phase | What it covers |
+|---|---|
+| `claim` | Waiting for the workspace (an eviction in progress) and preparing it |
+| `prepare` | From the job's start until restoring cache and artifacts can begin: everything before, including `get_sources` |
+| `pull` | Docker: checking the job's and services' images against their pull policy, and pulling them |
+| `services` | Docker: the services' network, starting them, waiting for their ports |
+| `container` | Docker: creating and starting the job container |
+| `helper` | Docker: pulling and starting the helper container that checks out sources, the `workspace_check` included |
+| `workspace_check` | Docker: walking the workspace for files of other users before the checkout; skipped when the last job left the workspace clean |
+| `get_sources` | Hooks and checkout (the `get_sources` log section) |
+| `setup_wait` | Docker: waiting for the job container and services after getting sources |
+| `restore_cache`, `download_artifacts` | Their log sections |
+| `script`, `after_script` | The script steps (`before_script` and `script`) and `after_script` |
+| `ownership` | Docker: stopping the job container and giving its files to the runner's user before cache and artifacts are read |
+| `archive_cache`, `upload_artifacts` | Saving the cache, uploading artifacts |
+| `cleanup` | Removing the job's file variables |
+| `report` | Sending the rest of the log and the final state to GitLab |
+| `teardown` | After the final update: removing the job's containers, network and volumes, handing the workspace back, removing a workspace that is not kept. The job's slot stays taken until it is done. |
+
+The Docker executor checks out sources while it pulls images and starts the
+services and the job container, so `pull`, `services` and `container` overlap
+`helper` and `get_sources`; `prepare` is what the job waited in all. Each job
+also logs its phases when it has been reported:
+
+```text
+⏱️  Job #123 took 3.21s until reported: claim=0.00s prepare=1.12s pull=0.01s container=0.31s helper=0.42s get_sources=0.65s script=1.02s ownership=0.09s archive_cache=0.40s cleanup=0.00s report=0.05s teardown=0.61s
+```
 
 Alerts worth having:
 

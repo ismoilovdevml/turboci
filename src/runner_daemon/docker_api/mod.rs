@@ -419,6 +419,16 @@ impl Docker {
             .await
     }
 
+    /// `POST /containers/{id}/kill`: SIGKILL; 409 when it is not running
+    pub async fn kill_container(&self, id: &str) -> Result<()> {
+        self.call(
+            Method::POST,
+            &format!("/containers/{}/kill", id),
+            Some(&[("signal", "KILL")]),
+        )
+        .await
+    }
+
     /// `GET /containers/{id}/json`
     pub async fn inspect_container(&self, id: &str) -> Result<ContainerInspectResponse> {
         self.get(&format!("/containers/{}/json", id), None).await

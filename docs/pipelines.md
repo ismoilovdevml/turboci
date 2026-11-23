@@ -17,7 +17,7 @@ lists what a runner has to do, and how TurboCI does it.
 | Cancel from the UI | The script is stopped, `after_script` still runs, then the job is cleaned up |
 | `hooks:pre_get_sources_script` | Runs before the checkout, after the runner's `pre_get_sources_script` |
 | `CI_DEBUG_TRACE: "true"` | Every command is echoed (`set -x`); masking still applies |
-| Collapsible log sections | `get_sources`, `restore_cache`, `download_artifacts`, `step_*`, `after_script`, `archive_cache`, `upload_artifacts_*` |
+| Collapsible log sections | gitlab-runner's: `prepare_executor`, `get_sources`, `restore_cache`, `download_artifacts`, `step_*`, `after_script`, `archive_cache` (`archive_cache_on_failure`), `upload_artifacts_on_success` (`_on_failure`), `cleanup_file_variables`; and `prepare_containers` (Docker: the services and job container started while sources were checked out). As in gitlab-runner the cache is saved before artifacts are uploaded |
 
 ## Images and services (docker executor)
 

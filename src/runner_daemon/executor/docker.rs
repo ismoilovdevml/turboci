@@ -424,6 +424,8 @@ async fn pull_image(
 
 /// Label marking containers and networks with the runner that created them
 const OWNER_LABEL: &str = "turboci.runner";
+/// How long a killed job container may take to stop
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl std::fmt::Debug for DockerExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -634,7 +636,8 @@ async fn sources_user(job: &Job, job_dir: &Path, clean: &CleanWorkspaces) -> Opt
         }
         if !clean.take(job_dir, stamp) {
             let dir = job_dir.to_path_buf();
-            let others = tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid))
+            let walk = tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid));
+            let others = metrics::timed(Phase::WorkspaceCheck, walk)
                 .await
                 .unwrap_or(true);
             if others {
@@ -1144,6 +1147,8 @@ impl DockerExecutor {
         .unwrap_or_else(|e| vec![format!("Cannot check the Docker daemon's settings: {}", e)])
     }
 
+    /// Run the job; what it leaves is returned (see `Teardown`), including
+    /// after failures, timeouts, cancellation and panics
     pub(super) async fn execute(
         &self,
         job: &Job,
@@ -1151,26 +1156,42 @@ impl DockerExecutor {
         deadline: Instant,
         trace: &mut TraceWriter<'_>,
         restore: &impl Restore,
-    ) -> JobOutcome {
+    ) -> (JobOutcome, Leftovers) {
         use futures_util::FutureExt;
 
         let mut containers = JobContainers::default();
+        // Closed by start_and_run once the job's containers are ready, here
+        // when it fails before
+        let mut preparing = true;
+        trace
+            .section_start("prepare_executor", "Preparing the \"docker\" executor")
+            .await;
         let outcome = std::panic::AssertUnwindSafe(self.start_and_run(
             job,
             job_dir,
             deadline,
             trace,
             &mut containers,
+            &mut preparing,
             restore,
         ))
         .catch_unwind()
         .await
         .unwrap_or_else(|_| Err(JobFailure::system("internal runner error")));
-        // Always runs, including after failures, timeouts, cancellation and panics
-        self.release(job.id, &containers, job_dir).await;
-        outcome
+        if preparing {
+            trace.section_end("prepare_executor").await;
+        }
+        let left = Leftovers {
+            executor: self.clone(),
+            job_id: job.id,
+            job_dir: job_dir.to_path_buf(),
+            containers,
+            settled: None,
+        };
+        (outcome, left)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_and_run(
         &self,
         job: &Job,
@@ -1178,6 +1199,7 @@ impl DockerExecutor {
         deadline: Instant,
         trace: &mut TraceWriter<'_>,
         containers: &mut JobContainers,
+        preparing: &mut bool,
         restore: &impl Restore,
     ) -> JobOutcome {
         let env = script::job_env(
@@ -1267,7 +1289,7 @@ impl DockerExecutor {
             .images
             .hold(&images.iter().map(|need| need.name).collect::<Vec<_>>())
             .await;
-        let pulls = self.plan_pulls(&images, trace).await?;
+        let pulls = metrics::timed(Phase::Pull, self.plan_pulls(&images, trace)).await?;
         // Pulled by the branch that needs them; an image both need is pulled
         // once (see `pull_shared`)
         let needed_by = |wanted: &[&ImageNeed]| -> Vec<PlannedPull> {
@@ -1290,6 +1312,7 @@ impl DockerExecutor {
         let dirs = JobDirs {
             builds: "/builds".to_string(),
             project: format!("/builds/{}", subdir),
+            host_project: job_dir.join(&subdir),
         };
         let setup = JobSetup {
             job,
@@ -1323,7 +1346,9 @@ impl DockerExecutor {
                     run,
                 )
                 .await?;
-            let runner = self.runner(&id, &env, false);
+            trace.section_end("prepare_executor").await;
+            *preparing = false;
+            let runner = self.runner(&id, &env);
             return run_job_steps(job, deadline, &runner, &runner, trace, &dirs, restore).await;
         }
 
@@ -1335,7 +1360,7 @@ impl DockerExecutor {
         // container: after_script still runs in it, as it would without
         // services. Container API calls are never interrupted (a dropped
         // create could leave a container nobody removes): every container is
-        // recorded as soon as it exists, and removed by `release`.
+        // recorded as soon as it exists, and removed by the job's teardown.
         let setup_stop = CancelSignal::default();
         let limits = Limits {
             deadline,
@@ -1351,7 +1376,7 @@ impl DockerExecutor {
         // open, and follow it live once it is closed
         let (log_sender, mut log_lines) = tokio::sync::mpsc::unbounded_channel();
         let sources = async {
-            let started = async {
+            let started = metrics::timed(Phase::Helper, async {
                 let mut pull_log = SetupLog::Trace(&mut *trace);
                 // The workspace check runs while the helper image is pulled;
                 // a canceled job does not wait for it
@@ -1362,17 +1387,18 @@ impl DockerExecutor {
                 pulled?;
                 limits.check(job)?;
                 let user = user.unwrap_or(None);
-                let id = self
-                    .start_helper(job, job_dir, &env, user)
+                // Kept until the job's teardown, which hands the workspace
+                // back with it
+                self.start_helper(job, job_dir, &env, user, helper)
                     .await
-                    .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-                *helper = Some(id.clone());
-                Ok::<_, JobFailure>(id)
-            }
+                    .map_err(|e| JobFailure::system(format!("{:#}", e)))
+            })
             .await;
             let sourced = match started {
                 Ok(id) => {
-                    let runner = self.runner(&id, &env, true);
+                    trace.section_end("prepare_executor").await;
+                    *preparing = false;
+                    let runner = self.runner(&id, &env);
                     Ok(get_sources_section(job, &runner, trace, &dirs, &limits).await)
                 }
                 Err(failure) => {
@@ -1380,7 +1406,21 @@ impl DockerExecutor {
                     Err(failure)
                 }
             };
-            forward_setup_log(&mut log_lines, trace).await;
+            // What the containers branch reported, and the wait for it to
+            // end, follow the checkout in a section of their own
+            let waiting = !(log_lines.is_closed() && log_lines.is_empty());
+            if *preparing || !waiting {
+                forward_setup_log(&mut log_lines, trace).await;
+            } else {
+                let header = if services.is_empty() {
+                    "Starting the job container"
+                } else {
+                    "Starting services and the job container"
+                };
+                trace.section_start("prepare_containers", header).await;
+                metrics::timed(Phase::SetupWait, forward_setup_log(&mut log_lines, trace)).await;
+                trace.section_end("prepare_containers").await;
+            }
             sourced
         };
         let containers = async {
@@ -1408,7 +1448,7 @@ impl DockerExecutor {
         }
         let id = started?;
         let sources_failure = sourced?;
-        let runner = self.runner(&id, &env, false);
+        let runner = self.runner(&id, &env);
         run_steps(
             job,
             deadline,
@@ -1421,21 +1461,19 @@ impl DockerExecutor {
         .await
     }
 
-    /// Runs scripts in container `id`; a sources-only one is removed once
-    /// getting sources is done
-    fn runner<'r>(&'r self, id: &'r str, env: &JobEnv, sources_only: bool) -> DockerRunner<'r> {
+    /// Runs scripts in container `id`
+    fn runner<'r>(&'r self, id: &'r str, env: &JobEnv) -> DockerRunner<'r> {
         DockerRunner {
             docker: &self.docker,
             container_id: id,
             env: env.to_docker(),
-            sources_only,
         }
     }
 
     /// Pull the job image and the service images in `pulls`, start the
     /// services on a network of the job's own, wait for them and start the
     /// job container; returns its id. Everything is recorded in `run` as
-    /// soon as it exists, so a failure leaves nothing `release` misses.
+    /// soon as it exists, so a failure leaves nothing the teardown misses.
     async fn start_job_container(
         &self,
         setup: &JobSetup<'_>,
@@ -1445,29 +1483,35 @@ impl DockerExecutor {
         run: &mut RunContainers,
     ) -> std::result::Result<String, JobFailure> {
         let job = setup.job;
-        self.pull_all(pulls, job, limits, log).await?;
+        metrics::timed(Phase::Pull, self.pull_all(pulls, job, limits, log)).await?;
         let volumes = self
             .job_volumes(job)
             .await
             .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
 
-        // Services need a network of their own to be reachable by alias
         if !setup.services.is_empty() {
-            limits.check(job)?;
-            let network = format!("turboci-job-{}", job.id);
-            self.create_network(&network)
-                .await
-                .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-            run.network = Some(network);
-        }
-        self.start_services(setup, &volumes, limits, log, run)
-            .await?;
-        if let Some(network) = run.network.clone() {
-            self.wait_for_services(job.id, &network, &run.services, log, limits)
-                .await;
+            let started = std::time::Instant::now();
+            let services = async {
+                // Services need a network of their own to be reachable by alias
+                limits.check(job)?;
+                let network = format!("turboci-job-{}", job.id);
+                self.create_network(&network)
+                    .await
+                    .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+                run.network = Some(network.clone());
+                self.start_services(setup, &volumes, limits, log, run)
+                    .await?;
+                self.wait_for_services(job.id, &network, &run.services, log, limits)
+                    .await;
+                Ok::<_, JobFailure>(())
+            }
+            .await;
+            metrics::record(Phase::Services, started.elapsed());
+            services?;
         }
 
         limits.check(job)?;
+        let started = std::time::Instant::now();
         let name = format!("turboci-job-{}", job.id);
         let config = ContainerCreateBody {
             image: Some(setup.image.to_string()),
@@ -1504,6 +1548,7 @@ impl DockerExecutor {
             .start_container(&id)
             .await
             .map_err(|e| JobFailure::system(format!("Failed to start container: {}", e)))?;
+        metrics::record(Phase::Container, started.elapsed());
         Ok(id)
     }
 
@@ -1597,7 +1642,7 @@ impl DockerExecutor {
         let started = futures_util::future::join_all(starts).await;
         let mut failure = None;
         for (id, failed) in started {
-            // Every service that exists is removed by `release`, started or not
+            // Every service that exists is removed by the teardown, started or not
             run.services.extend(id);
             if failure.is_none() {
                 failure = failed;
@@ -1607,13 +1652,15 @@ impl DockerExecutor {
     }
 
     /// Start the container that checks out sources as `user` (root when
-    /// `None`, see `sources_user`), with the workspace mounted
+    /// `None`, see `sources_user`), with the workspace mounted; recorded in
+    /// `helper` as soon as it exists, so a failed start leaves nothing
     async fn start_helper(
         &self,
         job: &Job,
         job_dir: &Path,
         env: &JobEnv,
         user: Option<String>,
+        helper: &mut Option<String>,
     ) -> Result<String> {
         let config = ContainerCreateBody {
             image: Some(self.config.helper_image.clone()),
@@ -1633,6 +1680,7 @@ impl DockerExecutor {
         let id = self
             .create_named(&format!("turboci-job-{}-sources", job.id), config)
             .await?;
+        *helper = Some(id.clone());
         self.docker
             .start_container(&id)
             .await
@@ -2302,12 +2350,114 @@ impl DockerExecutor {
         Ok(response.id)
     }
 
-    /// Remove the job's containers and network, then hand the workspace back to
-    /// the runner's user (files created in containers belong to root)
-    async fn release(&self, job_id: u64, containers: &JobContainers, job_dir: &Path) {
-        // Removing the containers first stops everything the job started, so
-        // nothing the job controls runs during cleanup. They are independent,
-        // so they are removed at the same time.
+    /// Stop what of the job could still change the workspace and give the
+    /// workspace back to its owner, the runner's user (files created in
+    /// containers belong to root), so the runner can read and remove them.
+    /// The job container is killed, not removed: removing it, its volumes
+    /// (a docker:dind's images) and the other containers can wait until the
+    /// job has been reported (see `Leftovers::finish`).
+    async fn settle(&self, job_id: u64, job_dir: &Path, containers: &mut JobContainers) -> Settled {
+        // The job's containers may have changed anything
+        self.clean_workspaces.forget(job_dir);
+        if containers.run.job.is_none() && containers.helper.is_none() {
+            return Settled::Untouched;
+        }
+        if let Some(id) = &containers.run.job {
+            if let Err(e) = self.stop(id).await {
+                // A container that may still run can still change the workspace
+                warn!("Failed to stop container {}: {:#}", id, e);
+                match self.force_remove(id).await {
+                    Ok(()) => containers.run.job = None,
+                    Err(e) => {
+                        warn!("Failed to remove container {}: {:#}", id, e);
+                        return Settled::Not;
+                    }
+                }
+            }
+        }
+        self.hand_back(job_id, job_dir, containers.helper.as_deref(), false)
+            .await
+    }
+
+    /// Give the workspace to its owner once nothing of the job runs any
+    /// more. The sources `helper` (the trusted helper image, only the
+    /// workspace mounted) does it, after a walk of the workspace found
+    /// something to hand back when `walk_first`; without a helper, a fresh
+    /// helper container does it when the walk finds something.
+    async fn hand_back(
+        &self,
+        job_id: u64,
+        job_dir: &Path,
+        helper: Option<&str>,
+        walk_first: bool,
+    ) -> Settled {
+        #[cfg(unix)]
+        {
+            let Ok(meta) = tokio::fs::metadata(job_dir).await else {
+                return Settled::Not;
+            };
+            let stamp = WorkspaceStamp::of(&meta);
+            if let Some(helper) = helper {
+                if walk_first {
+                    let (dir, uid, gid) = (job_dir.to_path_buf(), stamp.uid, stamp.gid);
+                    let walk = tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid));
+                    if !walk.await.unwrap_or(true) {
+                        return Settled::Owned(stamp);
+                    }
+                }
+                let script = chown_script(stamp.uid, stamp.gid);
+                let cmd = ["sh", "-c", script.as_str()];
+                let chown = exec_as_root(&self.docker, helper, &cmd);
+                match tokio::time::timeout(CLEANUP_TIMEOUT, chown).await {
+                    Ok(Ok(0)) => return Settled::Owned(stamp),
+                    Ok(Ok(code)) => warn!("Resetting workspace ownership exited with {}", code),
+                    Ok(Err(e)) => warn!("Failed to reset workspace ownership: {:#}", e),
+                    Err(_) => warn!("Resetting workspace ownership timed out"),
+                }
+            }
+            match self.reset_ownership(job_id, job_dir, stamp).await {
+                Ok(()) => Settled::Owned(stamp),
+                Err(e) => {
+                    warn!("Failed to reset workspace ownership: {:#}", e);
+                    Settled::Not
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (job_id, job_dir, helper, walk_first);
+            Settled::Not
+        }
+    }
+
+    /// Kill container `id` and wait until it has stopped (one that is gone
+    /// or not running counts as stopped)
+    async fn stop(&self, id: &str) -> Result<()> {
+        match self.docker.kill_container(id).await {
+            Ok(()) => {}
+            Err(e) if matches!(e.status_code(), Some(404 | 409)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        let mut wait = self.docker.wait_container(id);
+        tokio::time::timeout(STOP_TIMEOUT, async {
+            while let Some(status) = wait.next().await {
+                match status {
+                    // Killed: its exit code is not zero
+                    Ok(_) | Err(docker_api::Error::ContainerWait { .. }) => {}
+                    Err(e) if e.status_code() == Some(404) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .context("timed out")??;
+        Ok(())
+    }
+
+    /// Remove the job's containers, all at the same time, and its network;
+    /// true when every container is gone
+    async fn remove(&self, containers: &JobContainers) -> bool {
         let removals = containers
             .run
             .job
@@ -2335,13 +2485,7 @@ impl DockerExecutor {
                 warn!("Failed to remove network {}: {}", network, e);
             }
         }
-
-        if containers.run.job.is_some() || containers.helper.is_some() {
-            // A container that may still run can still change the workspace
-            if let Err(e) = self.reset_ownership(job_id, job_dir, all_removed).await {
-                warn!("Failed to reset workspace ownership: {:#}", e);
-            }
-        }
+        all_removed
     }
 
     /// Pull a runner-internal image (no job credentials) when it is not present
@@ -2358,70 +2502,153 @@ impl DockerExecutor {
         force_remove(&self.docker, id).await
     }
 
-    /// Give the workspace back to the runner's uid/gid (the owner of
-    /// `job_dir`) from a fresh container of the (trusted) helper image, never
-    /// from the job's own image. Skipped when everything already belongs to
-    /// it, e.g. jobs running as the runner's user, or Docker Desktop. With
-    /// `may_mark`, a workspace that belongs wholly to its owner afterwards is
-    /// marked clean for the next job's checkout (see `CleanWorkspaces`).
-    async fn reset_ownership(&self, job_id: u64, job_dir: &Path, may_mark: bool) -> Result<()> {
-        // The job's containers may have changed anything
-        self.clean_workspaces.forget(job_dir);
-        #[cfg(unix)]
-        {
-            let meta = tokio::fs::metadata(job_dir).await?;
-            let stamp = WorkspaceStamp::of(&meta);
-            let (uid, gid) = (stamp.uid, stamp.gid);
-            let dir = job_dir.to_path_buf();
-            let needed =
-                tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid)).await?;
-            let may_mark = may_mark && stamp.owned_by_runner();
-            if !needed {
-                if may_mark {
-                    self.clean_workspaces.mark(job_dir, stamp);
-                }
-                return Ok(());
-            }
-            // Jobs without sources to check out never pulled the helper image
-            self.pull_if_missing(&self.config.helper_image).await?;
-            let config = ContainerCreateBody {
-                image: Some(self.config.helper_image.clone()),
-                user: Some("0".to_string()),
-                entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
-                cmd: Some(vec![chown_script(uid, gid)]),
-                network_disabled: Some(true),
-                host_config: Some(HostConfig {
-                    binds: Some(vec![format!("{}:/builds", job_dir.display())]),
-                    ..Default::default()
-                }),
+    /// Give the workspace back to its owner's uid/gid (`stamp`) from a
+    /// fresh container of the (trusted) helper image, never from the job's
+    /// own image. Skipped when everything already belongs to it, e.g. jobs
+    /// running as the runner's user, or Docker Desktop.
+    #[cfg(unix)]
+    async fn reset_ownership(
+        &self,
+        job_id: u64,
+        job_dir: &Path,
+        stamp: WorkspaceStamp,
+    ) -> Result<()> {
+        let (uid, gid) = (stamp.uid, stamp.gid);
+        let dir = job_dir.to_path_buf();
+        let needed = tokio::task::spawn_blocking(move || owned_by_others(&dir, uid, gid)).await?;
+        if !needed {
+            return Ok(());
+        }
+        // Jobs without sources to check out never pulled the helper image
+        self.pull_if_missing(&self.config.helper_image).await?;
+        let config = ContainerCreateBody {
+            image: Some(self.config.helper_image.clone()),
+            user: Some("0".to_string()),
+            entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+            cmd: Some(vec![chown_script(uid, gid)]),
+            network_disabled: Some(true),
+            host_config: Some(HostConfig {
+                binds: Some(vec![format!("{}:/builds", job_dir.display())]),
                 ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = self
+            .create_named(&format!("turboci-job-{}-cleanup", job_id), config)
+            .await?;
+        let result = async {
+            self.docker.start_container(&id).await?;
+            let mut wait = self.docker.wait_container(&id);
+            tokio::time::timeout(CLEANUP_TIMEOUT, async {
+                while let Some(status) = wait.next().await {
+                    status?;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("chown timed out")?
+        }
+        .await;
+        let _ = self.force_remove(&id).await;
+        // The script exited with 0: it gave everything to the owner
+        result
+    }
+}
+
+/// How the workspace was handed back once the job's processes stopped
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// No container of the job ran: nothing in it changed
+    Untouched,
+    /// Everything belongs to the workspace's owner, as `stamp` shows it,
+    /// and nothing of the job runs any more
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Owned(WorkspaceStamp),
+    /// Handing back failed, or a container could not be stopped
+    Not,
+}
+
+/// What a Docker job leaves once its steps ran (see `Teardown`): its
+/// containers (the job container still idling, the sources helper, the
+/// services), network and volumes
+pub struct Leftovers {
+    executor: DockerExecutor,
+    job_id: u64,
+    job_dir: PathBuf,
+    containers: JobContainers,
+    /// Once `prepare_uploads` ran
+    settled: Option<Settled>,
+}
+
+impl Leftovers {
+    /// Stop the job's container and give the workspace to the runner's
+    /// user, so cache and artifacts can be read and the workspace removed
+    pub(super) async fn prepare_uploads(&mut self) {
+        if self.settled.is_none() {
+            let settled = self
+                .executor
+                .settle(self.job_id, &self.job_dir, &mut self.containers)
+                .await;
+            self.settled = Some(settled);
+        }
+    }
+
+    /// Remove the containers, the network and the job container's volumes,
+    /// and give the workspace to its owner when `prepare_uploads` did not.
+    /// A workspace that belongs wholly to its owner afterwards, when that is
+    /// the runner's own user and group, is marked clean for the next job's
+    /// checkout (see `CleanWorkspaces`).
+    pub(super) async fn finish(mut self) {
+        let executor = self.executor.clone();
+        let all_removed = if self.settled.is_some() {
+            executor.remove(&self.containers).await
+        } else {
+            // Without uploads, the job container and the services are
+            // removed first, which stops the job; the helper stays for
+            // handing the workspace back, should a walk find it needed
+            executor.clean_workspaces.forget(&self.job_dir);
+            let containers = &self.containers;
+            let touched = containers.run.job.is_some() || containers.helper.is_some();
+            let job = JobContainers {
+                helper: None,
+                run: RunContainers {
+                    network: None,
+                    services: containers.run.services.clone(),
+                    job: containers.run.job.clone(),
+                },
             };
-            let id = self
-                .create_named(&format!("turboci-job-{}-cleanup", job_id), config)
-                .await?;
-            let result = async {
-                self.docker.start_container(&id).await?;
-                let mut wait = self.docker.wait_container(&id);
-                tokio::time::timeout(CLEANUP_TIMEOUT, async {
-                    while let Some(status) = wait.next().await {
-                        status?;
-                    }
-                    anyhow::Ok(())
-                })
-                .await
-                .context("chown timed out")?
-            }
-            .await;
-            let _ = self.force_remove(&id).await;
-            result?;
-            // The script exited with 0: it gave everything to the owner
-            if may_mark {
-                self.clean_workspaces.mark(job_dir, stamp);
+            let rest = JobContainers {
+                helper: containers.helper.clone(),
+                run: RunContainers {
+                    network: containers.run.network.clone(),
+                    ..RunContainers::default()
+                },
+            };
+            let removed = executor.remove(&job).await;
+            self.settled = Some(if touched {
+                executor
+                    .hand_back(self.job_id, &self.job_dir, rest.helper.as_deref(), true)
+                    .await
+            } else {
+                Settled::Untouched
+            });
+            executor.remove(&rest).await && removed
+        };
+        #[cfg(unix)]
+        if let Some(Settled::Owned(stamp)) = self.settled {
+            if all_removed && stamp.owned_by_runner() {
+                self.executor.clean_workspaces.mark(&self.job_dir, stamp);
             }
         }
         #[cfg(not(unix))]
-        let _ = (job_id, may_mark);
-        Ok(())
+        let _ = all_removed;
+    }
+
+    /// Run `finish` in the background (a teardown that was dropped)
+    pub(super) fn finish_later(self) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(self.finish());
+        }
     }
 }
 
@@ -2463,9 +2690,6 @@ struct DockerRunner<'a> {
     docker: &'a Docker,
     container_id: &'a str,
     env: Vec<String>,
-    /// A helper container that only checks out sources: removed once that is
-    /// done instead of idling until the job ends
-    sources_only: bool,
 }
 
 impl DockerRunner<'_> {
@@ -2489,35 +2713,32 @@ impl DockerRunner<'_> {
 
     /// Run `cmd` as root in the container and return its exit code
     async fn exec_as_root(&self, cmd: &[&str]) -> Result<i64> {
-        let exec = self
-            .docker
-            .create_exec(
-                self.container_id,
-                &ExecConfig {
-                    cmd: Some(cmd.to_vec()),
-                    user: Some("0"),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        let mut output = self.docker.start_exec(&exec.id).await?;
-        while output.next().await.is_some() {}
-        let inspect = self.docker.inspect_exec(&exec.id).await?;
-        Ok(inspect.exit_code.unwrap_or(-1))
+        exec_as_root(self.docker, self.container_id, cmd).await
     }
 }
 
-impl ScriptRunner for DockerRunner<'_> {
-    async fn sources_done(&self) {
-        if self.sources_only {
-            if let Err(e) = force_remove(self.docker, self.container_id).await {
-                warn!("Failed to remove container {}: {:#}", self.container_id, e);
-            }
-        }
-    }
+/// Run `cmd` as root in container `id` and return its exit code; its
+/// output is discarded
+async fn exec_as_root(docker: &Docker, id: &str, cmd: &[&str]) -> Result<i64> {
+    let exec = docker
+        .create_exec(
+            id,
+            &ExecConfig {
+                cmd: Some(cmd.to_vec()),
+                user: Some("0"),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut output = docker.start_exec(&exec.id).await?;
+    while output.next().await.is_some() {}
+    let inspect = docker.inspect_exec(&exec.id).await?;
+    Ok(inspect.exit_code.unwrap_or(-1))
+}
 
+impl ScriptRunner for DockerRunner<'_> {
     async fn run(
         &self,
         script: &str,
@@ -3755,10 +3976,20 @@ mod tests {
         assert!(log.contains("hello from git"), "{}", log);
         assert!(log.contains("ping=PONG"), "{}", log);
         assert!(took < Duration::from_secs(18), "took {:?}\n{}", took, log);
-        // The services' progress follows the checkout's section
-        let sources_end = log.find("section_end:").expect("get_sources section");
-        let service = log.find("Starting service").expect("service started");
-        assert!(sources_end < service, "{}", log);
+        // The services' progress follows the checkout's section, in a
+        // section of its own, after the executor's preparation
+        let at = |text: &str| {
+            log.find(text)
+                .unwrap_or_else(|| panic!("no {:?} in\n{}", text, log))
+        };
+        let prepared = at(":prepare_executor\r");
+        let sources_start = at(":get_sources\r");
+        let sources_end = log.rfind(":get_sources\r").unwrap();
+        let containers = at(":prepare_containers\r");
+        let service = at("Starting service");
+        assert!(prepared < sources_start, "{}", log);
+        assert!(sources_start < sources_end, "{}", log);
+        assert!(sources_end < containers && containers < service, "{}", log);
         assert!(leftovers(job_id).await.is_empty());
         executor.cleanup(&j, false).await;
     }
@@ -4269,6 +4500,109 @@ mod tests {
             trace.text(),
             "checkout done\nStarting service a ...\nWaiting for services ...\n"
         );
+    }
+
+    /// Names of the running containers of job `job_id`
+    async fn running(job_id: u64) -> Vec<String> {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        docker
+            .list_containers(
+                false,
+                &std::collections::HashMap::from([(
+                    "name".to_string(),
+                    vec![format!("turboci-job-{}", job_id)],
+                )]),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .flat_map(|container| container.names.unwrap_or_default())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_uploads_read_a_handed_back_workspace_and_containers_go_after() {
+        use std::os::unix::fs::MetadataExt;
+
+        let executor = with_pipeline_images().await;
+        let job_id = 975_000_000 + u64::from(std::process::id());
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            0,
+            serde_json::json!([]),
+            // Root-owned and unreadable for anyone else, and a process that
+            // would go on writing
+            &[
+                "mkdir -m 700 secret && echo s > secret/file && chmod 600 secret/file",
+                "(i=0; while :; do i=$((i+1)); echo $i > late; sleep 0.1; done) &",
+            ],
+        );
+        let job_dir = executor.job_dir(&j);
+        // The runner's user owns the workspace; as root, uid 1000 plays it
+        let owner = std::fs::metadata(&job_dir).unwrap().uid();
+        let (uid, gid) = if owner == 0 {
+            for entry in walkdir::WalkDir::new(&job_dir) {
+                std::os::unix::fs::chown(entry.unwrap().path(), Some(1000), Some(1000)).unwrap();
+            }
+            (1000, 1000)
+        } else {
+            let meta = std::fs::metadata(&job_dir).unwrap();
+            (meta.uid(), meta.gid())
+        };
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let (outcome, mut teardown) = executor.execute_deferred(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        // Until the teardown, the job container idles and the helper and
+        // the service live on
+        assert_eq!(
+            running(job_id).await.len(),
+            3,
+            "{:?}",
+            leftovers(job_id).await
+        );
+
+        teardown.prepare_uploads().await;
+        // The job is stopped, and all of its files belong to the owner
+        assert_eq!(
+            running(job_id).await.len(),
+            2,
+            "{:?}",
+            running(job_id).await
+        );
+        let late = std::fs::read_to_string(job_dir.join("project/late")).unwrap();
+        for entry in walkdir::WalkDir::new(&job_dir) {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (uid, gid),
+                "{}",
+                entry.path().display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_to_string(job_dir.join("project/late")).unwrap(),
+            late,
+            "the job's process still runs"
+        );
+
+        teardown.finish().await;
+        assert!(leftovers(job_id).await.is_empty());
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        assert!(docker
+            .inspect_network(&format!("turboci-job-{}", job_id))
+            .await
+            .is_err());
+        executor.cleanup(&j, false).await;
+        assert!(!job_dir.exists());
     }
 
     #[tokio::test]
