@@ -3955,7 +3955,9 @@ mod tests {
     /// Runs the audit's Docker jobs (a noop job, a job next to a redis
     /// service, a job next to redis and postgres, a job writing 2000 small
     /// files to its cache, a job saving a cache and uploading artifacts, a
-    /// job uploading its untracked files) BENCH_RUNS times each (default 10,
+    /// job uploading its untracked files, a job next to redis restoring a
+    /// cache and the artifacts of three earlier jobs, each download taking
+    /// BENCH_ARTIFACT_DELAY_MS, default 150) BENCH_RUNS times each (default 10,
     /// after one warm-up) through the whole daemon against a mock GitLab, and
     /// prints the median and 90th percentile of every phase. Run it as a user
     /// other than root, as the runner runs in production, so jobs leave files
@@ -3975,7 +3977,7 @@ mod tests {
         let pull_policy =
             std::env::var("BENCH_PULL_POLICY").unwrap_or_else(|_| "if-not-present".to_string());
         let selected: Vec<String> = std::env::var("BENCH_WORKLOADS")
-            .unwrap_or_else(|_| "noop,service,services,cache,uploads,untracked".to_string())
+            .unwrap_or_else(|_| "noop,service,services,cache,uploads,untracked,restore".to_string())
             .split(',')
             .map(|name| name.trim().to_string())
             .collect();
@@ -4004,6 +4006,40 @@ mod tests {
             state_dir: dir.path().to_string_lossy().into_owned(),
             ..config::RunnerConfig::default()
         };
+        // Artifacts of earlier jobs: 3 archives of 200 small files each,
+        // every download delayed like a round trip to a remote GitLab
+        let artifact_delay = std::env::var("BENCH_ARTIFACT_DELAY_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or(150);
+        let mut dependencies = Vec::new();
+        for dep in 1..=3u64 {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for i in 0..200 {
+                zip.start_file(
+                    format!("dep{}/f{}.txt", dep, i),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+                std::io::Write::write_all(&mut zip, format!("{} {}\n", dep, i).as_bytes()).unwrap();
+            }
+            let archive = zip.finish().unwrap().into_inner();
+            let id = 980_000 + dep;
+            dependencies.push(serde_json::json!({
+                "id": id, "name": format!("build-{}", dep), "token": "dep-token",
+                "artifacts_file": {"filename": "artifacts.zip", "size": archive.len()}
+            }));
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v4/jobs/{}/artifacts", id)))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(archive)
+                        .set_delay(Duration::from_millis(artifact_delay)),
+                )
+                .mount(&server)
+                .await;
+        }
+        let dependencies = serde_json::Value::Array(dependencies);
         let docker = executor::DockerExecutor::new(config::DockerConfig {
             builds_dir: Some(dir.path().join("builds").to_string_lossy().into_owned()),
             pull_policy,
@@ -4025,6 +4061,13 @@ mod tests {
             while [ $i -lt 500 ]; do echo \"$CI_JOB_ID $i\" > cache/f$i; \
             echo $i > out/a$i; i=$((i+1)); done";
         let untracked_script = "rm -rf out && mkdir out && echo a > out/a && echo b > b.log";
+        // Fails unless the cache (after the warm-up) and the artifacts are there
+        let restore_script = format!(
+            "test -f dep1/f0.txt && test -f dep3/f199.txt && \
+             if [ \"$CI_JOB_ID\" != {} ]; then test -f cache/f1999; else {}; fi",
+            base + 700,
+            cache_script
+        );
         let none = || serde_json::json!([]);
         let workloads: [(
             &str,
@@ -4032,7 +4075,7 @@ mod tests {
             &str,
             serde_json::Value,
             serde_json::Value,
-        ); 7] = [
+        ); 8] = [
             ("noop", none(), "true", none(), none()),
             (
                 "service",
@@ -4084,6 +4127,13 @@ mod tests {
                 none(),
                 serde_json::json!([{"name": "untracked", "untracked": true}]),
             ),
+            (
+                "restore",
+                serde_json::json!([{"name": "redis:7-alpine", "alias": "redis"}]),
+                &restore_script,
+                serde_json::json!([{"key": "bench", "paths": ["cache/"], "policy": "pull-push"}]),
+                none(),
+            ),
         ];
         let mut report = String::new();
         for (index, (name, services, script, cache, artifacts)) in workloads.into_iter().enumerate()
@@ -4100,8 +4150,10 @@ mod tests {
                     "git_info": {"repo_url": "file:///builds/origin.git", "ref": "main", "ref_type": "branch",
                                  "sha": sha, "before_sha": "", "protected": false,
                                  "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]},
-                    // Root in a helper reads the origin of the runner's user
+                    // Root in a helper reads the origin of the runner's user;
+                    // GitLab always sends CI_JOB_ID
                     "variables": [
+                        {"key": "CI_JOB_ID", "value": id.to_string()},
                         {"key": "GIT_CONFIG_COUNT", "value": "1"},
                         {"key": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
                         {"key": "GIT_CONFIG_VALUE_0", "value": "*"}
@@ -4109,6 +4161,7 @@ mod tests {
                     "services": services,
                     "cache": cache,
                     "artifacts": artifacts,
+                    "dependencies": if name == "restore" { dependencies.clone() } else { none() },
                     "steps": [{"name": "script", "when": "on_success", "timeout": 600, "script": [script]}]
                 }))
                 .unwrap()
