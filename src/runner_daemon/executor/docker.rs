@@ -2210,15 +2210,23 @@ impl DockerExecutor {
             .await
     }
 
-    /// Create a bridge network for the job (replacing a leftover one)
+    /// Create a bridge network for the job. Usually the name is free; a
+    /// leftover network of the name (409 Conflict) is removed first.
     async fn create_network(&self, name: &str) -> Result<()> {
+        let request = docker_api::NetworkCreateRequest {
+            name: name.to_string(),
+            driver: Some("bridge".to_string()),
+            labels: Some(self.labels()),
+            check_duplicate: Some(true),
+        };
+        match self.docker.create_network(&request).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.status_code() == Some(409) => {}
+            Err(e) => return Err(e).with_context(|| format!("Failed to create network {}", name)),
+        }
         let _ = self.docker.remove_network(name).await;
         self.docker
-            .create_network(&docker_api::NetworkCreateRequest {
-                name: name.to_string(),
-                driver: Some("bridge".to_string()),
-                labels: Some(self.labels()),
-            })
+            .create_network(&request)
             .await
             .with_context(|| format!("Failed to create network {}", name))?;
         Ok(())
@@ -4768,6 +4776,39 @@ mod tests {
             .into_iter()
             .filter_map(|network| network.name)
             .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_job_network_replaces_a_leftover_one() {
+        let executor = DockerExecutor::new(DockerConfig::default()).unwrap();
+        let name = format!(
+            "turboci-job-{}",
+            970_000_000 + u64::from(std::process::id())
+        );
+        let names = || async {
+            let found = executor
+                .docker
+                .list_networks(&std::collections::HashMap::from([(
+                    "name".to_string(),
+                    vec![name.clone()],
+                )]))
+                .await
+                .unwrap();
+            found
+                .into_iter()
+                .filter_map(|network| network.name)
+                .collect::<Vec<_>>()
+        };
+
+        // A new name, then the same name again as a crashed job's leftover
+        executor.create_network(&name).await.unwrap();
+        executor.create_network(&name).await.unwrap();
+        let found = names().await;
+
+        executor.docker.remove_network(&name).await.unwrap();
+        assert_eq!(found, std::slice::from_ref(&name));
+        assert!(names().await.is_empty());
     }
 
     #[tokio::test]

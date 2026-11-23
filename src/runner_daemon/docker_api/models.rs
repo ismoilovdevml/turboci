@@ -310,6 +310,10 @@ pub struct NetworkCreateRequest {
     pub driver: Option<String>,
     #[serde(rename = "Labels", skip_serializing_if = "Option::is_none")]
     pub labels: Option<HashMap<String, String>>,
+    /// 409 when a network has the name: dockerd before 25 (API 1.44) would
+    /// otherwise create a second one; later ones always check
+    #[serde(rename = "CheckDuplicate", skip_serializing_if = "Option::is_none")]
+    pub check_duplicate: Option<bool>,
 }
 
 /// An entry of `GET /networks`
