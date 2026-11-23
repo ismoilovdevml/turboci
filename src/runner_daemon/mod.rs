@@ -243,6 +243,16 @@ fn project_id(job: &Job) -> u64 {
     job.job_info.as_ref().map_or(0, |info| info.project_id)
 }
 
+/// Whether a cache entry or artifact of `when` is saved after a job that
+/// `succeeded` or not (default: on_success)
+fn wanted(when: Option<&str>, succeeded: bool) -> bool {
+    match when {
+        Some("always") => true,
+        Some("on_failure") => !succeeded,
+        _ => succeeded,
+    }
+}
+
 /// Wait for a free job slot, then ask GitLab for a job.
 ///
 /// The slot is taken before the request, so the runner never accepts more jobs
@@ -1010,6 +1020,7 @@ impl RunnerDaemon {
                     .iter()
                     .any(|c| c.policy == "push" || c.policy == "pull-push");
             let uploads_artifacts = job.artifacts.as_ref().is_some_and(|a| !a.is_empty());
+            let reads = self.upload_reads(&job, &variables, outcome.is_ok());
             if saves_cache {
                 let section = if outcome.is_ok() {
                     "archive_cache"
@@ -1019,13 +1030,20 @@ impl RunnerDaemon {
                 trace
                     .section_start(section, &format!("Saving cache for {} job", result))
                     .await;
-                // The upload reads the workspace on the host, as the runner's user
+                // The upload reads the workspace on the host, as the runner's
+                // user; prepared once for the artifacts too
                 if let Some(teardown) = teardown.as_mut() {
-                    teardown.prepare_uploads().await;
+                    teardown.prepare_uploads(&reads).await;
                 }
                 metrics::timed(
                     metrics::Phase::ArchiveCache,
-                    self.upload_cache(&job, &variables, &mut trace, outcome.is_ok()),
+                    self.upload_cache(
+                        &job,
+                        &variables,
+                        &mut trace,
+                        outcome.is_ok(),
+                        teardown.as_ref(),
+                    ),
                 )
                 .await;
                 trace.section_end(section).await;
@@ -1041,14 +1059,20 @@ impl RunnerDaemon {
                     .await;
                 // The upload reads the workspace on the host, as the runner's user
                 if let Some(teardown) = teardown.as_mut() {
-                    teardown.prepare_uploads().await;
+                    teardown.prepare_uploads(&reads).await;
                 }
                 // An upload failure fails a job that otherwise succeeded (the
                 // next stage would miss its inputs); the job's own failure
                 // takes precedence
                 let uploaded = metrics::timed(
                     metrics::Phase::UploadArtifacts,
-                    self.upload_artifacts(&job, &variables, &mut trace, outcome.is_ok()),
+                    self.upload_artifacts(
+                        &job,
+                        &variables,
+                        &mut trace,
+                        outcome.is_ok(),
+                        teardown.as_ref(),
+                    ),
                 )
                 .await;
                 trace.section_end(section).await;
@@ -1445,6 +1469,44 @@ impl RunnerDaemon {
         Ok(())
     }
 
+    /// What the cache and artifact uploads of `job` read in its project, as
+    /// `upload_cache` and `upload_artifacts` pick the cache entries and
+    /// artifacts by the job's result
+    fn upload_reads(
+        &self,
+        job: &Job,
+        variables: &Variables,
+        succeeded: bool,
+    ) -> executor::UploadReads {
+        let mut patterns = Vec::new();
+        let mut untracked = false;
+        let cache = job.cache.iter().filter(|entry| {
+            self.config.cache_enabled
+                && (entry.policy == "push" || entry.policy == "pull-push")
+                && wanted(entry.when.as_deref(), succeeded)
+        });
+        for entry in cache {
+            patterns.extend(
+                entry
+                    .paths
+                    .iter()
+                    .map(|path| script::expand(path, variables)),
+            );
+            untracked |= entry.untracked.unwrap_or(false);
+        }
+        let artifacts = job.artifacts.iter().flatten();
+        for artifact in artifacts.filter(|artifact| wanted(artifact.when.as_deref(), succeeded)) {
+            patterns.extend(
+                artifact
+                    .paths
+                    .iter()
+                    .map(|path| script::expand(path, variables)),
+            );
+            untracked |= artifact.untracked;
+        }
+        executor::UploadReads::new(self.project_dir(job), patterns, untracked)
+    }
+
     /// Upload artifacts whose `when` matches the job result (default: on_success)
     async fn upload_artifacts(
         &self,
@@ -1452,6 +1514,7 @@ impl RunnerDaemon {
         variables: &Variables,
         trace: &mut TraceWriter<'_>,
         succeeded: bool,
+        teardown: Option<&executor::Teardown>,
     ) -> JobOutcome {
         let Some(ref job_artifacts) = job.artifacts else {
             return Ok(());
@@ -1460,7 +1523,12 @@ impl RunnerDaemon {
         let cancel = trace.cancel();
         // Paths, exclude patterns and names may use `variables`
         let untracked = self
-            .untracked_if_needed(job, job_artifacts.iter().any(|a| a.untracked), trace)
+            .untracked_if_needed(
+                job,
+                job_artifacts.iter().any(|a| a.untracked),
+                trace,
+                teardown,
+            )
             .await;
         let expand_all = |items: &[String]| -> Vec<String> {
             items
@@ -1487,16 +1555,11 @@ impl RunnerDaemon {
         };
 
         for artifact in job_artifacts {
-            let wanted = match artifact.when.as_deref() {
-                Some("always") => true,
-                Some("on_failure") => !succeeded,
-                _ => succeeded,
-            };
             let mut paths = expand_all(&artifact.paths);
             if artifact.untracked {
                 paths.extend(untracked.iter().cloned());
             }
-            if !wanted || paths.is_empty() {
+            if !wanted(artifact.when.as_deref(), succeeded) || paths.is_empty() {
                 continue;
             }
             let name = artifact
@@ -1595,11 +1658,12 @@ impl RunnerDaemon {
         job: &Job,
         wanted: bool,
         trace: &mut TraceWriter<'_>,
+        teardown: Option<&executor::Teardown>,
     ) -> Vec<String> {
         if !wanted {
             return Vec::new();
         }
-        match self.executor.untracked_files(job).await {
+        match self.executor.untracked_files(job, teardown).await {
             // File names are matched literally, not as glob patterns
             Ok(files) => files.iter().map(|f| glob::Pattern::escape(f)).collect(),
             Err(e) => {
@@ -1621,6 +1685,7 @@ impl RunnerDaemon {
         variables: &Variables,
         trace: &mut TraceWriter<'_>,
         succeeded: bool,
+        teardown: Option<&executor::Teardown>,
     ) {
         if !self.config.cache_enabled {
             return;
@@ -1631,14 +1696,11 @@ impl RunnerDaemon {
             .cache
             .iter()
             .any(|entry| entry.untracked.unwrap_or(false));
-        let untracked = self.untracked_if_needed(job, wants_untracked, trace).await;
+        let untracked = self
+            .untracked_if_needed(job, wants_untracked, trace, teardown)
+            .await;
 
         for cache_entry in &job.cache {
-            let wanted = match cache_entry.when.as_deref() {
-                Some("always") => true,
-                Some("on_failure") => !succeeded,
-                _ => succeeded,
-            };
             let mut paths: Vec<String> = cache_entry
                 .paths
                 .iter()
@@ -1647,7 +1709,7 @@ impl RunnerDaemon {
             if cache_entry.untracked.unwrap_or(false) {
                 paths.extend(untracked.iter().cloned());
             }
-            if !wanted
+            if !wanted(cache_entry.when.as_deref(), succeeded)
                 || paths.is_empty()
                 || (cache_entry.policy != "push" && cache_entry.policy != "pull-push")
             {

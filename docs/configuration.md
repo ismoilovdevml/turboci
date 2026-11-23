@@ -642,7 +642,10 @@ CA for dockerd and writes `registry_ca`. `--insecure-registry HOST` writes
 `insecure_registries`; `daemon.json` is left to you.
 
 Files that jobs create in the workspace belong to root in the container; the
-runner hands them back to its own user after every job.
+runner hands them back to its own user after every job. Cache and artifacts
+are read before that, as the runner's user: when their paths hold a file or
+directory that user cannot read (say a `chmod 600` file of root), the
+workspace is handed back first.
 
 !!! warning "The docker group is root-equivalent"
     The `turboci` user is in the `docker` group, which can start privileged

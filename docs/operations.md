@@ -185,7 +185,7 @@ Histogram buckets are 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300 and
 | `setup_wait` | Docker: waiting for the job container and services after getting sources |
 | `restore_cache`, `download_artifacts` | Their log sections |
 | `script`, `after_script` | The script steps (`before_script` and `script`) and `after_script` |
-| `ownership` | Docker: stopping the job container and giving its files to the runner's user before cache and artifacts are read |
+| `ownership` | Docker: stopping the job container before cache and artifacts are read, and checking that the runner's user can read what they need; only when it cannot are the job's files given to that user here, otherwise in the `teardown` |
 | `archive_cache`, `upload_artifacts` | Saving the cache, uploading artifacts |
 | `cleanup` | Removing the job's file variables |
 | `upload_trace` | Sending the rest of the log to GitLab |

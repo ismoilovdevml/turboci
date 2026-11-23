@@ -24,9 +24,11 @@ use crate::gitlab::{FailureReason, Job, RemoteState};
 
 mod docker;
 mod shell;
+mod uploads;
 
 pub use docker::DockerExecutor;
 pub use shell::ShellExecutor;
+pub use uploads::UploadReads;
 
 /// Used when GitLab sends no job timeout
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -220,13 +222,21 @@ impl ExecutorType {
 
     /// Files in the checked-out project that git does not track (including
     /// ignored ones), relative to the project, for `artifacts:untracked` and
-    /// `cache:untracked`
-    pub async fn untracked_files(&self, job: &Job) -> Result<Vec<String>> {
+    /// `cache:untracked`. Docker lists them in the sources helper the job's
+    /// `teardown` still holds, if any.
+    pub async fn untracked_files(
+        &self,
+        job: &Job,
+        teardown: Option<&Teardown>,
+    ) -> Result<Vec<String>> {
         let subdir = script::project_subdir(job).unwrap_or_else(|_| "project".to_string());
         let job_dir = self.job_dir(job);
         let output = match self {
             ExecutorType::Docker(executor) => {
-                executor.untracked_files(job.id, &job_dir, &subdir).await?
+                let helper = teardown.and_then(|teardown| teardown.0.as_ref()?.helper());
+                executor
+                    .untracked_files(job.id, &job_dir, &subdir, helper)
+                    .await?
             }
             ExecutorType::Shell(executor) => {
                 executor.untracked_files(&job_dir.join(&subdir)).await?
@@ -330,11 +340,12 @@ pub struct Teardown(Option<docker::Leftovers>);
 
 impl Teardown {
     /// Stop everything of the job that could still write to the workspace
-    /// and give the workspace to the runner's user, so cache and artifacts
-    /// can be read; `finish` does it when this was not called
-    pub async fn prepare_uploads(&mut self) {
+    /// and, unless the runner's user can read all that `reads` needs as it
+    /// is, give the workspace to that user, so cache and artifacts can be
+    /// read; `finish` does what this did not
+    pub async fn prepare_uploads(&mut self, reads: &UploadReads) {
         if let Some(left) = &mut self.0 {
-            metrics::timed(Phase::Ownership, left.prepare_uploads()).await;
+            metrics::timed(Phase::Ownership, left.prepare_uploads(reads)).await;
         }
     }
 
@@ -1618,7 +1629,7 @@ mod tests {
         std::fs::write(project.join("new.txt"), "n").unwrap();
 
         let j = job(serde_json::json!({"id": 17, "token": "t"}));
-        let files = executor.untracked_files(&j).await.unwrap();
+        let files = executor.untracked_files(&j, None).await.unwrap();
 
         assert!(files.contains(&"new.txt".to_string()), "{:?}", files);
         assert!(!marker.exists(), "the job's core.fsmonitor command ran");

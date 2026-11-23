@@ -898,17 +898,27 @@ impl DockerExecutor {
         std::collections::HashMap::from([(OWNER_LABEL.to_string(), self.owner.clone())])
     }
 
-    /// Remove containers and networks this runner left behind (crash, kill,
-    /// power loss); other runners on the same Docker host are not touched
-    /// `git ls-files --others -z` of the project, run by a helper container as
-    /// the workspace's owner
+    /// `git ls-files --others -z` of the project as the workspace's owner:
+    /// an exec in the job's sources `helper` when there is one, else a
+    /// helper container of its own
     pub(super) async fn untracked_files(
         &self,
         job_id: u64,
         job_dir: &Path,
         subdir: &str,
+        helper: Option<&str>,
     ) -> Result<String> {
         let dir = format!("/builds/{}", subdir);
+        if let Some(helper) = helper {
+            let user = workspace_owner(job_dir).await;
+            match self.untracked_in(helper, &dir, user.as_deref()).await {
+                Ok(files) => return Ok(files),
+                Err(e) => warn!(
+                    "Listing untracked files in the sources helper failed, trying a new container: {:#}",
+                    e
+                ),
+            }
+        }
         let script = format!(
             "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c safe.directory={dir} {} -C {dir} ls-files --others -z",
             NO_REPO_COMMANDS.join(" "),
@@ -929,6 +939,68 @@ impl DockerExecutor {
         .await
     }
 
+    /// `git ls-files --others -z` of `dir` by an exec in the running
+    /// `helper` as `user` (the container's when `None`). The helper was
+    /// started with the job's variables: git gets a clean environment
+    /// instead, as a helper container of its own would have.
+    async fn untracked_in(&self, helper: &str, dir: &str, user: Option<&str>) -> Result<String> {
+        const PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        let safe_directory = format!("safe.directory={}", dir);
+        let mut cmd = vec![
+            "env",
+            "-i",
+            PATH,
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "git",
+            "-c",
+            &safe_directory,
+        ];
+        cmd.extend(NO_REPO_COMMANDS);
+        cmd.extend(["-C", dir, "ls-files", "--others", "-z"]);
+        let exec = self
+            .docker
+            .create_exec(
+                helper,
+                &ExecConfig {
+                    cmd: Some(cmd),
+                    env: Some(vec![PATH]),
+                    user,
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let run = async {
+            let mut output = self.docker.start_exec(&exec.id).await?;
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            while let Some(chunk) = output.next().await {
+                match chunk? {
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        stdout.extend_from_slice(&message)
+                    }
+                    LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
+                    LogOutput::StdIn { .. } => {}
+                }
+            }
+            let code = self.docker.inspect_exec(&exec.id).await?.exit_code;
+            if code != Some(0) {
+                anyhow::bail!(
+                    "git exited with {:?}: {}",
+                    code,
+                    String::from_utf8_lossy(&stderr).trim()
+                );
+            }
+            Ok(String::from_utf8_lossy(&stdout).into_owned())
+        };
+        tokio::time::timeout(CLEANUP_TIMEOUT, run)
+            .await
+            .context("timed out")?
+    }
+
+    /// Remove containers and networks this runner left behind (crash, kill,
+    /// power loss); other runners on the same Docker host are not touched
     pub async fn sweep_orphans(&self) {
         let filter = std::collections::HashMap::from([(
             "label".to_string(),
@@ -2351,13 +2423,21 @@ impl DockerExecutor {
         Ok(response.id)
     }
 
-    /// Stop what of the job could still change the workspace and give the
-    /// workspace back to its owner, the runner's user (files created in
-    /// containers belong to root), so the runner can read and remove them.
-    /// The job container is killed, not removed: removing it, its volumes
-    /// (a docker:dind's images) and the other containers can wait until the
-    /// job has been reported (see `Leftovers::finish`).
-    async fn settle(&self, job_id: u64, job_dir: &Path, containers: &mut JobContainers) -> Settled {
+    /// Stop what of the job could still change the workspace and, unless the
+    /// runner's user can read what the uploads need (`reads`) as it is, give
+    /// the workspace back to its owner, the runner's user (files created in
+    /// containers belong to root), so the runner can read them. The job
+    /// container is killed, not removed: removing it, its volumes (a
+    /// docker:dind's images) and the other containers, and a hand-back left
+    /// for later, can wait until the job has been reported (see
+    /// `Leftovers::finish`).
+    async fn settle(
+        &self,
+        job_id: u64,
+        job_dir: &Path,
+        containers: &mut JobContainers,
+        reads: &UploadReads,
+    ) -> Settled {
         // The job's containers may have changed anything
         self.clean_workspaces.forget(job_dir);
         if containers.run.job.is_none() && containers.helper.is_none() {
@@ -2375,6 +2455,13 @@ impl DockerExecutor {
                     }
                 }
             }
+        }
+        if uploads_can_read(job_dir, reads).await {
+            tracing::debug!(
+                "Job #{}: the uploads can read the workspace, handed back after the report",
+                job_id
+            );
+            return Settled::Stopped;
         }
         self.hand_back(job_id, job_dir, containers.helper.as_deref(), false)
             .await
@@ -2561,6 +2648,10 @@ impl DockerExecutor {
 enum Settled {
     /// No container of the job ran: nothing in it changed
     Untouched,
+    /// Nothing of the job runs any more, and the runner's user can read
+    /// what the uploads need: handing the workspace back is left to
+    /// `Leftovers::finish`
+    Stopped,
     /// Everything belongs to the workspace's owner, as `stamp` shows it,
     /// and nothing of the job runs any more
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -2582,16 +2673,22 @@ pub struct Leftovers {
 }
 
 impl Leftovers {
-    /// Stop the job's container and give the workspace to the runner's
-    /// user, so cache and artifacts can be read and the workspace removed
-    pub(super) async fn prepare_uploads(&mut self) {
+    /// Stop the job's container and, unless the runner's user can read what
+    /// the uploads need (`reads`) as it is, give the workspace to that
+    /// user, so cache and artifacts can be read
+    pub(super) async fn prepare_uploads(&mut self, reads: &UploadReads) {
         if self.settled.is_none() {
             let settled = self
                 .executor
-                .settle(self.job_id, &self.job_dir, &mut self.containers)
+                .settle(self.job_id, &self.job_dir, &mut self.containers, reads)
                 .await;
             self.settled = Some(settled);
         }
+    }
+
+    /// The job's sources helper, which runs until `finish`
+    pub(super) fn helper(&self) -> Option<&str> {
+        self.containers.helper.as_deref()
     }
 
     /// Remove the containers, the network and the job container's volumes,
@@ -2601,12 +2698,13 @@ impl Leftovers {
     /// checkout (see `CleanWorkspaces`).
     pub(super) async fn finish(mut self) {
         let executor = self.executor.clone();
-        let all_removed = if self.settled.is_some() {
+        let all_removed = if !matches!(self.settled, None | Some(Settled::Stopped)) {
             executor.remove(&self.containers).await
         } else {
-            // Without uploads, the job container and the services are
-            // removed first, which stops the job; the helper stays for
-            // handing the workspace back, should a walk find it needed
+            // Without uploads, or with uploads that did not need it, the
+            // job container and the services are removed first, which
+            // stops the job; the helper stays for handing the workspace
+            // back, should a walk find it needed
             executor.clean_workspaces.forget(&self.job_dir);
             let containers = &self.containers;
             let touched = containers.run.job.is_some() || containers.helper.is_some();
@@ -2625,14 +2723,23 @@ impl Leftovers {
                     ..RunContainers::default()
                 },
             };
-            let removed = executor.remove(&job).await;
-            self.settled = Some(if touched {
-                executor
-                    .hand_back(self.job_id, &self.job_dir, rest.helper.as_deref(), true)
-                    .await
+            let hand_back =
+                executor.hand_back(self.job_id, &self.job_dir, rest.helper.as_deref(), true);
+            let removed = if self.settled == Some(Settled::Stopped) {
+                // The job container is stopped already (services do not
+                // mount the workspace): hand back while they are removed
+                let (removed, settled) = tokio::join!(executor.remove(&job), hand_back);
+                self.settled = Some(settled);
+                removed
             } else {
-                Settled::Untouched
-            });
+                let removed = executor.remove(&job).await;
+                self.settled = Some(if touched {
+                    hand_back.await
+                } else {
+                    Settled::Untouched
+                });
+                removed
+            };
             executor.remove(&rest).await && removed
         };
         #[cfg(unix)]
@@ -2675,6 +2782,25 @@ fn owned_by_others(dir: &Path, uid: u32, gid: u32) -> bool {
             .and_then(|entry| entry.metadata())
             .map_or(true, |meta| meta.uid() != uid || meta.gid() != gid)
     })
+}
+
+/// Whether the runner's process (`reads.reader`) and git listing untracked
+/// files (as the workspace's owner) can read what the uploads need in
+/// `job_dir` as it is (see `uploads::readable`), off the async runtime
+async fn uploads_can_read(job_dir: &Path, reads: &UploadReads) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let git = match tokio::fs::metadata(job_dir).await {
+        Ok(meta) => uploads::Reader {
+            uid: meta.uid(),
+            groups: vec![meta.gid()],
+        },
+        Err(_) => return false,
+    };
+    let (job_dir, reads) = (job_dir.to_path_buf(), reads.clone());
+    tokio::task::spawn_blocking(move || uploads::readable(&job_dir, &reads, Some(&git)))
+        .await
+        .unwrap_or(false)
 }
 
 /// Kill and remove a container with its anonymous volumes; one that is
@@ -4629,6 +4755,7 @@ mod tests {
             ],
         );
         let job_dir = executor.job_dir(&j);
+        let project = job_dir.join("project");
         // The runner's user owns the workspace; as root, uid 1000 plays it
         let owner = std::fs::metadata(&job_dir).unwrap().uid();
         let (uid, gid) = if owner == 0 {
@@ -4656,7 +4783,14 @@ mod tests {
             leftovers(job_id).await
         );
 
-        teardown.prepare_uploads().await;
+        // The artifacts would hold secret/, which the owner cannot read
+        teardown
+            .prepare_uploads(&reads_as(&project, &["secret/"], (uid, gid)))
+            .await;
+        assert!(matches!(
+            teardown.0.as_ref().unwrap().settled,
+            Some(Settled::Owned(_))
+        ));
         // The job is stopped, and all of its files belong to the owner
         assert_eq!(
             running(job_id).await.len(),
@@ -4664,6 +4798,7 @@ mod tests {
             "{:?}",
             running(job_id).await
         );
+        assert!(archived_as(&project, "secret", (uid, gid)));
         let late = std::fs::read_to_string(job_dir.join("project/late")).unwrap();
         for entry in walkdir::WalkDir::new(&job_dir) {
             let entry = entry.unwrap();
@@ -4689,6 +4824,121 @@ mod tests {
             .inspect_network(&format!("turboci-job-{}", job_id))
             .await
             .is_err());
+        executor.cleanup(&j, false).await;
+        assert!(!job_dir.exists());
+    }
+
+    /// Uploads of `patterns` in `project`, read by `uid:gid`
+    fn reads_as(project: &Path, patterns: &[&str], (uid, gid): (u32, u32)) -> UploadReads {
+        let mut reads = UploadReads::new(
+            project.to_path_buf(),
+            patterns.iter().map(|p| p.to_string()).collect(),
+            false,
+        );
+        reads.reader = uploads::Reader {
+            uid,
+            groups: vec![gid],
+        };
+        reads
+    }
+
+    /// Whether `uid:gid` can archive `path` in `project`, as the uploads
+    /// would (as root, a tar run as that user tells)
+    fn archived_as(project: &Path, path: &str, (uid, gid): (u32, u32)) -> bool {
+        use std::os::unix::process::CommandExt;
+
+        let mut tar = std::process::Command::new("tar");
+        tar.arg("-cf")
+            .arg("/dev/null")
+            .arg("-C")
+            .arg(project)
+            .arg(path);
+        if rustix::process::geteuid().is_root() {
+            tar.uid(uid).gid(gid);
+        }
+        tar.status().unwrap().success()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_uploads_read_a_readable_workspace_before_it_is_handed_back() {
+        use std::os::unix::fs::MetadataExt;
+
+        let executor = with_pipeline_images().await;
+        let job_id = 976_000_000 + u64::from(std::process::id());
+        // As root, with the image's umask: 0644 files, 0755 directories
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            0,
+            serde_json::json!([]),
+            &["mkdir -p out/sub cache && echo a > out/sub/a && echo c > cache/c"],
+        );
+        let job_dir = executor.job_dir(&j);
+        // The runner's user owns the workspace; as root, uid 1000 plays it
+        let owner = std::fs::metadata(&job_dir).unwrap();
+        let (uid, gid) = if owner.uid() == 0 {
+            for entry in walkdir::WalkDir::new(&job_dir) {
+                std::os::unix::fs::chown(entry.unwrap().path(), Some(1000), Some(1000)).unwrap();
+            }
+            (1000, 1000)
+        } else {
+            (owner.uid(), owner.gid())
+        };
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+        let (outcome, mut teardown) = executor.execute_deferred(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, trace.text());
+
+        let project = job_dir.join("project");
+        let mut reads = reads_as(&project, &["out/", "cache/*"], (uid, gid));
+        reads.untracked = true;
+        teardown.prepare_uploads(&reads).await;
+        assert!(matches!(
+            teardown.0.as_ref().unwrap().settled,
+            Some(Settled::Stopped)
+        ));
+        // The job container is stopped, the helper and the service run
+        assert_eq!(running(job_id).await.len(), 2);
+        // Nothing was handed back: the job's files still belong to root
+        let created = std::fs::metadata(job_dir.join("project/out/sub/a")).unwrap();
+        assert_eq!((created.uid(), created.gid()), (0, 0));
+        assert!(archived_as(&project, "out", (uid, gid)));
+        assert!(archived_as(&project, "cache", (uid, gid)));
+        // git in the sources helper lists the untracked files
+        let ExecutorType::Docker(docker) = &executor else {
+            unreachable!()
+        };
+        let helper = teardown.0.as_ref().unwrap().helper().unwrap().to_string();
+        let listed = docker
+            .untracked_in(
+                &helper,
+                "/builds/project",
+                Some(&format!("{}:{}", uid, gid)),
+            )
+            .await
+            .unwrap();
+        let mut listed: Vec<&str> = listed.split('\0').filter(|f| !f.is_empty()).collect();
+        listed.sort();
+        assert_eq!(listed, ["cache/c", "out/sub/a"]);
+        let files = executor.untracked_files(&j, Some(&teardown)).await.unwrap();
+        assert_eq!(files.len(), 2, "{:?}", files);
+
+        // After the report, the workspace is handed back and the containers go
+        teardown.finish().await;
+        assert!(leftovers(job_id).await.is_empty());
+        for entry in walkdir::WalkDir::new(&job_dir) {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (uid, gid),
+                "{}",
+                entry.path().display()
+            );
+        }
         executor.cleanup(&j, false).await;
         assert!(!job_dir.exists());
     }
@@ -4743,7 +4993,7 @@ mod tests {
         );
 
         let j = job(serde_json::json!({"id": job_id, "token": "t"}));
-        let files = executor.untracked_files(&j).await.unwrap();
+        let files = executor.untracked_files(&j, None).await.unwrap();
 
         let ran = project.join("fsmonitor-ran").exists();
         executor.cleanup(&j, false).await;
