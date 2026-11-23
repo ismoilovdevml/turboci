@@ -1355,7 +1355,9 @@ fn collect_paths(
 
         let full_pattern = root.join(pattern_path);
         for entry in glob::glob(&full_pattern.to_string_lossy())? {
-            let path = entry?;
+            // Without a trailing `/` or `/.` (which `etc//` or `etc/.` match
+            // with), so a symlink is looked at, not the directory it points to
+            let path: PathBuf = entry?.components().collect();
             if !is_inside_workspace(&path, &root_canon, &mut inside) {
                 warn!("Skipping {:?}: resolves outside of workspace", path);
                 continue;
@@ -2660,6 +2662,42 @@ mod tests {
         .unwrap();
 
         assert!(data.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_does_not_follow_a_symlink_through_a_trailing_separator_or_dot() {
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("config.toml"), b"runner-token").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("etc")).unwrap();
+        let ws_path = ws.path().to_str().unwrap();
+
+        for pattern in ["etc//", "etc/.", "etc/./", "./etc//"] {
+            let paths = [pattern.to_string()];
+            let artifact = create_archive(ws_path, &paths, &[], "zip", staging().path())
+                .await
+                .unwrap()
+                .map(bytes);
+            let cache = create_cache_archive(ws_path, &paths, staging().path())
+                .await
+                .unwrap()
+                .map(bytes);
+            let mut names = artifact.map(|data| zip_names(&data)).unwrap_or_default();
+            names.extend(
+                cache
+                    .map(|data| tar_entries(&data))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|entry| entry.name),
+            );
+            assert!(
+                names.iter().all(|name| !name.contains("config.toml")),
+                "{} read the symlink's target: {:?}",
+                pattern,
+                names
+            );
+        }
     }
 
     /// Synthetic node_modules-like tree: ~15k small files in nested
