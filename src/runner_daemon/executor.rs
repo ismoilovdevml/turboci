@@ -942,16 +942,13 @@ async fn checkout(
         .await;
 
     // Like gitlab-runner: skip LFS objects during checkout, then pull them if
-    // git-lfs is available and the pipeline did not opt out
+    // git-lfs is available, the pipeline did not opt out and the commit was
+    // checked out (with GIT_CHECKOUT=false `git lfs pull` fails)
     let lfs = if matches!(strategy, GitStrategy::Fetch | GitStrategy::Clone)
+        && git::checks_out(&job.variables)
         && variable_value(job, "GIT_LFS_SKIP_SMUDGE") != Some("1")
     {
-        let dest = script::quote(&dirs.project);
-        let safe = script::quote(&format!("safe.directory={}", dirs.project));
-        format!(
-            "if git lfs version >/dev/null 2>&1 && [ -d {dest}/.git ]; then \
-             git -c {safe} -C {dest} lfs pull; fi\n"
-        )
+        git::lfs_pull_script(&dirs.project)
     } else {
         String::new()
     };
@@ -1670,6 +1667,71 @@ mod tests {
 
         assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
         assert!(log.contains("version=2.0.0"), "{}", log);
+    }
+
+    #[tokio::test]
+    async fn lfs_objects_are_pulled_after_a_checkout_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&origin)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+        std::fs::write(origin.join("a.bin"), "pointer\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "lfs"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        // A git-lfs that fails its pull like the real one does without a
+        // checkout, and says so
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let fake = bin.join("git-lfs");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n[ \"$1\" = version ] && exit 0\necho lfs-pull-ran; exit 2\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let with = |id: u64, checkout: &str| {
+            job(serde_json::json!({
+                "id": id, "token": "t",
+                "git_info": {
+                    "repo_url": format!("file://{}", origin.display()), "ref": "main",
+                    "ref_type": "branch", "sha": sha, "before_sha": "",
+                    "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]
+                },
+                "variables": [
+                    {"key": "PATH", "value": path},
+                    {"key": "GIT_CHECKOUT", "value": checkout}
+                ],
+                "steps": steps(&["echo script-ran"], &[])
+            }))
+        };
+
+        let (outcome, log) = run_shell(&with(23, "false"), dir.path()).await;
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(!log.contains("lfs-pull-ran"), "{}", log);
+
+        let (outcome, log) = run_shell(&with(24, "true"), dir.path()).await;
+        assert!(outcome.is_err(), "{}", log);
+        assert!(log.contains("lfs-pull-ran"), "{}", log);
     }
 
     #[tokio::test]

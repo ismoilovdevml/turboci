@@ -60,6 +60,34 @@ fn submodule_strategy(variables: &[Variable]) -> SubmoduleStrategy {
     }
 }
 
+/// Whether the fetched commit is checked out: GIT_CHECKOUT=false fetches
+/// without checking out, as in gitlab-runner
+pub fn checks_out(variables: &[Variable]) -> bool {
+    variable(variables, "GIT_CHECKOUT") != Some("false")
+}
+
+/// Shell line that pulls the Git LFS objects of the checkout in `dest`, as
+/// gitlab-runner's `git lfs pull` after its checkout, when git-lfs is
+/// installed and a tracked file has the `filter=lfs` attribute. That is what
+/// git-lfs itself goes by: `git lfs pull` leaves a pointer file alone that
+/// no `filter=lfs` covers. `git check-attr` reads every source of attributes
+/// as git does (`.gitattributes` in any directory, `.git/info/attributes`,
+/// the global and system files, macros); for a small repository it takes a
+/// few milliseconds where `git lfs pull` takes 25 or more, and about as long
+/// as it for 20000 files. A path named `lfs` only makes it pull for nothing.
+/// No `grep -q`: with pipefail, check-attr killed by SIGPIPE would fail the
+/// pipeline after a match.
+pub fn lfs_pull_script(dest: &str) -> String {
+    let safe = script::quote(&format!("safe.directory={}", dest));
+    let git = format!("git -c {} -C {}", safe, script::quote(dest));
+    format!(
+        "if git lfs version >/dev/null 2>&1 && [ -d {dest}/.git ] && \
+         {git} ls-files -z | {git} check-attr -z --stdin filter | tr '\\000' '\\n' | \
+         grep -x lfs >/dev/null; then {git} lfs pull; fi\n",
+        dest = script::quote(dest),
+    )
+}
+
 /// `GIT_DEPTH` overrides the project setting sent in `git_info.depth`; 0 means full history
 fn depth(git_info: &GitInfo, variables: &[Variable]) -> u32 {
     variable(variables, "GIT_DEPTH")
@@ -176,8 +204,7 @@ fn sync_commands(
         git(&["remote", "add", "origin", &git_info.repo_url]),
         fetch,
     ]);
-    // GIT_CHECKOUT=false fetches without checking out, as in gitlab-runner
-    if variable(variables, "GIT_CHECKOUT") != Some("false") {
+    if checks_out(variables) {
         commands.push(git(&["checkout", "-q", "-f", &git_info.sha]));
         let flags = variable(variables, "GIT_CLEAN_FLAGS").unwrap_or("-ffdx");
         if existing && flags != "none" {
@@ -661,6 +688,108 @@ mod tests {
         let none = [var("GIT_CLEAN_FLAGS", "none")];
         let cmds = update_commands(&info, &none, "/w").unwrap();
         assert!(!cmds.iter().any(|c| c.contains(&"clean".to_string())));
+    }
+
+    /// Whether `lfs_pull_script` pulls in a repository of `files` (path,
+    /// content, all committed), with `info` as its `.git/info/attributes`;
+    /// a fake git-lfs records the pull
+    fn pulls_lfs(files: &[(&str, &str)], info: Option<&str>) -> bool {
+        let root = tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let marker = root.path().join("pulled");
+        let fake = bin.join("git-lfs");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in version) ;; pull) touch '{}' ;; *) exit 1 ;; esac\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let repo = root.path().join("project");
+        std::fs::create_dir(&repo).unwrap();
+        run(&repo, &["init", "-q"]);
+        for (path, content) in files {
+            let file = repo.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, content).unwrap();
+        }
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-q", "-m", "files"]);
+        if let Some(info) = info {
+            std::fs::write(repo.join(".git/info/attributes"), info).unwrap();
+        }
+        // bash, so pipefail is on as in jobs whose image has it
+        let shell = if Path::new("/bin/bash").exists() {
+            "/bin/bash"
+        } else {
+            "sh"
+        };
+        let script = format!(
+            "set -e\n(set -o pipefail) 2>/dev/null && set -o pipefail\n{}",
+            lfs_pull_script(repo.to_str().unwrap())
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let out = Command::new(shell)
+            .arg("-c")
+            .arg(script)
+            .env("PATH", path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("XDG_CONFIG_HOME", root.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{:?}", out);
+        marker.exists()
+    }
+
+    #[test]
+    fn lfs_objects_are_pulled_only_when_a_tracked_file_uses_the_lfs_filter() {
+        let lfs = "*.bin filter=lfs diff=lfs merge=lfs -text\n";
+        // Nested attributes count, as for git
+        assert!(pulls_lfs(
+            &[
+                ("README", "r"),
+                ("assets/.gitattributes", lfs),
+                ("assets/a.bin", "p")
+            ],
+            None
+        ));
+        // Through a macro, or the repository's info/attributes
+        assert!(pulls_lfs(
+            &[
+                (".gitattributes", "[attr]big filter=lfs\n*.bin big\n"),
+                ("a.bin", "p")
+            ],
+            None
+        ));
+        assert!(pulls_lfs(&[("a.bin", "p")], Some(lfs)));
+        // No tracked file matches, other attributes, or none at all
+        assert!(!pulls_lfs(
+            &[("assets/.gitattributes", lfs), ("README", "r")],
+            None
+        ));
+        assert!(!pulls_lfs(
+            &[(".gitattributes", "*.txt text\n"), ("a.txt", "t")],
+            None
+        ));
+        assert!(!pulls_lfs(&[("README", "r")], None));
+        // A match early in a listing longer than a pipe's buffer: check-attr
+        // dies of SIGPIPE when grep stops reading early, which pipefail
+        // would take for no match
+        let names: Vec<String> = (0..4000)
+            .map(|i| format!("many/file-with-a-long-name-{:05}.txt", i))
+            .collect();
+        let mut files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "x")).collect();
+        files.push((".gitattributes", lfs));
+        files.push(("0.bin", "p"));
+        assert!(pulls_lfs(&files, None));
     }
 
     #[test]
