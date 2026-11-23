@@ -1679,6 +1679,7 @@ mod tests {
                 .args(args)
                 .current_dir(&origin)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
@@ -1717,9 +1718,13 @@ mod tests {
                     "ref_type": "branch", "sha": sha, "before_sha": "",
                     "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]
                 },
+                // CI images set up git-lfs's filter system-wide, which would
+                // run the fake git-lfs as the checkout's smudge filter
                 "variables": [
                     {"key": "PATH", "value": path},
-                    {"key": "GIT_CHECKOUT", "value": checkout}
+                    {"key": "GIT_CHECKOUT", "value": checkout},
+                    {"key": "GIT_CONFIG_NOSYSTEM", "value": "1"},
+                    {"key": "GIT_CONFIG_GLOBAL", "value": "/dev/null"}
                 ],
                 "steps": steps(&["echo script-ran"], &[])
             }))

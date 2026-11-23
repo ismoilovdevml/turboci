@@ -332,10 +332,13 @@ mod tests {
     }
 
     fn run(dir: &Path, args: &[&str]) -> String {
+        // Without the host's git config: CI images set up git-lfs's filter
+        // system-wide, which would turn test files into LFS pointers
         let out = Command::new("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
