@@ -463,9 +463,13 @@ fn service_ports(config: Option<&docker_api::ContainerConfig>) -> Vec<u16> {
 
 /// How long a service may take to accept connections, like gitlab-runner
 const SERVICE_WAIT: Duration = Duration::from_secs(30);
-/// Pause between connection attempts: a service that is ready after 1.1s
-/// must not hold the job until the next full second
+/// Longest pause between connection attempts: a service that is ready after
+/// 1.1s must not hold the job until the next full second
 const SERVICE_POLL: Duration = Duration::from_millis(200);
+/// First pause between connection attempts from the host, doubled after
+/// each attempt up to `SERVICE_POLL`: most services open their ports within
+/// a few hundred milliseconds, and an attempt that is refused costs little
+const SERVICE_FIRST_POLL: Duration = Duration::from_millis(25);
 /// Limit of one connection attempt (like `nc -w1`)
 const SERVICE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -542,12 +546,19 @@ enum HostWait {
     Unreachable,
 }
 
+/// The pause after one of `poll` between connection attempts (see
+/// `SERVICE_FIRST_POLL`)
+fn next_poll(poll: Duration) -> Duration {
+    (poll * 2).min(SERVICE_POLL)
+}
+
 /// Wait from the runner's host until one of `ports` at `ip` accepts
 /// connections (docker:dind exposes 2376 for TLS even when it only listens
 /// on 2375), for up to `timeout`
 async fn wait_from_host(ip: std::net::IpAddr, ports: &[u16], timeout: Duration) -> HostWait {
     let give_up = Instant::now() + timeout;
     let mut first = true;
+    let mut poll = SERVICE_FIRST_POLL;
     loop {
         let probes = futures_util::future::join_all(
             ports
@@ -567,7 +578,8 @@ async fn wait_from_host(ip: std::net::IpAddr, ports: &[u16], timeout: Duration) 
         if Instant::now() >= give_up {
             return HostWait::TimedOut;
         }
-        tokio::time::sleep(SERVICE_POLL).await;
+        tokio::time::sleep(poll).await;
+        poll = next_poll(poll);
     }
 }
 
@@ -2266,26 +2278,27 @@ impl DockerExecutor {
         log: &mut SetupLog<'_, '_>,
         limits: &Limits<'_>,
     ) -> usize {
-        let mut checks = Vec::new();
-        for id in services {
-            let Ok(info) = self.docker.inspect_container(id).await else {
-                continue;
-            };
-            let ports = service_ports(info.config.as_ref());
-            if ports.is_empty() {
-                continue;
-            }
-            checks.push(ServiceCheck {
-                host: info
-                    .name
-                    .as_deref()
-                    .unwrap_or_default()
-                    .trim_start_matches('/')
-                    .to_string(),
-                address: host_reachable_address(&info, network),
-                ports,
-            });
-        }
+        let inspected = futures_util::future::join_all(
+            services.iter().map(|id| self.docker.inspect_container(id)),
+        )
+        .await;
+        let checks: Vec<ServiceCheck> = inspected
+            .into_iter()
+            .filter_map(|info| {
+                let info = info.ok()?;
+                let ports = service_ports(info.config.as_ref());
+                (!ports.is_empty()).then(|| ServiceCheck {
+                    host: info
+                        .name
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim_start_matches('/')
+                        .to_string(),
+                    address: host_reachable_address(&info, network),
+                    ports,
+                })
+            })
+            .collect();
         if checks.is_empty() {
             return 0;
         }
@@ -6031,6 +6044,43 @@ mod tests {
         let state = usage.state();
         assert!(state.held.is_empty());
         assert!(state.last_used["alpine:3.20"] >= before);
+    }
+
+    #[test]
+    fn service_polls_start_short_and_double_up_to_the_longest() {
+        let mut poll = SERVICE_FIRST_POLL;
+        let mut polls = Vec::new();
+        for _ in 0..6 {
+            polls.push(poll.as_millis());
+            poll = next_poll(poll);
+        }
+        assert_eq!(polls, [25, 50, 100, 200, 200, 200]);
+    }
+
+    #[tokio::test]
+    async fn host_wait_sees_a_port_soon_after_it_opens() {
+        let localhost = std::net::IpAddr::from([127, 0, 0, 1]);
+        let port = closed_port();
+        let late = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tokio::net::TcpListener::bind((localhost, port))
+                .await
+                .unwrap()
+        };
+        let ports = [port];
+        let started = Instant::now();
+
+        let (waited, _listener) =
+            tokio::join!(wait_from_host(localhost, &ports, SERVICE_WAIT), late);
+
+        assert_eq!(waited, HostWait::Ready);
+        // Attempts at about 0, 25 and 75ms: at a fixed SERVICE_POLL the
+        // second attempt would come only after 200ms
+        assert!(
+            started.elapsed() < Duration::from_millis(180),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
