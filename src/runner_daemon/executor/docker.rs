@@ -1544,9 +1544,10 @@ impl DockerExecutor {
     }
 
     /// Pull the job image and the service images in `pulls`, start the
-    /// services on a network of the job's own, wait for them and start the
-    /// job container; returns its id. Everything is recorded in `run` as
-    /// soon as it exists, so a failure leaves nothing the teardown misses.
+    /// services on a network of the job's own and wait for them while the
+    /// job container is created and started on that network; returns its id
+    /// once both are done. Everything is recorded in `run` as soon as it
+    /// exists, so a failure leaves nothing the teardown misses.
     async fn start_job_container(
         &self,
         setup: &JobSetup<'_>,
@@ -1561,28 +1562,63 @@ impl DockerExecutor {
             .job_volumes(job)
             .await
             .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
+        if setup.services.is_empty() {
+            return self
+                .create_job_container(setup, &volumes, None, limits, &mut run.job)
+                .await;
+        }
 
-        if !setup.services.is_empty() {
-            let started = std::time::Instant::now();
-            let services = async {
-                // Services need a network of their own to be reachable by alias
-                limits.check(job)?;
-                let network = format!("turboci-job-{}", job.id);
-                self.create_network(&network)
-                    .await
-                    .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-                run.network = Some(network.clone());
-                self.start_services(setup, &volumes, limits, log, run)
+        // Services need a network of their own to be reachable by alias;
+        // the job container joins it too
+        limits.check(job)?;
+        let started = std::time::Instant::now();
+        let network = format!("turboci-job-{}", job.id);
+        let created = self
+            .create_network(&network)
+            .await
+            .map_err(|e| JobFailure::system(format!("{:#}", e)));
+        if let Err(failure) = created {
+            metrics::record(Phase::Services, started.elapsed());
+            return Err(failure);
+        }
+        run.network = Some(network.clone());
+        let RunContainers {
+            services, job: id, ..
+        } = run;
+        // Only this branch writes to the log; the job container only runs a
+        // sleep until the steps, which start once both branches are done
+        let services_up = async {
+            let up = async {
+                self.start_services(setup, &volumes, &network, limits, log, services)
                     .await?;
-                self.wait_for_services(job.id, &network, &run.services, log, limits)
+                self.wait_for_services(job.id, &network, services, log, limits)
                     .await;
                 Ok::<_, JobFailure>(())
             }
             .await;
             metrics::record(Phase::Services, started.elapsed());
-            services?;
-        }
+            up
+        };
+        let container = self.create_job_container(setup, &volumes, Some(&network), limits, id);
+        let (services_up, container) = tokio::join!(services_up, container);
+        services_up?;
+        let id = container?;
+        // A wait for services that the job timeout or a cancel ended
+        limits.check(job)?;
+        Ok(id)
+    }
 
+    /// Create and start the job container on `network` (the configured
+    /// `network_mode` when `None`); recorded in `slot` once it exists
+    async fn create_job_container(
+        &self,
+        setup: &JobSetup<'_>,
+        volumes: &[String],
+        network: Option<&str>,
+        limits: &Limits<'_>,
+        slot: &mut Option<String>,
+    ) -> std::result::Result<String, JobFailure> {
+        let job = setup.job;
         limits.check(job)?;
         let started = std::time::Instant::now();
         let name = format!("turboci-job-{}", job.id);
@@ -1605,7 +1641,7 @@ impl DockerExecutor {
                     std::iter::once(format!("{}:/builds", setup.job_dir.display()))
                         .chain(volumes.iter().cloned())
                         .collect(),
-                    run.network.as_deref(),
+                    network,
                 ),
             ),
             ..Default::default()
@@ -1614,7 +1650,7 @@ impl DockerExecutor {
             .create_named_for(&name, config, setup.image_options.platform.as_deref())
             .await
             .map_err(|e| JobFailure::system(format!("{:#}", e)))?;
-        run.job = Some(id.clone());
+        *slot = Some(id.clone());
         info!("📦 Created container: {}", id);
 
         self.docker
@@ -1625,8 +1661,9 @@ impl DockerExecutor {
         Ok(id)
     }
 
-    /// Create and start the job's services, all at the same time; each is
-    /// recorded in `run` (in the services' order) once it exists. A failing
+    /// Create and start the job's services on `network`, all at the same
+    /// time; each is recorded in `ids` (in the services' order) once it
+    /// exists. A failing
     /// service, a cancel or the job timeout stops the services that have
     /// not been created or started yet, but no create or start call that is
     /// under way: a dropped create could leave a container nobody removes.
@@ -1634,9 +1671,10 @@ impl DockerExecutor {
         &self,
         setup: &JobSetup<'_>,
         volumes: &[String],
+        network: &str,
         limits: &Limits<'_>,
         log: &mut SetupLog<'_, '_>,
-        run: &mut RunContainers,
+        ids: &mut Vec<String>,
     ) -> JobOutcome {
         let job = setup.job;
         if setup.services.is_empty() {
@@ -1655,7 +1693,7 @@ impl DockerExecutor {
             }
             limits.check(job).map_err(Some)
         };
-        let network = run.network.as_deref();
+        let network = Some(network);
         let starts = setup
             .services
             .iter()
@@ -1716,7 +1754,7 @@ impl DockerExecutor {
         let mut failure = None;
         for (id, failed) in started {
             // Every service that exists is removed by the teardown, started or not
-            run.services.extend(id);
+            ids.extend(id);
             if failure.is_none() {
                 failure = failed;
             }
@@ -4689,6 +4727,111 @@ mod tests {
         assert_eq!(log.matches("Starting service redis:7-alpine").count(), 3);
         assert!(!log.contains("script-ran"), "{}", log);
         assert!(leftovers(job_id).await.is_empty());
+        assert!(leftover_networks(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    /// Names of networks left of job `job_id`
+    async fn leftover_networks(job_id: u64) -> Vec<String> {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        docker
+            .list_networks(&std::collections::HashMap::from([(
+                "name".to_string(),
+                vec![format!("turboci-job-{}", job_id)],
+            )]))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|network| network.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_job_container_starts_while_services_are_awaited() {
+        let executor = with_pipeline_images().await;
+        let job_id = 967_000_000 + u64::from(std::process::id());
+        // How long the job container's first process has been running (from
+        // its start time since boot in clock ticks), and the service's answer
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "redis:7-alpine"},
+            "services": [{
+                "name": "redis:7-alpine", "alias": "cache",
+                "command": ["sh", "-c", "sleep 3; exec redis-server"]
+            }],
+            "steps": steps(&[
+                "echo \"age=$(awk -v up=\"$(cut -d' ' -f1 /proc/uptime)\" '{printf \"%d\", up - $22 / 100}' /proc/1/stat)\"",
+                "echo \"ping=$(redis-cli -h cache ping)\"",
+            ], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        // The script started once the service answered...
+        assert!(log.contains("ping=PONG"), "{}", log);
+        assert!(log.contains("Waiting for services"), "{}", log);
+        assert!(!log.contains("WARNING"), "{}", log);
+        // ...in a job container started while the service was awaited
+        let age: u64 = log
+            .lines()
+            .find_map(|line| line.strip_prefix("age="))
+            .and_then(|age| age.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no age in\n{}", log));
+        assert!(
+            age >= 2,
+            "job container started {}s before the script\n{}",
+            age,
+            log
+        );
+        assert!(leftovers(job_id).await.is_empty());
+        assert!(leftover_networks(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_job_container_that_fails_to_start_next_to_services_leaves_nothing() {
+        let executor = with_pipeline_images().await;
+        let job_id = 968_000_000 + u64::from(std::process::id());
+        let j = job(serde_json::json!({
+            "id": job_id, "token": "t",
+            "image": {"name": "redis:7-alpine", "entrypoint": ["/nonexistent"]},
+            "services": [
+                {"name": "redis:7-alpine", "alias": "one",
+                 "command": ["sh", "-c", "sleep 2; exec redis-server"]},
+                {"name": "redis:7-alpine", "alias": "two"}
+            ],
+            "steps": steps(&["echo script-ran"], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(
+            failure.reason,
+            FailureReason::RunnerSystemFailure,
+            "{}",
+            log
+        );
+        assert!(
+            failure.message.starts_with("Failed to start container"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(log.matches("Starting service redis:7-alpine").count(), 2);
+        assert!(!log.contains("script-ran"), "{}", log);
+        assert!(leftovers(job_id).await.is_empty());
+        assert!(leftover_networks(job_id).await.is_empty());
         executor.cleanup(&j, false).await;
     }
 

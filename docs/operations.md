@@ -194,7 +194,9 @@ Histogram buckets are 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300 and
 
 The Docker executor checks out sources while it pulls images and starts the
 services and the job container, so `pull`, `services` and `container` overlap
-`helper` and `get_sources`; `prepare` is what the job waited in all. Each job
+`helper` and `get_sources`; the job container is started while the services
+start and are awaited, so `container` also overlaps `services`. `prepare` is
+what the job waited in all. Each job
 also logs its phases when it has been reported:
 
 ```text
