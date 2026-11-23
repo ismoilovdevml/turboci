@@ -99,6 +99,36 @@ impl JobEnv {
             .map(|(k, v)| format!("{}={}", k, v))
             .collect()
     }
+
+    /// Let git in a job container trust the checkout. It belongs to the
+    /// runner's user while the job usually runs as root, and git 2.35.2 and
+    /// later refuses a repository someone else owns ("detected dubious
+    /// ownership"). gitlab-runner's checkouts belong to root like its jobs,
+    /// so pipelines expect git to just work. The setting goes in through
+    /// git's `GIT_CONFIG_COUNT` environment, after any entries the job sets
+    /// itself; a count git would reject anyway is left alone.
+    pub fn trust_checkouts(&mut self) {
+        let count = match self.vars.iter().find(|(k, _)| k == "GIT_CONFIG_COUNT") {
+            None => 0,
+            Some((_, value)) => match value.parse::<usize>() {
+                Ok(count) => count,
+                Err(_) => return,
+            },
+        };
+        for (key, value) in [
+            (
+                format!("GIT_CONFIG_KEY_{}", count),
+                "safe.directory".to_string(),
+            ),
+            (format!("GIT_CONFIG_VALUE_{}", count), "*".to_string()),
+            ("GIT_CONFIG_COUNT".to_string(), (count + 1).to_string()),
+        ] {
+            match self.vars.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1 = value,
+                None => self.vars.push((key, value)),
+            }
+        }
+    }
 }
 
 fn is_valid_key(key: &str) -> bool {
@@ -454,6 +484,54 @@ fn lookup<'a>(name: &str, values: &'a HashMap<String, String>) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkouts_are_trusted_after_the_jobs_own_git_config() {
+        let env = |vars: &[(&str, &str)]| {
+            let mut env = JobEnv {
+                vars: vars
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                files: Vec::new(),
+            };
+            env.trust_checkouts();
+            env.vars
+        };
+        let pairs = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            env(&[("CI", "true")]),
+            pairs(&[
+                ("CI", "true"),
+                ("GIT_CONFIG_KEY_0", "safe.directory"),
+                ("GIT_CONFIG_VALUE_0", "*"),
+                ("GIT_CONFIG_COUNT", "1"),
+            ])
+        );
+        assert_eq!(
+            env(&[
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "core.abbrev"),
+                ("GIT_CONFIG_VALUE_0", "12"),
+            ]),
+            pairs(&[
+                ("GIT_CONFIG_COUNT", "2"),
+                ("GIT_CONFIG_KEY_0", "core.abbrev"),
+                ("GIT_CONFIG_VALUE_0", "12"),
+                ("GIT_CONFIG_KEY_1", "safe.directory"),
+                ("GIT_CONFIG_VALUE_1", "*"),
+            ])
+        );
+        // git fails on such a count by itself; nothing is hidden behind it
+        assert_eq!(
+            env(&[("GIT_CONFIG_COUNT", "x")]),
+            pairs(&[("GIT_CONFIG_COUNT", "x")])
+        );
+    }
     use std::process::Command;
 
     #[test]

@@ -49,6 +49,12 @@ lists what a runner has to do, and how TurboCI does it.
 The pipeline's exact commit is checked out through the refspecs GitLab sends,
 so merge request and tag pipelines get the right code.
 
+On the docker executor the checkout belongs to the runner's user while the job
+usually runs as root, so the runner tells git in the job container to trust it
+(`safe.directory=*`, through `GIT_CONFIG_COUNT`, after any `GIT_CONFIG_*`
+entries the job sets). `git` commands in the script work without a
+`git config --global --add safe.directory` line.
+
 ## Artifacts
 
 | Feature | Notes |

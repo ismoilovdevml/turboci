@@ -1202,7 +1202,7 @@ impl DockerExecutor {
         preparing: &mut bool,
         restore: &impl Restore,
     ) -> JobOutcome {
-        let env = script::job_env(
+        let mut env = script::job_env(
             job,
             "/builds",
             job_dir,
@@ -1211,6 +1211,7 @@ impl DockerExecutor {
                 ca_pem: self.ca_pem.clone(),
             },
         );
+        env.trust_checkouts();
         // Image and service names may use variables, e.g. $CI_REGISTRY_IMAGE/ci
         let values: std::collections::HashMap<String, String> = env.vars.iter().cloned().collect();
         let expand = |name: &str| script::expand(name, &values);
@@ -3321,6 +3322,93 @@ mod tests {
             .await
             .is_err());
         executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_job_as_root_uses_git_on_the_runners_checkout() {
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        let project = 937_000_000 + u64::from(std::process::id());
+        let workspace = executor
+            .builds_root()
+            .join(format!("project-{}-0", project));
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let work = workspace.join("origin-work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "hello\n").unwrap();
+        git(&work, &["add", "file.txt"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        let sha = git(&work, &["rev-parse", "HEAD"]);
+        git(
+            &workspace,
+            &["clone", "-q", "--bare", "origin-work", "origin.git"],
+        );
+        // The checkout belongs to the runner's user (uid 1000 plays it when
+        // the tests run as root), the job's git runs as root
+        std::fs::create_dir_all(workspace.join("project")).unwrap();
+        if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&workspace).unwrap()) == 0 {
+            for entry in walkdir::WalkDir::new(&workspace) {
+                std::os::unix::fs::chown(entry.unwrap().path(), Some(1000), Some(1000)).unwrap();
+            }
+        }
+
+        let j = job(serde_json::json!({
+            "id": project, "token": "t", "allow_git_fetch": true,
+            "image": {"name": DockerConfig::default().helper_image, "entrypoint": [""]},
+            "job_info": {"name": "build", "stage": "test", "project_id": project, "project_name": "app"},
+            "git_info": {
+                "repo_url": "file:///builds/origin.git", "ref": "main", "ref_type": "branch",
+                "sha": sha, "before_sha": "", "protected": false,
+                "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]
+            },
+            // The job's own git settings still apply next to the runner's
+            "variables": [
+                {"key": "GIT_CONFIG_COUNT", "value": "1"},
+                {"key": "GIT_CONFIG_KEY_0", "value": "core.abbrev"},
+                {"key": "GIT_CONFIG_VALUE_0", "value": "12"}
+            ],
+            "steps": steps(&[
+                "echo \"job-user=$(id -u) checkout-owner=$(stat -c %u .git)\"",
+                "echo \"short=$(git rev-parse --short HEAD)\"",
+                "git status --porcelain"
+            ], &[])
+        }));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, j.id, "t", &scrubber);
+        let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+        trace.finish().await;
+        let log = trace.text();
+        executor.cleanup(&j, false).await;
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("job-user=0 checkout-owner="), "{}", log);
+        assert!(!log.contains("checkout-owner=0\n"), "{}", log);
+        assert!(log.contains(&format!("short={}\n", &sha[..12])), "{}", log);
+        assert!(!log.contains("dubious ownership"), "{}", log);
     }
 
     #[tokio::test]
