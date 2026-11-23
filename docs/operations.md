@@ -182,7 +182,7 @@ Histogram buckets are 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300 and
 | `helper` | Docker: pulling and starting the helper container that checks out sources, the `workspace_check` included |
 | `workspace_check` | Docker: walking the workspace for files of other users before the checkout; skipped when the last job left the workspace clean |
 | `get_sources` | Hooks and checkout (the `get_sources` log section) |
-| `setup_wait` | Docker: waiting for the job container and services after getting sources |
+| `setup_wait` | Docker: waiting for the job container and services after getting sources and restoring cache and artifacts |
 | `restore_cache`, `download_artifacts` | Their log sections |
 | `script`, `after_script` | The script steps (`before_script` and `script`) and `after_script` |
 | `ownership` | Docker: stopping the job container before cache and artifacts are read, and checking that the runner's user can read what they need; only when it cannot are the job's files given to that user here, otherwise in the `teardown` |
@@ -193,10 +193,11 @@ Histogram buckets are 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300 and
 | `teardown` | After the final update: removing the job's containers, network and volumes, handing the workspace back, removing a workspace that is not kept. The job's slot stays taken until it is done. |
 
 The Docker executor checks out sources while it pulls images and starts the
-services and the job container, so `pull`, `services` and `container` overlap
-`helper` and `get_sources`; the job container is started while the services
-start and are awaited, so `container` also overlaps `services`. `prepare` is
-what the job waited in all. Each job
+services and the job container, and restores cache and artifacts after it, so
+`pull`, `services` and `container` overlap `helper`, `get_sources`,
+`restore_cache` and `download_artifacts`; the job container is started while
+the services start and are awaited, so `container` also overlaps `services`.
+`prepare` is what the job waited until the restore could begin. Each job
 also logs its phases when it has been reported:
 
 ```text

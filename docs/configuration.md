@@ -395,11 +395,15 @@ until the runner restarts). Jobs
 with `services` get their own network where each service is reachable by its
 aliases. The job container joins that network; it is created and started
 while the services start and are awaited, and the scripts start once both
-are done. The checkout runs while the job image is pulled and the services
-start; the log shows the services' progress after the `get_sources` section,
-in a `prepare_containers` section, as it happens once `get_sources` is closed.
-If either fails, or the job times out or is canceled, the other is stopped
-and every container of the job is removed.
+are done. The checkout, and after it the restore of the cache and of the
+dependencies' artifacts, run while the job image is pulled and the services
+start; the log shows the services' progress after the `get_sources`,
+`restore_cache` and `download_artifacts` sections, in a `prepare_containers`
+section, as it happens once they are closed. If either side fails, or the job
+times out or is canceled, the other is stopped (a stopped restore is waited
+for, so nothing writes to the workspace afterwards) and every container of the
+job is removed. A failing checkout or restore does not stop the containers:
+`after_script` still runs, as without services.
 
 Once the scripts have ended, the job container is stopped and the helper
 gives the files the job created (as root, usually) to the runner's user, so

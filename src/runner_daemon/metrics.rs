@@ -102,7 +102,8 @@ pub enum Phase {
     /// Docker: walking the workspace for files of other users before the checkout
     WorkspaceCheck,
     GetSources,
-    /// Docker: waiting for the job container and services after getting sources
+    /// Docker: waiting for the job container and services after getting
+    /// sources and restoring cache and artifacts
     SetupWait,
     RestoreCache,
     DownloadArtifacts,

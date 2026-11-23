@@ -4483,4 +4483,113 @@ mod tests {
             report
         );
     }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_jobs_get_their_cache_and_artifacts_before_the_script() {
+        let server = MockServer::start().await;
+        job_routes(&server).await;
+        // Slower than the checkout, so the restore overlaps the service start
+        serve_artifacts(&server, 331, zip_of(&[("dist/app.txt", "built")]), 300).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config::RunnerConfig {
+            runner_token: "glrt-test".to_string(),
+            gitlab_url: server.uri(),
+            cache_dir: dir.path().join("cache").to_string_lossy().into_owned(),
+            state_dir: dir.path().to_string_lossy().into_owned(),
+            ..config::RunnerConfig::default()
+        };
+        let docker = executor::DockerExecutor::new(config::DockerConfig {
+            builds_dir: Some(dir.path().join("builds").to_string_lossy().into_owned()),
+            pull_policy: "if-not-present".to_string(),
+            ..config::DockerConfig::default()
+        })
+        .unwrap()
+        .with_owner("turboci-test");
+        let daemon = RunnerDaemon::new(
+            config,
+            GitLabClient::new(server.uri(), "glrt-test".to_string()),
+            executor::ExecutorType::Docker(docker),
+        );
+        let project = 932_000_000 + u64::from(std::process::id()) * 10;
+        let job = |id: u64, sha: &str, script: &str, dependencies: serde_json::Value| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "token": format!("job-token-{}", id), "allow_git_fetch": true,
+                "image": {"name": "alpine:3.20"},
+                "job_info": {"name": "build", "stage": "test", "project_id": project, "project_name": "app"},
+                "git_info": {"repo_url": "file:///builds/origin.git", "ref": "main", "ref_type": "branch",
+                             "sha": sha, "before_sha": "", "protected": false,
+                             "refspecs": ["+refs/heads/main:refs/remotes/origin/main"]},
+                "variables": [
+                    {"key": "GIT_CONFIG_COUNT", "value": "1"},
+                    {"key": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+                    {"key": "GIT_CONFIG_VALUE_0", "value": "*"}
+                ],
+                "services": [{"name": "redis:7-alpine", "alias": "redis"}],
+                "cache": [{"key": "deps", "paths": ["vendor/"], "policy": "pull-push"}],
+                "dependencies": dependencies,
+                "steps": [{"name": "script", "when": "on_success", "timeout": 600, "script": [script]}]
+            }))
+            .unwrap()
+        };
+        // The origin lives in the project's workspace, as /builds/origin.git
+        let workspace = daemon
+            .executor
+            .job_dir(&job(project, "", "", serde_json::json!([])));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (_, sha) = origin_repo(&workspace);
+        let bare = std::process::Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(workspace.join("origin"))
+            .arg(workspace.join("origin.git"))
+            .output()
+            .unwrap();
+        assert!(bare.status.success(), "{:?}", bare);
+
+        let first = project + 1;
+        let script = "mkdir -p vendor && echo cached-dep > vendor/lib.txt";
+        daemon
+            .execute_job(job(first, &sha, script, serde_json::json!([])))
+            .await
+            .unwrap();
+        assert_eq!(
+            final_update(&server, first).await["state"],
+            "success",
+            "{}",
+            trace_of(&server, first).await
+        );
+        let second = project + 2;
+        let dependencies = serde_json::json!([{"id": 331, "name": "compile", "token": "d",
+            "artifacts_file": {"filename": "artifacts.zip", "size": 10}}]);
+        let script = "cat vendor/lib.txt dist/app.txt";
+        daemon
+            .execute_job(job(second, &sha, script, dependencies))
+            .await
+            .unwrap();
+
+        let trace = trace_of(&server, second).await;
+        let state = final_update(&server, second).await["state"].clone();
+        assert_eq!(state, "success", "{}", trace);
+        assert!(trace.contains("cached-dep\nbuilt"), "{}", trace);
+        let at = |text: &str| {
+            trace
+                .find(text)
+                .unwrap_or_else(|| panic!("no {:?} in\n{}", text, trace))
+        };
+        assert!(at(":get_sources\r") < at(":restore_cache\r"), "{}", trace);
+        assert!(
+            at(":restore_cache\r") < at(":download_artifacts\r"),
+            "{}",
+            trace
+        );
+        assert!(
+            at(":download_artifacts\r") < at(":step_script\r"),
+            "{}",
+            trace
+        );
+        daemon
+            .executor
+            .cleanup(&job(second, &sha, "", serde_json::json!([])), false)
+            .await;
+    }
 }

@@ -1486,7 +1486,12 @@ impl DockerExecutor {
                     trace.section_end("prepare_executor").await;
                     *preparing = false;
                     let runner = self.runner(&id, &env);
-                    Ok(get_sources_section(job, &runner, trace, &dirs, &limits).await)
+                    let failure = get_sources_section(job, &runner, trace, &dirs, &limits).await;
+                    // The restore only writes to the workspace on the host, so
+                    // it runs while the containers start too. A failing
+                    // restore does not stop them, like a failing checkout;
+                    // a failure of the containers branch stops the restore.
+                    Ok(restore_section(job, failure, trace, &limits, restore).await)
                 }
                 Err(failure) => {
                     fail(failure.clone());
@@ -1494,7 +1499,7 @@ impl DockerExecutor {
                 }
             };
             // What the containers branch reported, and the wait for it to
-            // end, follow the checkout in a section of their own
+            // end, follow the checkout and the restore in a section of their own
             let waiting = !(log_lines.is_closed() && log_lines.is_empty());
             if *preparing || !waiting {
                 forward_setup_log(&mut log_lines, trace).await;
@@ -1534,18 +1539,9 @@ impl DockerExecutor {
             return Err(failure);
         }
         let id = started?;
-        let sources_failure = sourced?;
+        let failure = sourced?;
         let runner = self.runner(&id, &env);
-        run_steps(
-            job,
-            deadline,
-            sources_failure,
-            &runner,
-            trace,
-            &dirs,
-            restore,
-        )
-        .await
+        run_script_steps(job, deadline, failure, &runner, trace, &dirs).await
     }
 
     /// Runs scripts in container `id`
@@ -4437,6 +4433,264 @@ mod tests {
             log
         );
         assert!(took < Duration::from_secs(20), "took {:?}\n{}", took, log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    /// A restore taking `delay` in a restore_cache section, as the daemon's,
+    /// which then writes restored.txt into `project` (or fails with
+    /// `failure`); ends early, without writing, once stopped
+    struct SlowRestore {
+        project: PathBuf,
+        delay: Duration,
+        failure: Option<JobFailure>,
+        started: std::sync::atomic::AtomicBool,
+        ended: std::sync::atomic::AtomicBool,
+    }
+
+    impl SlowRestore {
+        fn new(project: PathBuf, delay: Duration) -> Self {
+            Self {
+                project,
+                delay,
+                failure: None,
+                started: Default::default(),
+                ended: Default::default(),
+            }
+        }
+
+        fn started(&self) -> bool {
+            self.started.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn ended(&self) -> bool {
+            self.ended.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Restore for SlowRestore {
+        async fn restore(
+            &self,
+            _job: &Job,
+            trace: &mut TraceWriter<'_>,
+            stop: &Stop,
+        ) -> JobOutcome {
+            use std::sync::atomic::Ordering;
+            self.started.store(true, Ordering::SeqCst);
+            trace
+                .section_start("restore_cache", "Restoring cache")
+                .await;
+            let until = Instant::now() + self.delay;
+            let mut outcome = Ok(());
+            while Instant::now() < until {
+                if let Err(e) = stop.check() {
+                    outcome = Err(JobFailure::system(e));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if outcome.is_ok() {
+                outcome = match &self.failure {
+                    Some(failure) => Err(failure.clone()),
+                    None => std::fs::write(self.project.join("restored.txt"), "restored\n")
+                        .map_err(JobFailure::system),
+                };
+            }
+            trace.section_end("restore_cache").await;
+            self.ended.store(true, Ordering::SeqCst);
+            outcome
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_restore_runs_while_services_start() {
+        let executor = with_pipeline_images().await;
+        let job_id = 919_000_000 + u64::from(std::process::id());
+        // One after the other, the restore and the service delay would take
+        // at least 16 s; overlapped about 8 s plus setup
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            8,
+            serde_json::json!([]),
+            &[
+                "cat restored.txt file.txt",
+                "echo \"ping=$(redis-cli -h cache ping)\"",
+            ],
+        );
+        let restore =
+            SlowRestore::new(executor.job_dir(&j).join("project"), Duration::from_secs(8));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let started = Instant::now();
+        let outcome = executor.execute(&j, &mut trace, &restore).await;
+        let took = started.elapsed();
+        trace.finish().await;
+        let log = trace.text();
+
+        assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+        assert!(log.contains("restored\nhello from git"), "{}", log);
+        assert!(log.contains("ping=PONG"), "{}", log);
+        assert!(took < Duration::from_secs(14), "took {:?}\n{}", took, log);
+        // The restore follows getting sources; what the containers branch
+        // reported meanwhile follows the restore, before the steps
+        let at = |text: &str| {
+            log.find(text)
+                .unwrap_or_else(|| panic!("no {:?} in\n{}", text, log))
+        };
+        let sources_end = log.rfind(":get_sources\r").unwrap();
+        let restore_start = at(":restore_cache\r");
+        let restore_end = log.rfind(":restore_cache\r").unwrap();
+        let containers = at(":prepare_containers\r");
+        let service = at("Starting service");
+        let step = at(":step_script\r");
+        assert!(
+            sources_end < restore_start && restore_start < restore_end,
+            "{}",
+            log
+        );
+        assert!(restore_end < containers && containers < service, "{}", log);
+        assert!(service < step, "{}", log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_failed_job_container_stops_the_restore() {
+        // dockerd refuses the job container (an unknown capability) once
+        // the service is up, while the restore still runs
+        let executor = ExecutorType::Docker(
+            DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                cap_add: vec!["TURBOCI_NO_SUCH_CAP".to_string()],
+                ..DockerConfig::default()
+            })
+            .unwrap(),
+        );
+        with_pipeline_images().await;
+        let job_id = 923_000_000 + u64::from(std::process::id());
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            3,
+            serde_json::json!([]),
+            &["echo script-ran"],
+        );
+        let restore = SlowRestore::new(
+            executor.job_dir(&j).join("project"),
+            Duration::from_secs(60),
+        );
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let started = Instant::now();
+        let outcome = executor.execute(&j, &mut trace, &restore).await;
+        let took = started.elapsed();
+        trace.finish().await;
+        let log = trace.text();
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(
+            failure.reason,
+            FailureReason::RunnerSystemFailure,
+            "{}",
+            log
+        );
+        assert!(restore.started() && restore.ended(), "{}", log);
+        assert!(!executor.job_dir(&j).join("project/restored.txt").exists());
+        assert!(took < Duration::from_secs(30), "took {:?}\n{}", took, log);
+        assert!(
+            !log.contains("script-ran") && !log.contains("after-ran"),
+            "{}",
+            log
+        );
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_failed_restore_still_runs_after_script_next_to_services() {
+        let executor = with_pipeline_images().await;
+        let job_id = 924_000_000 + u64::from(std::process::id());
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            3,
+            serde_json::json!([]),
+            &["echo script-ran"],
+        );
+        let mut restore = SlowRestore::new(executor.job_dir(&j).join("project"), Duration::ZERO);
+        restore.failure = Some(JobFailure {
+            reason: FailureReason::ScriptFailure,
+            exit_code: None,
+            message: "failed to download artifacts from job #5 (build)".to_string(),
+        });
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber);
+
+        let outcome = executor.execute(&j, &mut trace, &restore).await;
+        trace.finish().await;
+        let log = trace.text();
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(failure.reason, FailureReason::ScriptFailure, "{}", log);
+        assert_eq!(
+            failure.message,
+            "failed to download artifacts from job #5 (build)"
+        );
+        assert!(!log.contains("\nscript-ran"), "{}", log);
+        assert!(log.contains("after-ran"), "{}", log);
+        assert!(leftovers(job_id).await.is_empty());
+        executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_cancel_stops_the_restore_and_service_startup() {
+        let executor = with_pipeline_images().await;
+        let job_id = 925_000_000 + u64::from(std::process::id());
+        let j = pipelined_job(
+            &executor,
+            job_id,
+            "redis:7-alpine",
+            60,
+            serde_json::json!([]),
+            &["echo script-ran"],
+        );
+        let restore = SlowRestore::new(
+            executor.job_dir(&j).join("project"),
+            Duration::from_secs(60),
+        );
+        let scrubber = SecretScrubber::new(vec![]);
+        let cancel = CancelSignal::default();
+        let mut trace = TraceWriter::new(None, job_id, "t", &scrubber).with_cancel(cancel.clone());
+        let trigger = async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            cancel.update(RemoteState::Canceling);
+        };
+
+        let started = Instant::now();
+        let (outcome, ()) = tokio::join!(executor.execute(&j, &mut trace, &restore), trigger);
+        let took = started.elapsed();
+        trace.finish().await;
+        let log = trace.text();
+
+        assert_eq!(
+            outcome.unwrap_err().reason,
+            FailureReason::JobCanceled,
+            "{}",
+            log
+        );
+        assert!(restore.started() && restore.ended(), "{}", log);
+        assert!(took < Duration::from_secs(20), "took {:?}\n{}", took, log);
+        assert!(!log.contains("script-ran"), "{}", log);
         assert!(leftovers(job_id).await.is_empty());
         executor.cleanup(&j, false).await;
     }

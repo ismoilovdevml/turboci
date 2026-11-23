@@ -600,47 +600,68 @@ async fn git_dir_identity(host_project: &Path) -> Option<(u64, u64)> {
 async fn run_steps(
     job: &Job,
     deadline: Instant,
-    mut failure: Option<JobFailure>,
+    failure: Option<JobFailure>,
     runner: &impl ScriptRunner,
     trace: &mut TraceWriter<'_>,
     dirs: &JobDirs,
     restore: &impl Restore,
 ) -> JobOutcome {
     let cancel = trace.cancel();
-    let canceled = || RunError::Canceled.failure(job);
-    let timed_out = || RunError::TimedOut.failure(job);
-    if let Some(elapsed) = metrics::job_elapsed() {
-        metrics::record(Phase::Prepare, elapsed);
-    }
-
-    let script_limits = Limits {
+    let limits = Limits {
         deadline,
         cancel: &cancel,
         stop_at: RemoteState::Canceling,
     };
-    if failure.is_none() {
-        // Bound like the scripts: a slow S3 transfer must not outlive the job
-        // timeout or a cancel. The restore is then stopped and awaited, so no
-        // extraction still writes to the workspace while after_script, the
-        // saves and the cleanup run.
-        let stop = Stop::default();
-        let restoring = restore.restore(job, trace, &stop);
-        tokio::pin!(restoring);
-        let interrupted = tokio::select! {
-            restored = &mut restoring => {
-                failure = restored.err();
-                None
-            }
-            _ = tokio::time::sleep_until(script_limits.deadline) => Some(timed_out()),
-            _ = script_limits.cancel.reached(script_limits.stop_at) => Some(canceled()),
-        };
-        if interrupted.is_some() {
-            stop.stop();
-            // Dropping a download removes its temporary file
-            let _ = tokio::time::timeout(RESTORE_STOP_GRACE, restoring).await;
-            failure = interrupted;
-        }
+    let failure = restore_section(job, failure, trace, &limits, restore).await;
+    run_script_steps(job, deadline, failure, runner, trace, dirs).await
+}
+
+/// Restore the cache and artifacts unless getting sources failed (with
+/// `failure`); returns why the job fails, if it does. Bound like the
+/// scripts by `limits`: a slow S3 transfer must not outlive the job timeout
+/// or a cancel. The restore is then stopped and awaited, so no extraction
+/// still writes to the workspace while after_script, the saves and the
+/// cleanup run.
+async fn restore_section(
+    job: &Job,
+    failure: Option<JobFailure>,
+    trace: &mut TraceWriter<'_>,
+    limits: &Limits<'_>,
+    restore: &impl Restore,
+) -> Option<JobFailure> {
+    if let Some(elapsed) = metrics::job_elapsed() {
+        metrics::record(Phase::Prepare, elapsed);
     }
+    if failure.is_some() {
+        return failure;
+    }
+    let stop = Stop::default();
+    let restoring = restore.restore(job, trace, &stop);
+    tokio::pin!(restoring);
+    let interrupted = tokio::select! {
+        restored = &mut restoring => return restored.err(),
+        _ = tokio::time::sleep_until(limits.deadline) => RunError::TimedOut,
+        _ = limits.cancel.reached(limits.stop_at) => RunError::Canceled,
+    };
+    stop.stop();
+    // Dropping a download removes its temporary file
+    let _ = tokio::time::timeout(RESTORE_STOP_GRACE, restoring).await;
+    Some(interrupted.failure(job))
+}
+
+/// The job's steps, once sources and the restore are done (`failure` says
+/// why the job fails already, if it does)
+async fn run_script_steps(
+    job: &Job,
+    deadline: Instant,
+    mut failure: Option<JobFailure>,
+    runner: &impl ScriptRunner,
+    trace: &mut TraceWriter<'_>,
+    dirs: &JobDirs,
+) -> JobOutcome {
+    let cancel = trace.cancel();
+    let canceled = || RunError::Canceled.failure(job);
+    let timed_out = || RunError::TimedOut.failure(job);
 
     // RUNNER_SCRIPT_TIMEOUT caps the script steps within the job timeout
     let script_timeout = stage_timeout(job, "RUNNER_SCRIPT_TIMEOUT", trace).await;
@@ -1432,6 +1453,140 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(files_in(&into), written, "written after the job moved on");
         std::fs::remove_dir_all(&into).unwrap();
+    }
+
+    /// Runs until stopped, then takes a moment to end, like an extraction
+    /// finishing its file; counts its runs and records that it ended
+    #[derive(Default)]
+    struct StoppableRestore {
+        runs: std::sync::atomic::AtomicUsize,
+        ended: std::sync::atomic::AtomicBool,
+    }
+
+    impl Restore for StoppableRestore {
+        async fn restore(
+            &self,
+            _job: &Job,
+            trace: &mut TraceWriter<'_>,
+            stop: &Stop,
+        ) -> JobOutcome {
+            use std::sync::atomic::Ordering;
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            trace.write("restore-started\n").await;
+            while stop.check().is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.ended.store(true, Ordering::SeqCst);
+            stop.check().map_err(JobFailure::system)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_restore_section_skips_the_restore_after_failed_sources() {
+        let j = job(serde_json::json!({"id": 20, "token": "t"}));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, j.id, &j.token, &scrubber);
+        let cancel = CancelSignal::default();
+        let limits = Limits {
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+            stop_at: RemoteState::Canceling,
+        };
+        let restore = StoppableRestore::default();
+        let sources = JobFailure {
+            reason: FailureReason::ScriptFailure,
+            exit_code: Some(128),
+            message: "getting sources failed with exit code 128".to_string(),
+        };
+
+        let failure = restore_section(&j, Some(sources), &mut trace, &limits, &restore)
+            .await
+            .unwrap();
+
+        assert_eq!(failure.exit_code, Some(128));
+        assert_eq!(failure.message, "getting sources failed with exit code 128");
+        assert_eq!(restore.runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_restore_section_keeps_a_restore_failure() {
+        struct Failing;
+        impl Restore for Failing {
+            async fn restore(&self, _: &Job, _: &mut TraceWriter<'_>, _: &Stop) -> JobOutcome {
+                Err(JobFailure {
+                    reason: FailureReason::ScriptFailure,
+                    exit_code: None,
+                    message: "failed to download artifacts from job #5 (build)".to_string(),
+                })
+            }
+        }
+        let j = job(serde_json::json!({"id": 21, "token": "t"}));
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, j.id, &j.token, &scrubber);
+        let cancel = CancelSignal::default();
+        let limits = Limits {
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+            stop_at: RemoteState::Canceling,
+        };
+
+        let failure = restore_section(&j, None, &mut trace, &limits, &Failing)
+            .await
+            .unwrap();
+
+        assert_eq!(failure.reason, FailureReason::ScriptFailure);
+        assert_eq!(
+            failure.message,
+            "failed to download artifacts from job #5 (build)"
+        );
+        assert!(restore_section(&j, None, &mut trace, &limits, &NoRestore)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_restore_section_stops_and_awaits_a_restore_on_its_stop_signal() {
+        // The signal the Docker setup sets when the containers fail or the
+        // job is canceled, and the job timeout
+        for timeout in [false, true] {
+            let j = job(serde_json::json!({"id": 22, "token": "t", "runner_info": {"timeout": 9}}));
+            let scrubber = SecretScrubber::new(vec![]);
+            let mut trace = TraceWriter::new(None, j.id, &j.token, &scrubber);
+            let setup_stop = CancelSignal::default();
+            let limits = Limits {
+                deadline: Instant::now()
+                    + Duration::from_millis(if timeout { 300 } else { 60_000 }),
+                cancel: &setup_stop,
+                stop_at: RemoteState::Canceling,
+            };
+            let restore = StoppableRestore::default();
+            let trigger = async {
+                if !timeout {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    setup_stop.update(RemoteState::Canceling);
+                }
+            };
+
+            let (failure, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    restore_section(&j, None, &mut trace, &limits, &restore),
+                    trigger
+                )
+            })
+            .await
+            .expect("the restore was not stopped");
+
+            let failure = failure.unwrap();
+            if timeout {
+                assert_eq!(failure.reason, FailureReason::JobExecutionTimeout);
+                assert_eq!(failure.message, "execution took longer than 9s");
+            } else {
+                assert_eq!(failure.reason, FailureReason::JobCanceled);
+            }
+            // Nothing of it runs once the section has returned
+            assert!(restore.ended.load(std::sync::atomic::Ordering::SeqCst));
+        }
     }
 
     #[tokio::test]
