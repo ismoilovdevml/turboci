@@ -3953,16 +3953,18 @@ mod tests {
     }
 
     /// Runs the audit's Docker jobs (a noop job, a job next to a redis
-    /// service, a job writing 2000 small files to its cache, a job saving a
-    /// cache and uploading artifacts, a job uploading its untracked files)
-    /// BENCH_RUNS times each (default 10, after one warm-up) through the
-    /// whole daemon against a mock GitLab, and prints the median and 90th
-    /// percentile of every phase. Run it as a user other than root, as the runner runs in
-    /// production, so jobs leave files of another user behind:
+    /// service, a job next to redis and postgres, a job writing 2000 small
+    /// files to its cache, a job saving a cache and uploading artifacts, a
+    /// job uploading its untracked files) BENCH_RUNS times each (default 10,
+    /// after one warm-up) through the whole daemon against a mock GitLab, and
+    /// prints the median and 90th percentile of every phase. Run it as a user
+    /// other than root, as the runner runs in production, so jobs leave files
+    /// of another user behind:
     /// `cargo test --release bench_docker_job_phases -- --ignored --nocapture`.
     /// BENCH_PULL_POLICY sets the pull policy (default if-not-present),
     /// BENCH_WORKLOADS which workloads run (names, comma-separated; default
-    /// all).
+    /// all but `dind`). `dind`, a job next to a docker:dind service, runs the
+    /// containers privileged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "benchmark: needs a Docker daemon, run on its own with --nocapture"]
     async fn bench_docker_job_phases() {
@@ -3972,6 +3974,11 @@ mod tests {
             .unwrap_or(10);
         let pull_policy =
             std::env::var("BENCH_PULL_POLICY").unwrap_or_else(|_| "if-not-present".to_string());
+        let selected: Vec<String> = std::env::var("BENCH_WORKLOADS")
+            .unwrap_or_else(|_| "noop,service,services,cache,uploads,untracked".to_string())
+            .split(',')
+            .map(|name| name.trim().to_string())
+            .collect();
         let server = MockServer::start().await;
         let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
         for (verb, route, status) in [
@@ -4000,6 +4007,7 @@ mod tests {
         let docker = executor::DockerExecutor::new(config::DockerConfig {
             builds_dir: Some(dir.path().join("builds").to_string_lossy().into_owned()),
             pull_policy,
+            privileged: selected.iter().any(|name| name == "dind"),
             ..config::DockerConfig::default()
         })
         .unwrap()
@@ -4024,11 +4032,33 @@ mod tests {
             &str,
             serde_json::Value,
             serde_json::Value,
-        ); 5] = [
+        ); 7] = [
             ("noop", none(), "true", none(), none()),
             (
                 "service",
                 serde_json::json!([{"name": "redis:7-alpine", "alias": "redis"}]),
+                "true",
+                none(),
+                none(),
+            ),
+            (
+                "services",
+                serde_json::json!([
+                    {"name": "redis:7-alpine", "alias": "redis"},
+                    {"name": "postgres:16-alpine", "alias": "db", "variables": [
+                        {"key": "POSTGRES_HOST_AUTH_METHOD", "value": "trust"}
+                    ]}
+                ]),
+                "true",
+                none(),
+                none(),
+            ),
+            (
+                "dind",
+                // Without TLS, and without dockerd's 15s delay for that
+                serde_json::json!([{"name": "docker:27-dind", "alias": "docker",
+                    "command": ["--host=tcp://0.0.0.0:2375", "--tls=false"],
+                    "variables": [{"key": "DOCKER_TLS_CERTDIR", "value": ""}]}]),
                 "true",
                 none(),
                 none(),
@@ -4056,13 +4086,9 @@ mod tests {
             ),
         ];
         let mut report = String::new();
-        let selected = std::env::var("BENCH_WORKLOADS").ok();
         for (index, (name, services, script, cache, artifacts)) in workloads.into_iter().enumerate()
         {
-            if selected
-                .as_deref()
-                .is_some_and(|selected| !selected.split(',').any(|wanted| wanted == name))
-            {
+            if !selected.iter().any(|wanted| wanted == name) {
                 continue;
             }
             let project = base + index as u64 * 100;
