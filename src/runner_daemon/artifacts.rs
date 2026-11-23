@@ -220,23 +220,22 @@ const COMPRESSED_EXTENSIONS: &[&str] = &[
     "xz", "bz2", "7z",
 ];
 
-/// Download a dependency's artifacts archive to a file in `staging_dir` and
-/// extract it into the workspace, until `stop`. Returns the archive size.
-pub async fn download_and_extract_artifacts(
+/// Download a dependency's artifacts archive to a file in `staging_dir`
+/// (removed when the returned file, or the unfinished download, is
+/// dropped), unless `stop` is set; extract it with `extract_archive_file`
+pub async fn download_artifacts(
     gitlab: &GitLabClient,
     job_id: u64,
     token: &str,
-    workspace_path: &str,
     staging_dir: &Path,
     stop: &Stop,
-) -> Result<u64> {
+) -> Result<tempfile::NamedTempFile> {
     stop.check()?;
     let staged = tempfile::NamedTempFile::new_in(staging_dir)?;
-    let size = gitlab
+    gitlab
         .download_artifacts_to(job_id, token, staged.path())
         .await?;
-    extract_archive_file(staged.path(), workspace_path, stop).await?;
-    Ok(size)
+    Ok(staged)
 }
 
 /// Extract an untrusted ZIP file into the workspace, off the async runtime.

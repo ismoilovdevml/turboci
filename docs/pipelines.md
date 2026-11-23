@@ -62,7 +62,7 @@ entries the job sets). `git` commands in the script work without a
 | `paths`, `exclude`, `untracked` | Globs with `**`; paths may use variables |
 | `name`, `expire_in`, `when` | `when: on_success` (default), `on_failure`, `always` |
 | `reports` | Uploaded in the format GitLab asks for (`zip`, `gzip`, `raw`) |
-| Dependencies | `needs` and `dependencies` artifacts are downloaded and extracted before the script |
+| Dependencies | `needs` and `dependencies` artifacts are downloaded and extracted before the script: up to 4 archives download at the same time, and they are extracted one by one in the jobs' order, so a later job's files replace an earlier one's as with gitlab-runner |
 | `ARTIFACT_DOWNLOAD_ATTEMPTS` | Retries of dependency downloads (1–10) |
 | `ARTIFACT_COMPRESSION_LEVEL` | `fastest` (store), `fast`, `default`, `slow`, `slowest`: deflate level 1, 6, 7, 9 of ZIP artifacts. gitlab-runner honours it only with `FF_USE_FASTZIP`; TurboCI always does |
 

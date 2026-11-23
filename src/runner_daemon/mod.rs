@@ -34,6 +34,9 @@ pub mod system_id;
 pub mod token;
 pub mod trace;
 
+/// How many archives of a job's dependencies download at the same time
+const DEPENDENCY_DOWNLOADS: usize = 4;
+
 /// Retry count for a transfer, from a job variable such as
 /// ARTIFACT_DOWNLOAD_ATTEMPTS (1-10, default 1)
 fn attempts(job: &Job, key: &str) -> u32 {
@@ -1417,7 +1420,12 @@ impl RunnerDaemon {
     }
 
     /// Download and extract the artifacts of the jobs this one depends on,
-    /// until `stop` (the executor sets it on the job timeout or a cancel)
+    /// until `stop` (the executor sets it on the job timeout or a cancel).
+    /// Archives download at the same time while they are extracted one by
+    /// one in the jobs' order, so a later job's files replace an earlier
+    /// one's, as with gitlab-runner; at most DEPENDENCY_DOWNLOADS archives
+    /// are on disk at a time (downloading, downloaded or being extracted).
+    /// Each of the ARTIFACT_DOWNLOAD_ATTEMPTS is a download and its extraction.
     async fn download_dependencies(
         &self,
         job: &Job,
@@ -1425,48 +1433,128 @@ impl RunnerDaemon {
         workspace: &str,
         stop: &Stop,
     ) -> JobOutcome {
-        for dependency in job
+        use futures_util::StreamExt;
+
+        let dependencies: Vec<&crate::gitlab::Dependency> = job
             .dependencies
             .iter()
             .filter(|d| d.artifacts_file.is_some())
-        {
-            trace
-                .write(&format!(
-                    "Downloading artifacts from job #{} ({})...\n",
-                    dependency.id, dependency.name
-                ))
-                .await;
-            let job_dir = self.executor.job_dir(job);
-            let tries = attempts(job, "ARTIFACT_DOWNLOAD_ATTEMPTS");
-            let mut result = Err(anyhow::anyhow!("not attempted"));
-            for attempt in 1..=tries {
-                result = artifacts::download_and_extract_artifacts(
-                    &self.gitlab,
-                    dependency.id,
-                    &dependency.token,
-                    workspace,
-                    &job_dir,
-                    stop,
-                )
-                .await;
-                if result.is_ok() || attempt == tries {
-                    break;
+            .collect();
+        let job_dir = self.executor.job_dir(job);
+        let tries = attempts(job, "ARTIFACT_DOWNLOAD_ATTEMPTS");
+        let staging = job_dir.as_path();
+        // A download takes a slot, in the jobs' order, which its archive
+        // keeps until it is extracted; the slots bound what waits in the
+        // channel too
+        let slots = tokio::sync::Semaphore::new(DEPENDENCY_DOWNLOADS);
+        let (sender, mut downloaded) = tokio::sync::mpsc::unbounded_channel();
+        let downloads = async {
+            let mut queue = dependencies.iter();
+            let mut next = queue.next();
+            let mut running = futures_util::stream::FuturesOrdered::new();
+            loop {
+                tokio::select! {
+                    slot = slots.acquire(), if next.is_some() => {
+                        if let Some(dependency) = next {
+                            running.push_back(async move {
+                                let download = self
+                                    .download_dependency(dependency, staging, 1, tries, stop)
+                                    .await;
+                                (download, slot.ok())
+                            });
+                        }
+                        next = queue.next();
+                    }
+                    Some(download) = running.next(), if !running.is_empty() => {
+                        if sender.send(download).is_err() {
+                            break;
+                        }
+                    }
+                    else => break,
                 }
-                warn!(
-                    "Artifact download attempt {}/{} failed, retrying",
-                    attempt, tries
-                );
             }
-            result.map_err(|e| JobFailure {
-                reason: FailureReason::ScriptFailure,
-                exit_code: None,
-                message: format!(
-                    "failed to download artifacts from job #{} ({}): {:#}",
-                    dependency.id, dependency.name, e
-                ),
-            })?;
+            // The extractions decide when this ends
+            std::future::pending::<()>().await
+        };
+        let extractions = async {
+            for dependency in &dependencies {
+                trace
+                    .write(&format!(
+                        "Downloading artifacts from job #{} ({})...\n",
+                        dependency.id, dependency.name
+                    ))
+                    .await;
+                let ((mut download, mut attempt), _slot) = downloaded
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| ((Err(anyhow::anyhow!("not downloaded")), tries), None));
+                let result = loop {
+                    let result = match download {
+                        Ok(archive) => {
+                            artifacts::extract_archive_file(archive.path(), workspace, stop).await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    if result.is_ok() || attempt >= tries || stop.check().is_err() {
+                        break result;
+                    }
+                    warn!(
+                        "Artifact download attempt {}/{} failed, retrying",
+                        attempt, tries
+                    );
+                    (download, attempt) = self
+                        .download_dependency(dependency, staging, attempt + 1, tries, stop)
+                        .await;
+                };
+                result.map_err(|e| JobFailure {
+                    reason: FailureReason::ScriptFailure,
+                    exit_code: None,
+                    message: format!(
+                        "failed to download artifacts from job #{} ({}): {:#}",
+                        dependency.id, dependency.name, e
+                    ),
+                })?;
+            }
+            Ok(())
+        };
+        // Downloads still running when an extraction fails are dropped,
+        // which removes their files
+        tokio::select! {
+            extracted = extractions => extracted,
+            () = downloads => unreachable!("waits until the extractions end"),
         }
-        Ok(())
+    }
+
+    /// Download the artifacts of `dependency`, from attempt `first` on until
+    /// one succeeds or the `tries` are used up; the archive (or the last
+    /// error) and the attempt it came from
+    async fn download_dependency(
+        &self,
+        dependency: &crate::gitlab::Dependency,
+        staging_dir: &std::path::Path,
+        first: u32,
+        tries: u32,
+        stop: &Stop,
+    ) -> (Result<tempfile::NamedTempFile>, u32) {
+        let mut attempt = first;
+        loop {
+            let download = artifacts::download_artifacts(
+                &self.gitlab,
+                dependency.id,
+                &dependency.token,
+                staging_dir,
+                stop,
+            )
+            .await;
+            if download.is_ok() || attempt >= tries || stop.check().is_err() {
+                return (download, attempt);
+            }
+            warn!(
+                "Artifact download attempt {}/{} failed, retrying",
+                attempt, tries
+            );
+            attempt += 1;
+        }
     }
 
     /// What the cache and artifact uploads of `job` read in its project, as
@@ -2756,6 +2844,154 @@ mod tests {
             trace
         );
         assert!(!trace.contains("\nscript-ran"), "{}", trace);
+    }
+
+    /// A ZIP archive of `files` (name, content)
+    fn zip_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, content) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// Serve `archive` as the artifacts of job `id` after `delay_ms`
+    async fn serve_artifacts(server: &MockServer, id: u64, archive: Vec<u8>, delay_ms: u64) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/jobs/{}/artifacts", id)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(archive)
+                    .set_delay(Duration::from_millis(delay_ms)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// A job depending on the artifacts of `dependencies`, listing what it
+    /// got in after_script (which runs when the download fails too)
+    fn job_with_dependencies(id: u64, dependencies: &[u64], variables: serde_json::Value) -> Job {
+        let dependencies: Vec<serde_json::Value> = dependencies
+            .iter()
+            .map(|dep| {
+                serde_json::json!({"id": dep, "name": format!("build-{}", dep), "token": "d",
+                                   "artifacts_file": {"filename": "artifacts.zip", "size": 10}})
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": id, "token": "t",
+            "variables": variables,
+            "steps": [
+                {"name": "script", "script": ["echo same=$(cat same.txt)"], "when": "on_success"},
+                {"name": "after_script", "script": ["echo files: *.txt"], "when": "always"}
+            ],
+            "dependencies": dependencies
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dependency_artifacts_download_at_once_and_extract_in_order() {
+        let server = MockServer::start().await;
+        // The second job's archive arrives first, but its same.txt must
+        // replace the first one's, as when they download one by one
+        serve_artifacts(&server, 201, zip_of(&[("same.txt", "first")]), 700).await;
+        serve_artifacts(&server, 202, zip_of(&[("same.txt", "second")]), 0).await;
+        serve_artifacts(&server, 203, zip_of(&[("c.txt", "c")]), 700).await;
+        serve_artifacts(&server, 204, zip_of(&[("d.txt", "d")]), 700).await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+
+        let started = std::time::Instant::now();
+        daemon
+            .execute_job(job_with_dependencies(
+                200,
+                &[201, 202, 203, 204],
+                serde_json::json!([]),
+            ))
+            .await
+            .unwrap();
+        let took = started.elapsed();
+
+        let trace = trace_of(&server, 200).await;
+        assert_eq!(final_update(&server, 200).await["state"], "success");
+        assert!(trace.contains("same=second"), "{}", trace);
+        assert!(trace.contains("files: c.txt d.txt same.txt"), "{}", trace);
+        let at = |dep: u64| {
+            trace
+                .find(&format!("Downloading artifacts from job #{} ", dep))
+                .unwrap_or_else(|| panic!("no download line for #{}\n{}", dep, trace))
+        };
+        assert!(at(201) < at(202) && at(202) < at(203) && at(203) < at(204));
+        // One by one, the three delayed downloads would take 2.1 s
+        assert!(took < Duration::from_millis(1800), "took {:?}", took);
+    }
+
+    #[tokio::test]
+    async fn a_failed_dependency_download_is_retried_and_stops_later_extractions() {
+        let server = MockServer::start().await;
+        serve_artifacts(&server, 211, zip_of(&[("a.txt", "a")]), 0).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/212/artifacts"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        serve_artifacts(&server, 213, zip_of(&[("c.txt", "c")]), 0).await;
+        // 214 fails once, 215 sends a broken archive once: the next attempt
+        // downloads them again
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/214/artifacts"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        serve_artifacts(&server, 214, zip_of(&[("same.txt", "from-214")]), 0).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/215/artifacts"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not a zip".to_vec()))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        serve_artifacts(&server, 215, zip_of(&[("e.txt", "e")]), 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = daemon(&server, dir.path()).await;
+        let attempts = serde_json::json!([{"key": "ARTIFACT_DOWNLOAD_ATTEMPTS", "value": "2"}]);
+
+        daemon
+            .execute_job(job_with_dependencies(
+                210,
+                &[211, 212, 213],
+                attempts.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(final_update(&server, 210).await["state"], "failed");
+        let trace = trace_of(&server, 210).await;
+        assert!(
+            trace.contains("failed to download artifacts from job #212 (build-212)"),
+            "{}",
+            trace
+        );
+        assert_eq!(requests(&server, "GET", 212).await.len(), 2);
+        // Nothing after the failed job's artifacts is extracted
+        assert!(trace.contains("files: a.txt\n"), "{}", trace);
+        assert!(!trace.contains("Downloading artifacts from job #213"));
+        assert!(!trace.contains("same="), "{}", trace);
+
+        daemon
+            .execute_job(job_with_dependencies(216, &[214, 215], attempts))
+            .await
+            .unwrap();
+        let trace = trace_of(&server, 216).await;
+        assert_eq!(final_update(&server, 216).await["state"], "success");
+        assert!(trace.contains("same=from-214"), "{}", trace);
+        assert!(trace.contains("files: e.txt same.txt"), "{}", trace);
+        assert_eq!(requests(&server, "GET", 214).await.len(), 2);
+        assert_eq!(requests(&server, "GET", 215).await.len(), 2);
     }
 
     #[tokio::test]
