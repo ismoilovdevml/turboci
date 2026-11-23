@@ -81,6 +81,11 @@ impl Vars {
         self.entries.iter().flatten()
     }
 
+    fn get(&self, key: &str) -> Option<&str> {
+        let at = *self.index.get(key)?;
+        self.entries[at].as_ref().map(|(_, value)| value.as_str())
+    }
+
     fn into_vec(self) -> Vec<(String, String)> {
         self.entries.into_iter().flatten().collect()
     }
@@ -266,7 +271,26 @@ pub fn job_env(job: &Job, builds_dir: &str, host_job_dir: &Path, runner: &Runner
         let value = if var.raw {
             value
         } else {
-            expand(&value, &values)
+            // A variable naming itself (`PATH=/opt/tool/bin:$PATH`) means the
+            // value it replaces: an earlier definition (the runner's
+            // `environment` under a job's PATH), or on the shell executor the
+            // runner process's own environment. Its value as given would
+            // name itself again and leave a literal `$PATH` in the job's PATH.
+            let previous = vars.get(&var.key).map(str::to_string).or_else(|| {
+                if runner.disposable {
+                    None
+                } else {
+                    std::env::var(&var.key).ok()
+                }
+            });
+            match previous {
+                Some(previous) if names(&value, &var.key) => {
+                    let mut scoped = values.clone();
+                    scoped.insert(var.key.clone(), previous);
+                    expand(&value, &scoped)
+                }
+                _ => expand(&value, &values),
+            }
         };
         if var.file {
             env.files.retain(|(path, _)| !path.ends_with(&var.key));
@@ -335,6 +359,19 @@ pub fn service_env(
         files: Vec::new(),
     }
     .to_docker()
+}
+
+/// Whether `value` refers to the variable `key` (`$KEY` or `${KEY}`)
+fn names(value: &str, key: &str) -> bool {
+    value.contains(&format!("${{{}}}", key))
+        || value
+            .match_indices(&format!("${}", key))
+            .any(|(at, found)| {
+                !value[at + found.len()..]
+                    .bytes()
+                    .next()
+                    .is_some_and(|c| c == b'_' || c.is_ascii_alphanumeric())
+            })
 }
 
 /// Expand `$VAR` and `${VAR}` from `values` exactly as gitlab-runner does
@@ -715,6 +752,43 @@ mod tests {
                 PathBuf::from("/h/project.tmp/KUBECONFIG_FILE"),
                 "apiVersion: v1 /root".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn a_variable_naming_itself_extends_the_value_it_replaces() {
+        let with = |vars: serde_json::Value| -> Job {
+            serde_json::from_value(serde_json::json!({"id": 1, "token": "t", "variables": vars}))
+                .unwrap()
+        };
+        let path_of = |j: &Job, disposable: bool| {
+            let runner = RunnerVars {
+                disposable,
+                ..RunnerVars::default()
+            };
+            get(&job_env(j, "/b", Path::new("/h"), &runner), "PATH")
+                .unwrap()
+                .to_string()
+        };
+
+        // The runner's `environment` first, then the job's own PATH
+        let both = with(serde_json::json!([
+            {"key": "PATH", "value": "/env/bin:/usr/bin"},
+            {"key": "PATH", "value": "$PATH:/job/bin"}
+        ]));
+        assert_eq!(path_of(&both, true), "/env/bin:/usr/bin:/job/bin");
+        assert_eq!(path_of(&both, false), "/env/bin:/usr/bin:/job/bin");
+
+        // Alone on the shell executor: the runner process's own PATH
+        let alone = with(serde_json::json!([{"key": "PATH", "value": "/tools:${PATH}"}]));
+        let host = std::env::var("PATH").unwrap();
+        assert_eq!(path_of(&alone, false), format!("/tools:{}", host));
+        // A container's PATH is not the runner's: unchanged there
+        assert!(!path_of(&alone, true).contains(&host));
+
+        assert!(names("a:$PATH:b", "PATH") && names("${PATH}", "PATH") && names("$PATH", "PATH"));
+        assert!(
+            !names("$PATHX", "PATH") && !names("$PATH_EXTRA", "PATH") && !names("PATH", "PATH")
         );
     }
 

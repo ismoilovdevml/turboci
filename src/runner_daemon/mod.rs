@@ -2390,6 +2390,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_environment_path_reaches_shell_jobs() {
+        // A config migrated from gitlab-runner puts tools on PATH through
+        // `environment`, written out or extending the service's own PATH, and
+        // a job may extend it again with its own `PATH: $PATH:...`
+        let full = "{tools}:/usr/local/bin:/usr/bin:/bin";
+        for (id, path, job_path) in [
+            (141u64, full, None),
+            (142, "{tools}:$PATH", None),
+            (143, full, Some("$PATH:/opt/extra/bin")),
+        ] {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let tools = dir.path().join("tools");
+            std::fs::create_dir_all(&tools).unwrap();
+            let tool = tools.join("turboci-test-tool");
+            std::fs::write(&tool, "#!/bin/sh\necho tool-ran\n").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let mut runner = daemon(&server, dir.path()).await;
+            let mut config = (*runner.config).clone();
+            config.environment = vec![format!(
+                "PATH={}",
+                path.replace("{tools}", &tools.display().to_string())
+            )];
+            runner.config = Arc::new(config);
+            let variables: Vec<serde_json::Value> = job_path
+                .map(|value| vec![serde_json::json!({"key": "PATH", "value": value})])
+                .unwrap_or_default();
+            let job: Job = serde_json::from_value(serde_json::json!({
+                "id": id, "token": "t",
+                "variables": variables,
+                "steps": [{"name": "script", "when": "on_success",
+                           "script": ["echo \"path=$PATH\"", "turboci-test-tool", "ls / >/dev/null && echo ls-ran"]}]
+            }))
+            .unwrap();
+
+            runner.execute_job(job).await.unwrap();
+
+            let trace = trace_of(&server, id).await;
+            assert!(trace.contains("\ntool-ran"), "{}:\n{}", path, trace);
+            assert!(trace.contains("\nls-ran"), "{}:\n{}", path, trace);
+            if job_path.is_some() {
+                assert!(trace.contains("/bin:/opt/extra/bin\n"), "{}", trace);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn proxy_reaches_jobs_and_yields_to_job_variables() {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
