@@ -1,7 +1,13 @@
 //! A small client for the Docker Engine API calls the Docker executor makes,
-//! over dockerd's unix socket (HTTP/1.1, one connection per request).
+//! over dockerd's unix socket (HTTP/1.1).
 //!
-//! It speaks to dockerd exactly as bollard 0.19 did before it:
+//! Connections are kept alive for the next request, like the Docker CLI's
+//! (and gitlab-runner's) Go client does, unlike bollard (one connection per
+//! request): a few idle ones, for a few seconds. A connection an exec start
+//! hijacked is never reused. A GET that fails on a kept-alive connection
+//! dockerd closed (a restart) is sent once more.
+//!
+//! Otherwise it speaks to dockerd exactly as bollard 0.19 did before it:
 //! - the socket is `DOCKER_HOST`, which must be a `unix://` address when
 //!   set (TCP and TLS are not supported), else /var/run/docker.sock, and it
 //!   must exist when the client is created;
@@ -13,6 +19,8 @@
 //!   dockerd's `message`, and errors read the same as bollard's did.
 
 mod decode;
+#[cfg(test)]
+pub mod fake;
 mod models;
 
 pub use decode::LogOutput;
@@ -25,7 +33,7 @@ use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, CONNECTION, CONTENT_TYPE, UPGRADE};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyperlocal::UnixConnector;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -42,6 +50,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const ATTACHED_EXEC_START: &str = r#"{"Detach":false,"Tty":false,"OutputCapacity":null}"#;
 /// Read buffer of an exec's output stream
 const EXEC_OUTPUT_CAPACITY: usize = 8 * 1024;
+/// Idle connections kept for the next requests: a job's setup makes a few
+/// calls at a time, and several jobs may run
+const POOL_MAX_IDLE: usize = 8;
+/// How long an idle connection is kept: the calls of a job's setup follow
+/// each other within milliseconds. dockerd closes no idle connection, and
+/// this stays below the 5s after which Podman's service may exit when idle.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Why a Docker API call failed
 #[derive(Debug)]
@@ -173,7 +188,10 @@ impl Docker {
     /// A client of the socket at `path`, which is not checked
     pub fn with_socket(path: &str) -> Self {
         let mut builder = Client::builder(TokioExecutor::new());
-        builder.pool_max_idle_per_host(0);
+        builder
+            .pool_max_idle_per_host(POOL_MAX_IDLE)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_timer(TokioTimer::new());
         Self {
             client: builder.build(UnixConnector),
             host: path.bytes().map(|b| format!("{:02x}", b)).collect(),
@@ -202,20 +220,30 @@ impl Docker {
         headers: Vec<(HeaderName, HeaderValue)>,
         body: Bytes,
     ) -> Result<Response<Incoming>> {
-        let mut builder = Request::builder().method(method);
-        for (name, value) in headers {
-            builder = builder.header(name, value);
-        }
-        let request = builder
-            .uri(self.uri(path, query)?)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(body))
-            .map_err(Error::Http)?;
-        let response =
+        let uri = self.uri(path, query)?;
+        let send = || async {
+            let mut builder = Request::builder().method(method.clone());
+            for (name, value) in &headers {
+                builder = builder.header(name, value);
+            }
+            let request = builder
+                .uri(uri.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Full::new(body.clone()))
+                .map_err(Error::Http)?;
             match tokio::time::timeout(REQUEST_TIMEOUT, self.client.request(request)).await {
-                Ok(response) => response.map_err(Error::Client)?,
-                Err(_) => return Err(Error::Timeout),
-            };
+                Ok(response) => response.map_err(Error::Client),
+                Err(_) => Err(Error::Timeout),
+            }
+        };
+        let response = match send().await {
+            // A kept-alive connection that dockerd closed (it restarted) as
+            // the request went out on it. A GET changes nothing, so it is
+            // sent again, on a new connection. Hyper itself resends what had
+            // not been written yet.
+            Err(Error::Client(e)) if method == Method::GET && !e.is_connect() => send().await?,
+            response => response?,
+        };
         let status = response.status();
         if status.is_success()
             || status == StatusCode::NOT_MODIFIED
@@ -258,9 +286,12 @@ impl Docker {
 
     /// A call whose response body is not needed
     async fn call(&self, method: Method, path: &str, query: Option<&[(&str, &str)]>) -> Result<()> {
-        self.request(method, path, query, Vec::new(), Bytes::new())
-            .await
-            .map(drop)
+        let response = self
+            .request(method, path, query, Vec::new(), Bytes::new())
+            .await?;
+        // Read to its end (usually empty), so the connection can be reused
+        response.into_body().collect().await.map_err(Error::Hyper)?;
+        Ok(())
     }
 
     /// The newline-delimited JSON messages of a response, sent when the
@@ -901,6 +932,116 @@ mod tests {
                 )
             );
         }
+    }
+
+    use fake::{Answer, FakeDockerd};
+    use std::sync::Mutex;
+
+    fn client_of(fake: &FakeDockerd) -> Docker {
+        Docker::with_socket(fake.path().to_str().unwrap())
+    }
+
+    #[tokio::test]
+    async fn calls_one_after_another_reuse_a_connection() {
+        let fake = FakeDockerd::start(|_, _| Answer::Json("{}"));
+        let docker = client_of(&fake);
+
+        for _ in 0..50 {
+            docker.inspect_volume("v").await.unwrap();
+            docker.remove_network("n").await.unwrap();
+        }
+
+        assert_eq!(fake.requests().len(), 100);
+        // One per call without keep-alive
+        assert!(
+            fake.connections() <= 5,
+            "{} connections",
+            fake.connections()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hijacked_exec_connection_is_never_reused() {
+        // An 8-byte header (stdout, length 6) and the output
+        let mut output = vec![1, 0, 0, 0, 0, 0, 0, 6];
+        output.extend_from_slice(b"hello\n");
+        let fake = FakeDockerd::start(move |request, _| {
+            if request.ends_with("/start") {
+                Answer::Upgrade(output.clone())
+            } else {
+                Answer::Json("{}")
+            }
+        });
+        let docker = client_of(&fake);
+
+        for round in 0..3 {
+            docker.inspect_volume("before").await.unwrap();
+            let mut stream = docker.start_exec("e").await.unwrap();
+            let mut text = String::new();
+            while let Some(chunk) = stream.next().await {
+                text.push_str(&chunk.unwrap().to_string());
+            }
+            assert_eq!(text, "hello\n", "round {}", round);
+            docker.inspect_volume("after").await.unwrap();
+        }
+
+        // No request followed an exec start on its connection
+        let requests = fake.requests();
+        for (number, request) in &requests {
+            if request.ends_with("/start") {
+                assert_eq!(
+                    requests.iter().rfind(|(n, _)| n == number),
+                    Some(&(*number, request.clone())),
+                    "{:?}",
+                    requests
+                );
+            }
+        }
+        assert_eq!(requests.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn a_get_whose_connection_closes_unanswered_is_sent_again() {
+        // Every request is first answered by closing the connection, as by
+        // a dockerd that stops while it reads it
+        let seen = Mutex::new(std::collections::HashSet::new());
+        let fake = FakeDockerd::start(move |request, _| {
+            if seen.lock().unwrap().insert(request.to_string()) {
+                Answer::HangUp
+            } else {
+                Answer::Json("{}")
+            }
+        });
+        let docker = client_of(&fake);
+
+        docker.inspect_volume("v").await.unwrap();
+        // A POST may have been carried out: it is not sent again
+        let posted = docker.start_container("c").await;
+
+        assert!(posted.is_err(), "{:?}", posted);
+        let requests: Vec<String> = fake.requests().into_iter().map(|(_, r)| r).collect();
+        assert_eq!(
+            requests,
+            [
+                "GET /volumes/v",
+                "GET /volumes/v",
+                "POST /containers/c/start"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_go_on_after_dockerd_restarts() {
+        let fake = FakeDockerd::start(|_, _| Answer::Json("{}"));
+        let docker = client_of(&fake);
+
+        for _ in 0..20 {
+            docker.inspect_volume("v").await.unwrap();
+            fake.restart();
+            docker.inspect_volume("v").await.unwrap();
+        }
+
+        assert_eq!(fake.requests().len(), 40);
     }
 
     #[tokio::test]
