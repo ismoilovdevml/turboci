@@ -58,10 +58,21 @@ so merge request and tag pipelines get the right code.
 | `reports` | Uploaded in the format GitLab asks for (`zip`, `gzip`, `raw`) |
 | Dependencies | `needs` and `dependencies` artifacts are downloaded and extracted before the script |
 | `ARTIFACT_DOWNLOAD_ATTEMPTS` | Retries of dependency downloads (1–10) |
+| `ARTIFACT_COMPRESSION_LEVEL` | `fastest` (store), `fast`, `default`, `slow`, `slowest`: deflate level 1, 6, 7, 9 of ZIP artifacts. gitlab-runner honours it only with `FF_USE_FASTZIP`; TurboCI always does |
 
 Archives are streamed to and from disk, never held in memory. Extraction
 rejects entries that would escape the workspace (`../`, absolute paths,
 symlinks pointing outside).
+
+An artifact ZIP is uploaded while it is written, as gitlab-runner does, and
+staged in a file next to the workspace at the same time. A failed upload is
+sent again from that file: 3 attempts in all (6 while GitLab answers 503),
+1 s then 2 s apart (up to 5 s), or after the `Retry-After` GitLab sends
+(at most 60 s). Timeouts (408), rate limits (429) and server errors are
+retried; other client errors (403, 413, ...) fail at once. Each retry is
+noted in the job log. Files whose start does not compress (random,
+encrypted or packed data) and files with the extension of a compressed
+format (`.png`, `.gz`, `.zip`, `.jar`, ...) are stored rather than deflated.
 
 ## Cache
 

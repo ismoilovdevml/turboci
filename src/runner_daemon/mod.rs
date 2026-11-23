@@ -1391,6 +1391,22 @@ impl RunnerDaemon {
                 .collect()
         };
         let workspace = self.project_dir(job);
+        let level = match artifacts::CompressionLevel::parse(
+            variables
+                .get("ARTIFACT_COMPRESSION_LEVEL")
+                .map(String::as_str),
+        ) {
+            Ok(level) => level,
+            Err(e) => {
+                trace
+                    .write(&format!(
+                        "WARNING: ARTIFACT_COMPRESSION_LEVEL: {}, using default\n",
+                        e
+                    ))
+                    .await;
+                artifacts::CompressionLevel::Default
+            }
+        };
 
         for artifact in job_artifacts {
             let wanted = match artifact.when.as_deref() {
@@ -1421,39 +1437,39 @@ impl RunnerDaemon {
                 ))
                 .await;
 
+            let extension = match format {
+                "gzip" => ".gz",
+                "zip" => ".zip",
+                _ => "",
+            };
+            let upload = ArtifactUpload {
+                file_name: format!("{}{}", name, extension),
+                format: format.to_string(),
+                artifact_type: artifact_type.to_string(),
+                expire_in: artifact.expire_in.clone(),
+            };
+            let workspace = workspace.to_string_lossy();
+            let exclude = expand_all(&artifact.exclude);
             // Staged next to the workspace (same disk, not a possibly RAM-backed /tmp)
+            let staging_dir = self.executor.job_dir(job);
+            let files = artifacts::ArtifactFiles {
+                workspace: &workspace,
+                paths: &paths,
+                exclude: &exclude,
+                level,
+                staging_dir: &staging_dir,
+            };
             let archive_and_upload = async {
-                let Some(archive) = artifacts::create_archive(
-                    &workspace.to_string_lossy(),
-                    &paths,
-                    &expand_all(&artifact.exclude),
-                    format,
-                    &self.executor.job_dir(job),
+                artifacts::archive_and_upload(
+                    &self.gitlab,
+                    job.id,
+                    &job.token,
+                    files,
+                    &upload,
+                    &mut *trace,
                 )
-                .await?
-                else {
-                    return Ok(false);
-                };
-                let extension = match format {
-                    "gzip" => ".gz",
-                    "zip" => ".zip",
-                    _ => "",
-                };
-                self.gitlab
-                    .upload_artifacts(
-                        job.id,
-                        &job.token,
-                        ArtifactUpload {
-                            path: archive.file.path().to_path_buf(),
-                            len: archive.len,
-                            file_name: format!("{}{}", name, extension),
-                            format: format.to_string(),
-                            artifact_type: artifact_type.to_string(),
-                            expire_in: artifact.expire_in.clone(),
-                        },
-                    )
-                    .await
-                    .map(|()| true)
+                .await
+                .map(|uploaded| uploaded.is_some())
             };
             // An aborted job uploads nothing more: an upload may take up to an
             // hour, longer than the service manager waits for the runner to
@@ -1461,15 +1477,16 @@ impl RunnerDaemon {
             // the background, into a staging file that is then removed.
             let result = tokio::select! {
                 biased;
-                _ = cancel.reached(RemoteState::Aborted) => {
-                    trace.write("Artifacts not uploaded: job canceled\n").await;
-                    return Err(JobFailure {
-                        reason: FailureReason::JobCanceled,
-                        exit_code: None,
-                        message: "canceled".to_string(),
-                    });
-                }
-                result = archive_and_upload => result,
+                _ = cancel.reached(RemoteState::Aborted) => None,
+                result = archive_and_upload => Some(result),
+            };
+            let Some(result) = result else {
+                trace.write("Artifacts not uploaded: job canceled\n").await;
+                return Err(JobFailure {
+                    reason: FailureReason::JobCanceled,
+                    exit_code: None,
+                    message: "canceled".to_string(),
+                });
             };
             match result {
                 Ok(false) => {

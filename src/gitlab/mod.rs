@@ -169,8 +169,6 @@ impl GitLabClient {
         for attempt in 1..=max_attempts {
             match operation().await {
                 Ok(result) => return Ok(result),
-                // e.g. 413 or 403: the same request will fail the same way again
-                Err(e) if e.is::<Permanent>() => return Err(e),
                 Err(e) => {
                     last_error = Some(e);
                     if attempt < max_attempts {
@@ -540,63 +538,92 @@ impl GitLabClient {
         Ok(RemoteState::from_response(&response))
     }
 
-    /// Upload an artifacts archive as gitlab-runner does: multipart `file` field,
-    /// with format, type and expiry as query parameters
+    /// One attempt at uploading an artifacts archive, as gitlab-runner does:
+    /// multipart `file` field, with format, type and expiry as query
+    /// parameters. A file is sent with its length; a stream (the archive as
+    /// it is written) chunked. The error says whether to try again.
     pub async fn upload_artifacts(
         &self,
         job_id: u64,
         token: &str,
-        upload: ArtifactUpload,
-    ) -> Result<()> {
+        upload: &ArtifactUpload,
+        body: ArtifactBody<'_>,
+    ) -> std::result::Result<(), UploadError> {
         let url = format!("{}/api/v4/jobs/{}/artifacts", self.url, job_id);
         let mut query = vec![
-            ("artifact_format", upload.format.clone()),
-            ("artifact_type", upload.artifact_type.clone()),
+            ("artifact_format", upload.format.as_str()),
+            ("artifact_type", upload.artifact_type.as_str()),
         ];
         if let Some(expire_in) = &upload.expire_in {
-            query.push(("expire_in", expire_in.clone()));
+            query.push(("expire_in", expire_in.as_str()));
         }
-
-        self.retry_with_backoff(|| async {
-            let file = tokio::fs::File::open(&upload.path)
-                .await
-                .with_context(|| format!("Failed to open {}", upload.path.display()))?;
-            let part = reqwest::multipart::Part::stream_with_length(file, upload.len)
-                .file_name(upload.file_name.clone())
-                .mime_str("application/octet-stream")?;
-            let response = self
-                .client
-                .post(&url)
-                .query(&query)
-                .header("JOB-TOKEN", token)
-                .timeout(TRANSFER_TIMEOUT)
-                .multipart(reqwest::multipart::Form::new().part("file", part))
-                .send()
-                .await
-                .context("Failed to upload artifacts")?;
-
-            match response.status() {
-                StatusCode::CREATED | StatusCode::OK => Ok(()),
-                StatusCode::PAYLOAD_TOO_LARGE => Err(Permanent(
-                    "Artifact upload rejected: archive is larger than the instance limit"
-                        .to_string(),
+        let part = match body {
+            ArtifactBody::Stream(body) => reqwest::multipart::Part::stream(body),
+            ArtifactBody::File(path) => {
+                let file = tokio::fs::File::open(path)
+                    .await
+                    .map_err(|e| UploadError::local(format!("open {}: {}", path.display(), e)))?;
+                let len = file
+                    .metadata()
+                    .await
+                    .map_err(|e| UploadError::local(format!("stat {}: {}", path.display(), e)))?
+                    .len();
+                // Read in large chunks: each read is a trip to the blocking pool
+                let chunks = tokio_util::io::ReaderStream::with_capacity(file, UPLOAD_CHUNK);
+                reqwest::multipart::Part::stream_with_length(
+                    reqwest::Body::wrap_stream(chunks),
+                    len,
                 )
-                .into()),
-                status => {
-                    let error = response.text().await.unwrap_or_default();
-                    let message = format!("Artifact upload failed: {} {}", status, error);
-                    if status.is_client_error() {
-                        Err(Permanent(message).into())
-                    } else {
-                        Err(anyhow::anyhow!(message))
-                    }
-                }
             }
-        })
-        .await?;
+        };
+        let part = part
+            .file_name(upload.file_name.clone())
+            .mime_str("application/octet-stream")
+            .map_err(|e| UploadError::local(e.to_string()))?;
+        let response = self
+            .client
+            .post(&url)
+            .query(&query)
+            .header("JOB-TOKEN", token)
+            .timeout(TRANSFER_TIMEOUT)
+            .multipart(reqwest::multipart::Form::new().part("file", part))
+            .send()
+            .await
+            .map_err(|e| UploadError {
+                message: format!("Failed to upload artifacts: {:#}", anyhow::Error::new(e)),
+                retry: Some(None),
+                unavailable: false,
+            })?;
 
-        info!("Artifacts uploaded for job #{}", job_id);
-        Ok(())
+        let status = response.status();
+        if status == StatusCode::CREATED || status == StatusCode::OK {
+            info!("Artifacts uploaded for job #{}", job_id);
+            return Ok(());
+        }
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| parse_retry_after(v, chrono::Utc::now()));
+        let message = match status {
+            StatusCode::PAYLOAD_TOO_LARGE => {
+                "Artifact upload rejected: archive is larger than the instance limit".to_string()
+            }
+            _ => {
+                let error = response.text().await.unwrap_or_default();
+                format!("Artifact upload failed: {} {}", status, error.trim())
+            }
+        };
+        // Like gitlab-runner's retry statuses: timeouts, rate limits and
+        // server errors may pass; other client errors (403, 413, ...) do not
+        let retryable = status.is_server_error()
+            || status == StatusCode::REQUEST_TIMEOUT
+            || status == StatusCode::TOO_MANY_REQUESTS;
+        Err(UploadError {
+            message,
+            retry: retryable.then_some(retry_after),
+            unavailable: status == StatusCode::SERVICE_UNAVAILABLE,
+        })
     }
 
     /// Download the artifacts archive of job `job_id` (a dependency), authenticated
@@ -1110,24 +1137,88 @@ impl TokenResponse {
     }
 }
 
-/// An error that retrying cannot fix (4xx responses)
-#[derive(Debug)]
-struct Permanent(String);
+/// Read size of an artifact upload from its staging file
+const UPLOAD_CHUNK: usize = 256 * 1024;
 
-impl std::fmt::Display for Permanent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+/// Attempts at an artifact upload (gitlab-runner's artifacts-uploader:
+/// 3, and 6 while GitLab answers 503)
+const UPLOAD_ATTEMPTS: u32 = 3;
+const UPLOAD_ATTEMPTS_UNAVAILABLE: u32 = 6;
+
+/// Wait before the second attempt at an upload, doubled for each further
+/// one up to `MAX_UPLOAD_BACKOFF` (gitlab-runner's retry helper: 1-5 s)
+const UPLOAD_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_UPLOAD_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Longest wait taken from the Retry-After of an upload response
+/// (gitlab-runner's rate limit retries wait at most a minute)
+const MAX_UPLOAD_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// The body of an artifact upload
+pub enum ArtifactBody<'a> {
+    /// The archive staged in this file, sent with its length
+    File(&'a std::path::Path),
+    /// The archive as it is written, sent chunked
+    Stream(reqwest::Body),
+}
+
+/// Why an attempt at an artifact upload failed, and whether to try again
+#[derive(Debug)]
+pub struct UploadError {
+    pub message: String,
+    /// `None` when the same upload would fail again (403, 413, other client
+    /// errors, a local error); else the wait GitLab asked for, if any
+    retry: Option<Option<Duration>>,
+    /// GitLab answered 503: retried more often
+    unavailable: bool,
+}
+
+impl UploadError {
+    /// An error on this side (the staging file), not worth a retry
+    fn local(message: String) -> Self {
+        Self {
+            message: format!("Failed to upload artifacts: {}", message),
+            retry: None,
+            unavailable: false,
+        }
+    }
+
+    /// How many attempts an upload failing like this gets in all
+    pub fn attempts(&self) -> u32 {
+        if self.unavailable {
+            UPLOAD_ATTEMPTS_UNAVAILABLE
+        } else {
+            UPLOAD_ATTEMPTS
+        }
+    }
+
+    /// The wait before trying again after attempt `attempt` (from 1), or
+    /// `None` when there is no attempt left
+    pub fn retry_delay(&self, attempt: u32) -> Option<Duration> {
+        let asked = self.retry?;
+        if attempt >= self.attempts() {
+            return None;
+        }
+        Some(match asked {
+            Some(after) => after.min(MAX_UPLOAD_RETRY_AFTER),
+            None => UPLOAD_BACKOFF
+                .saturating_mul(1 << (attempt - 1).min(8))
+                .min(MAX_UPLOAD_BACKOFF),
+        })
     }
 }
 
-impl std::error::Error for Permanent {}
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
-/// An archive to upload as job artifacts
+impl std::error::Error for UploadError {}
+
+/// An archive to upload as job artifacts: its name and the query parameters
 #[derive(Debug, Clone)]
 pub struct ArtifactUpload {
-    /// Archive file on disk; it is streamed, never loaded into memory
-    pub path: std::path::PathBuf,
-    pub len: u64,
     /// File name of the archive, e.g. `artifacts.zip`
     pub file_name: String,
     /// `zip`, `gzip` or `raw`
@@ -1803,6 +1894,15 @@ mod tests {
             .unwrap();
     }
 
+    fn archive_upload(expire_in: Option<&str>) -> ArtifactUpload {
+        ArtifactUpload {
+            file_name: "artifacts.zip".to_string(),
+            format: "zip".to_string(),
+            artifact_type: "archive".to_string(),
+            expire_in: expire_in.map(str::to_string),
+        }
+    }
+
     #[tokio::test]
     async fn upload_artifacts_sends_multipart_file_with_query_parameters() {
         use wiremock::matchers::{header_exists, query_param};
@@ -1815,73 +1915,128 @@ mod tests {
             .and(query_param("expire_in", "1 week"))
             .and(header_exists("content-type"))
             .respond_with(ResponseTemplate::new(201))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
         let staged = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(staged.path(), b"PK-zip-bytes").unwrap();
-        client(&server)
-            .upload_artifacts(
-                7,
-                "job-token",
-                ArtifactUpload {
-                    path: staged.path().to_path_buf(),
-                    len: 12,
-                    file_name: "artifacts.zip".to_string(),
-                    format: "zip".to_string(),
-                    artifact_type: "archive".to_string(),
-                    expire_in: Some("1 week".to_string()),
-                },
-            )
+        let upload = archive_upload(Some("1 week"));
+        let gitlab = client(&server);
+        gitlab
+            .upload_artifacts(7, "job-token", &upload, ArtifactBody::File(staged.path()))
+            .await
+            .unwrap();
+        // The same, streamed as it is written: chunked, without a length
+        let chunks: Vec<std::io::Result<bytes::Bytes>> = vec![
+            Ok(bytes::Bytes::from_static(b"PK-zip")),
+            Ok(bytes::Bytes::from_static(b"-bytes")),
+        ];
+        let stream = reqwest::Body::wrap_stream(futures_util::stream::iter(chunks));
+        gitlab
+            .upload_artifacts(7, "job-token", &upload, ArtifactBody::Stream(stream))
             .await
             .unwrap();
 
-        let request = &server.received_requests().await.unwrap()[0];
-        let content_type = request.headers["content-type"].to_str().unwrap();
-        assert!(
-            content_type.starts_with("multipart/form-data"),
-            "{}",
-            content_type
+        let requests = server.received_requests().await.unwrap();
+        for request in &requests {
+            let content_type = request.headers["content-type"].to_str().unwrap();
+            assert!(
+                content_type.starts_with("multipart/form-data"),
+                "{}",
+                content_type
+            );
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(
+                body.contains("name=\"file\"; filename=\"artifacts.zip\""),
+                "{}",
+                body
+            );
+            assert!(body.contains("PK-zip-bytes"));
+        }
+        assert!(requests[0].headers.contains_key("content-length"));
+        assert_eq!(
+            requests[1].headers["transfer-encoding"].to_str().unwrap(),
+            "chunked"
         );
-        let body = String::from_utf8_lossy(&request.body);
-        assert!(
-            body.contains("name=\"file\"; filename=\"artifacts.zip\""),
-            "{}",
-            body
-        );
-        assert!(body.contains("PK-zip-bytes"));
     }
 
-    #[tokio::test]
-    async fn rejected_artifact_upload_is_not_retried() {
+    async fn upload_answered(status: u16, retry_after: Option<&str>) -> UploadError {
         let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(status);
+        if let Some(after) = retry_after {
+            response = response.insert_header("Retry-After", after);
+        }
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(413))
+            .respond_with(response)
             .expect(1)
             .mount(&server)
             .await;
         let staged = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(staged.path(), b"zip").unwrap();
-
-        let result = client(&server)
+        client(&server)
             .upload_artifacts(
                 7,
                 "t",
-                ArtifactUpload {
-                    path: staged.path().to_path_buf(),
-                    len: 3,
-                    file_name: "a.zip".to_string(),
-                    format: "zip".to_string(),
-                    artifact_type: "archive".to_string(),
-                    expire_in: None,
-                },
+                &archive_upload(None),
+                ArtifactBody::File(staged.path()),
             )
-            .await;
-
-        assert!(result.is_err());
+            .await
+            .unwrap_err()
     }
 
+    #[tokio::test]
+    async fn rejected_artifact_upload_is_not_retried() {
+        for status in [400, 403, 404, 413, 422] {
+            let error = upload_answered(status, None).await;
+            assert_eq!(error.retry_delay(1), None, "{}", status);
+        }
+        let too_large = upload_answered(413, None).await;
+        assert!(too_large.message.contains("larger than the instance limit"));
+    }
+
+    #[tokio::test]
+    async fn failed_artifact_uploads_are_retried_like_gitlab_runner() {
+        let secs = Duration::from_secs;
+        // Server errors: 3 attempts, 1 s then 2 s apart
+        let error = upload_answered(502, None).await;
+        assert_eq!(error.attempts(), 3);
+        assert_eq!(error.retry_delay(1), Some(secs(1)));
+        assert_eq!(error.retry_delay(2), Some(secs(2)));
+        assert_eq!(error.retry_delay(3), None);
+        // 503: 6 attempts, the backoff capped at 5 s
+        let error = upload_answered(503, None).await;
+        assert_eq!(error.attempts(), 6);
+        assert_eq!(error.retry_delay(3), Some(secs(4)));
+        assert_eq!(error.retry_delay(4), Some(secs(5)));
+        assert_eq!(error.retry_delay(6), None);
+        // Rate limits and timeouts wait as long as GitLab asks, up to a minute
+        let error = upload_answered(429, Some("7")).await;
+        assert_eq!(error.retry_delay(1), Some(secs(7)));
+        let error = upload_answered(503, Some("3600")).await;
+        assert_eq!(error.retry_delay(1), Some(MAX_UPLOAD_RETRY_AFTER));
+        let error = upload_answered(408, None).await;
+        assert_eq!(error.retry_delay(1), Some(secs(1)));
+    }
+
+    #[tokio::test]
+    async fn unreachable_gitlab_upload_is_retried_and_a_missing_file_is_not() {
+        let gitlab = GitLabClient::new("http://127.0.0.1:1".to_string(), "t".to_string());
+        let staged = tempfile::NamedTempFile::new().unwrap();
+        let upload = archive_upload(None);
+        let error = gitlab
+            .upload_artifacts(7, "t", &upload, ArtifactBody::File(staged.path()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.retry_delay(1), Some(Duration::from_secs(1)));
+
+        let missing = staged.path().with_extension("missing");
+        let error = gitlab
+            .upload_artifacts(7, "t", &upload, ArtifactBody::File(&missing))
+            .await
+            .unwrap_err();
+        assert_eq!(error.retry_delay(1), None);
+    }
     #[tokio::test]
     async fn download_artifacts_follows_redirect_to_object_storage() {
         let server = MockServer::start().await;

@@ -944,12 +944,6 @@ pub async fn create_archive(
             .with_context(|| format!("Failed to create a file in {}", staging_dir.display()))?;
         let root = Path::new(&workspace);
         let sha256 = match format.as_str() {
-            "zip" => {
-                let mut out = std::io::BufWriter::with_capacity(IO_BUF, file.as_file_mut());
-                build_zip(ZipWriter::new(&mut out), root, &files, false)?;
-                out.flush()?;
-                None
-            }
             "tar-zstd" => {
                 let out = HashingWriter::new(std::io::BufWriter::with_capacity(
                     IO_BUF,
@@ -964,30 +958,290 @@ pub async fn create_archive(
                     IO_BUF,
                     file.as_file_mut(),
                 ));
-                build_zip(ZipWriter::new_stream(&mut out), root, &files, true)?;
+                build_zip(
+                    ZipWriter::new_stream(&mut out),
+                    root,
+                    &files,
+                    Entries::Cache,
+                )?;
                 out.flush()?;
                 Some(out.hex())
             }
-            "gzip" => {
+            artifact => {
                 let mut out = std::io::BufWriter::with_capacity(IO_BUF, file.as_file_mut());
-                build_gzip(&files, &mut out)?;
+                write_artifact(&mut out, artifact, CompressionLevel::Default, root, &files)?;
                 out.flush()?;
                 None
             }
-            "raw" => match files.as_slice() {
-                [path] => {
-                    copy_regular_file(path, MAX_RAW_ARTIFACT_BYTES, file.as_file_mut())?;
-                    None
-                }
-                _ => anyhow::bail!("raw artifacts need exactly one file, got {}", files.len()),
-            },
-            other => anyhow::bail!("Unsupported artifact format {:?}", other),
         };
         let len = file.as_file().metadata()?.len();
         Ok(Some(Archive { file, len, sha256 }))
     })
     .await
     .context("Archive task panicked")?
+}
+
+/// How artifact ZIP entries are compressed: `ARTIFACT_COMPRESSION_LEVEL`,
+/// with gitlab-runner's names and fastzip's levels (`fastest` stores; the
+/// default is deflate's default, 6, as gitlab-runner's ZIP archiver writes
+/// without FF_USE_FASTZIP)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressionLevel {
+    Fastest,
+    Fast,
+    #[default]
+    Default,
+    Slow,
+    Slowest,
+}
+
+impl CompressionLevel {
+    /// The level a variable's value names; unset or empty is the default.
+    /// An unknown name is an error (gitlab-runner warns and uses the default).
+    pub fn parse(value: Option<&str>) -> std::result::Result<Self, String> {
+        Ok(match value.unwrap_or("") {
+            "fastest" => Self::Fastest,
+            "fast" => Self::Fast,
+            "default" | "" => Self::Default,
+            "slow" => Self::Slow,
+            "slowest" => Self::Slowest,
+            other => {
+                return Err(format!(
+                    "compression level {:?} is invalid (fastest, fast, default, slow or slowest)",
+                    other
+                ))
+            }
+        })
+    }
+
+    /// The deflate level; `None` for storing entries uncompressed
+    fn deflate(self) -> Option<i64> {
+        match self {
+            Self::Fastest => None,
+            Self::Fast => Some(1),
+            Self::Default => Some(6),
+            Self::Slow => Some(7),
+            Self::Slowest => Some(9),
+        }
+    }
+}
+
+/// Write the artifact archive of `files` in `format` (`zip`, `gzip`, `raw`)
+/// to `out`, which needs no seeking: the ZIP is written as a stream (sizes
+/// in data descriptors, as gitlab-runner's ZIPs have them)
+fn write_artifact(
+    out: &mut impl Write,
+    format: &str,
+    level: CompressionLevel,
+    root: &Path,
+    files: &[PathBuf],
+) -> Result<()> {
+    match format {
+        "zip" => {
+            build_zip(
+                ZipWriter::new_stream(out),
+                root,
+                files,
+                Entries::Artifact(level),
+            )?;
+        }
+        "gzip" => build_gzip(files, out)?,
+        "raw" => match files {
+            [path] => copy_regular_file(path, MAX_RAW_ARTIFACT_BYTES, out)?,
+            _ => anyhow::bail!("raw artifacts need exactly one file, got {}", files.len()),
+        },
+        other => anyhow::bail!("Unsupported artifact format {:?}", other),
+    }
+    Ok(())
+}
+
+/// Bytes of the archive handed to the first upload at a time
+const STREAM_CHUNK: usize = 256 * 1024;
+/// Chunks queued for the first upload: the archive is written at most this
+/// far ahead of what GitLab has taken
+const STREAM_QUEUE: usize = 16;
+
+/// Writes an archive to its staging file and, as it goes, to the first
+/// upload attempt. Once that upload is gone (it failed), only the file is
+/// written: a retry sends it.
+struct Tee {
+    file: std::io::BufWriter<std::fs::File>,
+    chunk: Vec<u8>,
+    upload: Option<tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>>,
+    len: u64,
+}
+
+impl Tee {
+    fn send(&mut self, item: std::io::Result<bytes::Bytes>) {
+        if let Some(upload) = &self.upload {
+            if upload.blocking_send(item).is_err() {
+                self.upload = None;
+            }
+        }
+    }
+
+    fn send_chunk(&mut self) {
+        if !self.chunk.is_empty() {
+            let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(STREAM_CHUNK));
+            self.send(Ok(chunk.into()));
+        }
+    }
+
+    /// The archive is complete: the file has it all, and the upload's body ends
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.file.flush()?;
+        self.send_chunk();
+        self.upload = None;
+        Ok(())
+    }
+
+    /// Writing the archive failed: the upload must not complete
+    fn fail(&mut self, error: &anyhow::Error) {
+        self.send(Err(std::io::Error::other(format!("{:#}", error))));
+        self.upload = None;
+    }
+}
+
+impl Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write_all(buf)?;
+        self.len += buf.len() as u64;
+        if self.upload.is_some() {
+            self.chunk.extend_from_slice(buf);
+            if self.chunk.len() >= STREAM_CHUNK {
+                self.send_chunk();
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// An artifact to archive and upload
+pub struct ArtifactFiles<'a> {
+    pub workspace: &'a str,
+    pub paths: &'a [String],
+    pub exclude: &'a [String],
+    pub level: CompressionLevel,
+    /// Where the archive is staged (a directory on disk)
+    pub staging_dir: &'a Path,
+}
+
+/// Archive the files matching `files` and upload them as job artifacts
+/// (`upload.format`). The first attempt sends the archive while it is
+/// written, as gitlab-runner does, so archiving and uploading overlap; it
+/// is staged in a file at the same time, which a retry sends (gitlab-runner's
+/// attempts and backoff, or the wait GitLab asks for). Retries are reported
+/// in `trace`. Returns the archive size, `None` when no file matches.
+pub async fn archive_and_upload(
+    gitlab: &GitLabClient,
+    job_id: u64,
+    token: &str,
+    files: ArtifactFiles<'_>,
+    upload: &crate::gitlab::ArtifactUpload,
+    trace: &mut super::trace::TraceWriter<'_>,
+) -> Result<Option<u64>> {
+    use crate::gitlab::ArtifactBody;
+
+    let (workspace, patterns, exclude) = (
+        files.workspace.to_string(),
+        files.paths.to_vec(),
+        files.exclude.to_vec(),
+    );
+    let entries =
+        tokio::task::spawn_blocking(move || collect_paths(&workspace, &patterns, &exclude, false))
+            .await
+            .context("Archive task panicked")??;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let staged = tempfile::NamedTempFile::new_in(files.staging_dir)
+        .with_context(|| format!("Failed to create a file in {}", files.staging_dir.display()))?;
+    let file = staged.as_file().try_clone()?;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(STREAM_QUEUE);
+    let (root, format, level) = (
+        PathBuf::from(files.workspace),
+        upload.format.clone(),
+        files.level,
+    );
+    // Dropped with the upload (a canceled job): the archive is then still
+    // written to its end in the background, into a file that is removed
+    let archiver = tokio::task::spawn_blocking(move || {
+        let mut out = Tee {
+            file: std::io::BufWriter::with_capacity(IO_BUF, file),
+            chunk: Vec::with_capacity(STREAM_CHUNK),
+            upload: Some(sender),
+            len: 0,
+        };
+        let written = write_artifact(&mut out, &format, level, &root, &entries)
+            .and_then(|()| out.finish().map_err(anyhow::Error::from));
+        match written {
+            Ok(()) => Ok(out.len),
+            Err(e) => {
+                out.fail(&e);
+                Err(e)
+            }
+        }
+    });
+    let body = futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx));
+    let started = std::time::Instant::now();
+    let (mut result, archived) = tokio::join!(
+        gitlab.upload_artifacts(
+            job_id,
+            token,
+            upload,
+            ArtifactBody::Stream(reqwest::Body::wrap_stream(body)),
+        ),
+        archiver
+    );
+    // An archive that could not be written is the error, whatever GitLab said
+    let len = archived.context("Archive task panicked")??;
+    let mut attempt = 1;
+    loop {
+        match result {
+            Ok(()) => {
+                let secs = started.elapsed().as_secs_f64();
+                trace
+                    .write(&format!(
+                        "Uploaded {:.1} MB in {:.1}s\n",
+                        len as f64 / 1e6,
+                        secs
+                    ))
+                    .await;
+                return Ok(Some(len));
+            }
+            Err(e) => {
+                let Some(delay) = e.retry_delay(attempt) else {
+                    return Err(anyhow::anyhow!(e.message));
+                };
+                warn!(
+                    "Job #{} artifact upload attempt {}/{} failed, retrying in {:?}: {}",
+                    job_id,
+                    attempt,
+                    e.attempts(),
+                    delay,
+                    e
+                );
+                trace
+                    .write(&format!(
+                        "WARNING: {} (attempt {}/{}), retrying in {}s\n",
+                        e,
+                        attempt,
+                        e.attempts(),
+                        delay.as_secs_f64()
+                    ))
+                    .await;
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                result = gitlab
+                    .upload_artifacts(job_id, token, upload, ArtifactBody::File(staged.path()))
+                    .await;
+            }
+        }
+    }
 }
 
 /// Passes writes on to `inner` and hashes them
@@ -1146,17 +1400,17 @@ fn collect_paths(
         .collect())
 }
 
-/// Add `files` to `zip` and finish it; `cache` picks the cache's entry
-/// compression (zstd or stored) over deflate. Returns the writer.
+/// Add `files` to `zip` and finish it, compressing entries as `entries`
+/// says. Returns the writer.
 fn build_zip<W: Write + Seek>(
     mut zip: ZipWriter<W>,
     root: &Path,
     files: &[PathBuf],
-    cache: bool,
+    entries: Entries,
 ) -> Result<W> {
     let mut buf = vec![0u8; IO_BUF];
     for path in files {
-        add_path_to_zip(&mut zip, path, root, cache, &mut buf)?;
+        add_path_to_zip(&mut zip, path, root, entries, &mut buf)?;
     }
     Ok(zip.finish()?)
 }
@@ -1318,28 +1572,79 @@ fn is_inside_workspace(
     inside
 }
 
-/// Options of an entry of `size` bytes named `name`: deflate for artifacts;
-/// for caches, zstd unless the entry is tiny or compressed already
-fn entry_options(cache: bool, name: &Path, size: u64) -> SimpleFileOptions {
-    let options = SimpleFileOptions::default();
-    if !cache {
-        return options.compression_method(CompressionMethod::Deflated);
-    }
-    let compressed = name
-        .extension()
+/// What a ZIP is for, which picks how its entries are compressed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entries {
+    /// Cache (format 1): zstd, or stored when tiny or compressed already
+    Cache,
+    /// Artifacts: deflate at this level, or stored when compressed already
+    Artifact(CompressionLevel),
+}
+
+/// Artifact files at least this large are sampled: their first
+/// `SAMPLE_BYTES` tell whether deflate makes them any smaller
+const SAMPLE_BYTES: usize = 64 * 1024;
+
+/// Whether `name` has the extension of a format that is compressed already
+fn compressed_already(name: &Path) -> bool {
+    name.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
             COMPRESSED_EXTENSIONS
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(ext))
-        });
-    if compressed || size < STORE_BELOW {
-        options.compression_method(CompressionMethod::Stored)
-    } else {
-        options
-            .compression_method(CompressionMethod::Zstd)
-            .compression_level(Some(CACHE_ZSTD_LEVEL))
+        })
+}
+
+/// Whether deflate leaves `sample` (the start of a file) at more than 95%
+/// of its size: random, encrypted or compressed data, which is stored
+/// rather than compressed for nothing (deflate at the default level runs
+/// at some 35 MB/s on such data)
+fn incompressible(sample: &[u8]) -> bool {
+    let mut deflate = flate2::Compress::new(flate2::Compression::fast(), false);
+    let mut out = Vec::with_capacity(sample.len() + sample.len() / 16 + 64);
+    match deflate.compress_vec(sample, &mut out, flate2::FlushCompress::Finish) {
+        Ok(flate2::Status::StreamEnd) => out.len() * 20 > sample.len() * 19,
+        // The output did not fit in more than the input: it does not compress
+        Ok(_) | Err(_) => true,
     }
+}
+
+/// Options of an entry of `size` bytes named `name`. Caches: zstd unless
+/// the entry is tiny or compressed already. Artifacts: deflate at the level
+/// asked for, stored for `fastest` and for data that does not compress
+/// (`sample`, the start of the file, empty when not sampled).
+fn entry_options(entries: Entries, name: &Path, size: u64, sample: &[u8]) -> SimpleFileOptions {
+    let options = SimpleFileOptions::default();
+    let stored = options.compression_method(CompressionMethod::Stored);
+    match entries {
+        Entries::Cache if compressed_already(name) || size < STORE_BELOW => stored,
+        Entries::Cache => options
+            .compression_method(CompressionMethod::Zstd)
+            .compression_level(Some(CACHE_ZSTD_LEVEL)),
+        Entries::Artifact(level) => match level.deflate() {
+            None => stored,
+            Some(_) if compressed_already(name) => stored,
+            Some(_) if !sample.is_empty() && incompressible(sample) => stored,
+            Some(deflate) => options
+                .compression_method(CompressionMethod::Deflated)
+                .compression_level(Some(deflate)),
+        },
+    }
+}
+
+/// Read up to `buf.len()` bytes, fewer only at the end of `reader`
+fn read_up_to(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 /// Add a regular file or symlink to the ZIP archive under its workspace-relative name
@@ -1347,7 +1652,7 @@ fn add_path_to_zip<W: Write + Seek>(
     zip: &mut ZipWriter<W>,
     path: &Path,
     workspace_root: &Path,
-    cache: bool,
+    entries: Entries,
     buf: &mut [u8],
 ) -> Result<()> {
     let relative_path = path
@@ -1372,15 +1677,27 @@ fn add_path_to_zip<W: Write + Seek>(
         return Ok(());
     }
 
-    let options = entry_options(cache, path, meta.len());
+    let mut file = open_found_file(path)?;
+    // The start of a large artifact file, to see whether it compresses
+    let sampled = match entries {
+        Entries::Artifact(level)
+            if level.deflate().is_some()
+                && meta.len() >= SAMPLE_BYTES as u64
+                && !compressed_already(path) =>
+        {
+            read_up_to(&mut file, &mut buf[..SAMPLE_BYTES])?
+        }
+        _ => 0,
+    };
+    let options = entry_options(entries, path, meta.len(), &buf[..sampled]);
     #[cfg(unix)]
     let options = {
         use std::os::unix::fs::PermissionsExt;
         options.unix_permissions(meta.permissions().mode())
     };
 
-    let mut file = open_found_file(path)?;
     zip.start_file(relative_path, options)?;
+    zip.write_all(&buf[..sampled])?;
     copy_with(buf, &mut file, zip)?;
 
     Ok(())
@@ -1859,6 +2176,287 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compression_levels_have_gitlab_runner_names() {
+        use CompressionLevel::*;
+        let parse = |v| CompressionLevel::parse(v);
+        assert_eq!(parse(None), Ok(Default));
+        assert_eq!(parse(Some("")), Ok(Default));
+        assert_eq!(parse(Some("default")), Ok(Default));
+        assert_eq!(parse(Some("fastest")), Ok(Fastest));
+        assert_eq!(parse(Some("fast")), Ok(Fast));
+        assert_eq!(parse(Some("slow")), Ok(Slow));
+        assert_eq!(parse(Some("slowest")), Ok(Slowest));
+        assert!(parse(Some("Fast")).is_err());
+        assert!(parse(Some("9")).is_err());
+        // fastzip's levels; the default is deflate's (gitlab-runner's ZIP archiver)
+        let levels: Vec<_> = [Fastest, Fast, Default, Slow, Slowest]
+            .iter()
+            .map(|l| l.deflate())
+            .collect();
+        assert_eq!(levels, [None, Some(1), Some(6), Some(7), Some(9)]);
+    }
+
+    /// A workspace with text, random bytes (large and small) and a PNG
+    fn artifact_tree() -> tempfile::TempDir {
+        let ws = tempdir().unwrap();
+        let mut seed: u64 = 5;
+        let mut noise = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 56) as u8
+                })
+                .collect()
+        };
+        std::fs::create_dir(ws.path().join("out")).unwrap();
+        std::fs::write(
+            ws.path().join("out/a.txt"),
+            "build log line\n".repeat(20_000),
+        )
+        .unwrap();
+        std::fs::write(ws.path().join("out/blob.bin"), noise(300 * 1024)).unwrap();
+        std::fs::write(ws.path().join("out/small.bin"), noise(1000)).unwrap();
+        std::fs::write(ws.path().join("out/img.png"), b"\x89PNG not really").unwrap();
+        ws
+    }
+
+    /// Method of each entry of a ZIP by name, and the entries extract as written
+    fn methods_by_name(data: &[u8], ws: &Path) -> Vec<(String, CompressionMethod)> {
+        let out = tempdir().unwrap();
+        extract_zip_to_workspace(data, out.path().to_str().unwrap()).unwrap();
+        let mut archive = ZipArchive::new(std::io::Cursor::new(data)).unwrap();
+        let mut methods: Vec<_> = (0..archive.len())
+            .map(|i| {
+                let entry = archive.by_index(i).unwrap();
+                let name = entry.name().unwrap().to_string();
+                assert_eq!(
+                    std::fs::read(out.path().join(&name)).unwrap(),
+                    std::fs::read(ws.join(&name)).unwrap(),
+                    "{}",
+                    name
+                );
+                (name, entry.compression())
+            })
+            .collect();
+        methods.sort_by(|a, b| a.0.cmp(&b.0));
+        methods
+    }
+
+    fn zip_with(ws: &Path, level: CompressionLevel) -> Vec<u8> {
+        let files = collect_paths(ws.to_str().unwrap(), &["out".to_string()], &[], false).unwrap();
+        let mut out = Vec::new();
+        write_artifact(&mut out, "zip", level, ws, &files).unwrap();
+        out
+    }
+
+    #[test]
+    fn artifacts_store_what_does_not_compress() {
+        use CompressionMethod::{Deflated, Stored};
+        let ws = artifact_tree();
+        let expect = |blob, small, text| {
+            vec![
+                ("out/a.txt".to_string(), text),
+                ("out/blob.bin".to_string(), blob),
+                ("out/img.png".to_string(), Stored),
+                ("out/small.bin".to_string(), small),
+            ]
+        };
+        // Random data is sampled and stored; small files are not sampled
+        let default = zip_with(ws.path(), CompressionLevel::Default);
+        assert_eq!(
+            methods_by_name(&default, ws.path()),
+            expect(Stored, Deflated, Deflated)
+        );
+        let slowest = zip_with(ws.path(), CompressionLevel::Slowest);
+        assert_eq!(
+            methods_by_name(&slowest, ws.path()),
+            expect(Stored, Deflated, Deflated)
+        );
+        assert!(slowest.len() <= default.len());
+        // fastest stores everything, as fastzip does
+        let fastest = zip_with(ws.path(), CompressionLevel::Fastest);
+        assert_eq!(
+            methods_by_name(&fastest, ws.path()),
+            expect(Stored, Stored, Stored)
+        );
+    }
+
+    #[test]
+    fn a_sample_tells_compressible_from_random_data() {
+        assert!(!incompressible(
+            "text compresses well\n".repeat(4000).as_bytes()
+        ));
+        let mut seed: u64 = 1;
+        let random: Vec<u8> = (0..SAMPLE_BYTES)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        assert!(incompressible(&random));
+    }
+
+    fn upload_of(format: &str) -> crate::gitlab::ArtifactUpload {
+        crate::gitlab::ArtifactUpload {
+            file_name: "artifacts.zip".to_string(),
+            format: format.to_string(),
+            artifact_type: "archive".to_string(),
+            expire_in: None,
+        }
+    }
+
+    /// The `file` part of a multipart upload body
+    fn uploaded_file(body: &[u8]) -> Vec<u8> {
+        let start = body
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("part headers")
+            + 4;
+        let end = body
+            .windows(4)
+            .rposition(|w| w == b"\r\n--")
+            .expect("closing boundary");
+        body[start..end].to_vec()
+    }
+
+    async fn archive_and_upload_to(
+        server: &wiremock::MockServer,
+        ws: &Path,
+        paths: &[String],
+        format: &str,
+    ) -> (Result<Option<u64>>, String) {
+        let gitlab = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = crate::security::secret_scrubber::SecretScrubber::new(vec![]);
+        let mut trace = super::super::trace::TraceWriter::new(None, 7, "t", &scrubber);
+        let stage = staging();
+        let target = upload_of(format);
+        // Bounded: a stream that is never closed must fail the test, not hang it
+        let upload = archive_and_upload(
+            &gitlab,
+            7,
+            "job-token",
+            ArtifactFiles {
+                workspace: ws.to_str().unwrap(),
+                paths,
+                exclude: &[],
+                level: CompressionLevel::Default,
+                staging_dir: stage.path(),
+            },
+            &target,
+            &mut trace,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), upload)
+            .await
+            .expect("archive and upload did not end within 60 s");
+        // The staged archive is removed
+        assert_eq!(std::fs::read_dir(stage.path()).unwrap().count(), 0);
+        trace.finish().await;
+        (result, trace.text())
+    }
+
+    #[tokio::test]
+    async fn the_archive_is_uploaded_while_it_is_written() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ws = artifact_tree();
+
+        let (result, trace) =
+            archive_and_upload_to(&server, ws.path(), &["out".to_string()], "zip").await;
+
+        let len = result.unwrap().unwrap();
+        let request = &server.received_requests().await.unwrap()[0];
+        // Streamed: chunked, no length known up front
+        assert!(!request.headers.contains_key("content-length"));
+        let zip = uploaded_file(&request.body);
+        assert_eq!(zip.len() as u64, len);
+        assert_eq!(methods_by_name(&zip, ws.path()).len(), 4);
+        assert!(trace.contains("Uploaded "), "{}", trace);
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_is_sent_again_from_the_staged_archive() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let ws = artifact_tree();
+
+        let (result, trace) =
+            archive_and_upload_to(&server, ws.path(), &["out".to_string()], "zip").await;
+
+        result.unwrap().unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        // The retry sends the same archive, from its file, with its length
+        assert!(requests[1].headers.contains_key("content-length"));
+        assert_eq!(
+            uploaded_file(&requests[0].body),
+            uploaded_file(&requests[1].body)
+        );
+        assert!(
+            trace.contains("WARNING: Artifact upload failed: 502 Bad Gateway")
+                && trace.contains("(attempt 1/3), retrying in 1s"),
+            "{}",
+            trace
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upload_is_not_retried_and_nothing_to_upload_sends_nothing() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let ws = artifact_tree();
+
+        let (result, _) =
+            archive_and_upload_to(&server, ws.path(), &["out".to_string()], "zip").await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("403"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        let (result, _) =
+            archive_and_upload_to(&server, ws.path(), &["missing/".to_string()], "zip").await;
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_archive_that_cannot_be_written_fails_its_upload() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let ws = artifact_tree();
+
+        // raw takes exactly one file: the archive fails after the upload started
+        let (result, _) =
+            archive_and_upload_to(&server, ws.path(), &["out".to_string()], "raw").await;
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("exactly one file"), "{}", error);
+    }
+
     /// Format 1 caches (ZIPs, written by versions up to 0.10)
     #[cfg(unix)]
     #[tokio::test]
@@ -2149,7 +2747,7 @@ mod tests {
 
     /// A mixed tree of `megabytes` MB: source-like text in many small
     /// files, about two fifths incompressible blobs (images, packed artifacts)
-    fn mixed_tree(megabytes: u64) -> tempfile::TempDir {
+    pub(super) fn mixed_tree(megabytes: u64) -> tempfile::TempDir {
         let ws = tempdir().unwrap();
         let mut seed: u64 = 7;
         let mut next = move || {
@@ -2860,5 +3458,312 @@ mod tests {
         let written = std::fs::metadata(ws.path().join("big.bin")).unwrap().len();
         assert!(written < 4 << 20, "{}", written);
         assert!(!ws.path().join("next.txt").exists());
+    }
+}
+
+/// Artifact transfer benchmarks against a local stand-in for GitLab
+#[cfg(test)]
+mod transfer_bench {
+    use super::*;
+    use crate::gitlab::ArtifactUpload;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    /// How the stand-in behaves: body bytes per second it reads or writes
+    /// (0: as fast as it can) and how long it takes to answer an upload
+    #[derive(Clone, Copy)]
+    struct Link {
+        rate: u64,
+        reply_delay: Duration,
+    }
+
+    /// Sleep so that `done` bytes since `started` do not exceed `rate`
+    async fn pace(rate: u64, started: Instant, done: u64) {
+        if rate > 0 {
+            let due = started + Duration::from_secs_f64(done as f64 / rate as f64);
+            tokio::time::sleep_until(due.into()).await;
+        }
+    }
+
+    /// Serve HTTP/1.1 on a local port: uploads are read (Content-Length or
+    /// chunked) and answered 201, a GET gets `download`. Returns the base URL.
+    async fn stand_in(link: Link, download: Arc<Vec<u8>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let download = Arc::clone(&download);
+                tokio::spawn(async move {
+                    let _ = serve(socket, link, download).await;
+                });
+            }
+        });
+        url
+    }
+
+    async fn serve(
+        socket: tokio::net::TcpStream,
+        link: Link,
+        download: Arc<Vec<u8>>,
+    ) -> std::io::Result<()> {
+        let (read, mut write) = socket.into_split();
+        let mut read = BufReader::with_capacity(256 * 1024, read);
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let mut head = Vec::new();
+            loop {
+                let mut line = String::new();
+                if read.read_line(&mut line).await? == 0 {
+                    return Ok(());
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                head.push(line.to_ascii_lowercase());
+            }
+            let get = head[0].starts_with("get ");
+            let length = head.iter().find_map(|h| {
+                h.strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<u64>().unwrap())
+            });
+            let chunked = head
+                .iter()
+                .any(|h| h.starts_with("transfer-encoding:") && h.contains("chunked"));
+            let started = Instant::now();
+            let mut body = 0u64;
+            if chunked {
+                loop {
+                    let mut size = String::new();
+                    read.read_line(&mut size).await?;
+                    let size = u64::from_str_radix(size.trim().split(';').next().unwrap(), 16)
+                        .map_err(std::io::Error::other)?;
+                    let mut left = size;
+                    while left > 0 {
+                        let want = left.min(buf.len() as u64) as usize;
+                        let n = read.read(&mut buf[..want]).await?;
+                        if n == 0 {
+                            return Ok(());
+                        }
+                        left -= n as u64;
+                        body += n as u64;
+                        pace(link.rate, started, body).await;
+                    }
+                    let mut crlf = String::new();
+                    read.read_line(&mut crlf).await?;
+                    if size == 0 {
+                        break;
+                    }
+                }
+            } else if let Some(mut left) = length {
+                while left > 0 {
+                    let want = left.min(buf.len() as u64) as usize;
+                    let n = read.read(&mut buf[..want]).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    left -= n as u64;
+                    body += n as u64;
+                    pace(link.rate, started, body).await;
+                }
+            }
+            if get {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    download.len()
+                );
+                write.write_all(head.as_bytes()).await?;
+                let started = Instant::now();
+                let mut sent = 0u64;
+                for chunk in download.chunks(64 * 1024) {
+                    write.write_all(chunk).await?;
+                    sent += chunk.len() as u64;
+                    pace(link.rate, started, sent).await;
+                }
+            } else {
+                tokio::time::sleep(link.reply_delay).await;
+                write
+                    .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}")
+                    .await?;
+            }
+        }
+    }
+
+    fn noise(len: usize, mut seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 8);
+        while out.len() < len {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            out.extend_from_slice(&seed.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// A workspace with one 50 MB file of random bytes (like the audit's job)
+    fn random_tree() -> tempfile::TempDir {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ws.path().join("tree")).unwrap();
+        std::fs::write(ws.path().join("tree/big.bin"), noise(50 << 20, 99)).unwrap();
+        ws
+    }
+
+    /// Smallest, median and largest
+    fn spread(mut values: Vec<f64>) -> (f64, f64, f64) {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (
+            values[0],
+            values[values.len() / 2],
+            values[values.len() - 1],
+        )
+    }
+
+    fn links() -> Vec<(&'static str, Link)> {
+        vec![
+            (
+                "unlimited",
+                Link {
+                    rate: 0,
+                    reply_delay: Duration::ZERO,
+                },
+            ),
+            (
+                "100MB/s+300ms",
+                Link {
+                    rate: 100_000_000,
+                    reply_delay: Duration::from_millis(300),
+                },
+            ),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark: cargo test --release -- --ignored bench_artifact_upload --nocapture"]
+    async fn bench_artifact_upload() {
+        let runs = 5;
+        let scrubber = crate::security::secret_scrubber::SecretScrubber::new(vec![]);
+        let upload = ArtifactUpload {
+            file_name: "artifacts.zip".to_string(),
+            format: "zip".to_string(),
+            artifact_type: "archive".to_string(),
+            expire_in: None,
+        };
+        let paths = ["tree".to_string()];
+        for (data, ws) in [
+            ("random", random_tree()),
+            ("mixed", super::tests::mixed_tree(50)),
+        ] {
+            let root = ws.path().to_str().unwrap();
+            for level in [
+                CompressionLevel::Default,
+                CompressionLevel::Fast,
+                CompressionLevel::Fastest,
+            ] {
+                // Archiving alone, to nowhere
+                let mut create = vec![];
+                let files = collect_paths(root, &paths, &[], false).unwrap();
+                for _ in 0..runs {
+                    let (files, root) = (files.clone(), ws.path().to_path_buf());
+                    let started = Instant::now();
+                    tokio::task::spawn_blocking(move || {
+                        let mut out = std::io::BufWriter::new(std::io::sink());
+                        write_artifact(&mut out, "zip", level, &root, &files).unwrap();
+                    })
+                    .await
+                    .unwrap();
+                    create.push(started.elapsed().as_secs_f64());
+                }
+                for (name, link) in links() {
+                    let url = stand_in(link, Arc::new(Vec::new())).await;
+                    let gitlab = GitLabClient::new(url, "t".to_string());
+                    let stage = tempfile::tempdir().unwrap();
+                    let (mut total, mut size) = (vec![], 0);
+                    for _ in 0..runs {
+                        let mut trace =
+                            super::super::trace::TraceWriter::new(None, 7, "t", &scrubber);
+                        let started = Instant::now();
+                        size = archive_and_upload(
+                            &gitlab,
+                            7,
+                            "job-token",
+                            ArtifactFiles {
+                                workspace: root,
+                                paths: &paths,
+                                exclude: &[],
+                                level,
+                                staging_dir: stage.path(),
+                            },
+                            &upload,
+                            &mut trace,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        total.push(started.elapsed().as_secs_f64());
+                    }
+                    let (c, t) = (spread(create.clone()), spread(total));
+                    println!(
+                        "BENCH upload data={} level={:?} link={} size={:.1}MB create={:.3}s total={:.3}s (min {:.3} max {:.3})",
+                        data, level, name, size as f64 / 1e6, c.1, t.1, t.0, t.2
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark: cargo test --release -- --ignored bench_artifact_download --nocapture"]
+    async fn bench_artifact_download() {
+        let runs = 5;
+        for (data, ws) in [
+            ("random", random_tree()),
+            ("mixed", super::tests::mixed_tree(50)),
+        ] {
+            let stage = tempfile::tempdir().unwrap();
+            let archive = create_archive(
+                ws.path().to_str().unwrap(),
+                &["tree".to_string()],
+                &[],
+                "zip",
+                stage.path(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let zip = Arc::new(std::fs::read(archive.file.path()).unwrap());
+            for (name, link) in links() {
+                let url = stand_in(link, Arc::clone(&zip)).await;
+                let gitlab = GitLabClient::new(url, "t".to_string());
+                let (mut download, mut extract, mut total) = (vec![], vec![], vec![]);
+                for _ in 0..runs {
+                    let out = tempfile::tempdir().unwrap();
+                    let staged = tempfile::NamedTempFile::new_in(stage.path()).unwrap();
+                    let started = Instant::now();
+                    gitlab
+                        .download_artifacts_to(9, "dep-token", staged.path())
+                        .await
+                        .unwrap();
+                    let downloaded = started.elapsed().as_secs_f64();
+                    extract_archive_file(
+                        staged.path(),
+                        out.path().to_str().unwrap(),
+                        &Stop::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let all = started.elapsed().as_secs_f64();
+                    download.push(downloaded);
+                    extract.push(all - downloaded);
+                    total.push(all);
+                }
+                let (d, e, t) = (spread(download), spread(extract), spread(total));
+                println!(
+                    "BENCH download data={} link={} size={:.1}MB download={:.3}s extract={:.3}s total={:.3}s (min {:.3} max {:.3})",
+                    data, name, zip.len() as f64 / 1e6, d.1, e.1, t.1, t.0, t.2
+                );
+            }
+        }
     }
 }
