@@ -2,6 +2,10 @@
 //! offset GitLab has acknowledged, so output is never lost or duplicated: after a
 //! 416 range mismatch it resends from the offset the server reports.
 //!
+//! The writer only scrubs and appends: a task of its own sends the log to GitLab,
+//! once the update interval GitLab asks for has passed or a batch is pending, so a
+//! slow or unreachable GitLab never holds up reading the job's output.
+//!
 //! Only output GitLab has not acknowledged is kept in memory. Acknowledged output
 //! is moved to an unlinked temporary file (the spool) and read back from there if
 //! GitLab asks for it again. The spool goes in a directory on disk (the runner's
@@ -11,13 +15,14 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use tokio::sync::{watch, Notify};
 use tokio::time::Sleep;
 use tracing::warn;
 
 use super::cancel::CancelSignal;
-use crate::gitlab::GitLabClient;
+use crate::gitlab::{GitLabClient, RemoteState};
 use crate::security::secret_scrubber::{SecretScrubber, StreamScrubber};
 
 /// Same default as gitlab-runner's `output_limit` (4 MiB); the daemon sets
@@ -30,6 +35,9 @@ const MAX_UPDATE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Output sent sooner than the interval once this much is pending
 const FLUSH_BYTES: usize = 256 * 1024;
 const FINISH_ATTEMPTS: u32 = 5;
+/// Longest `finish` waits for GitLab to have the whole log: the job's final
+/// state is reported after it, and must not wait on an unreachable GitLab
+const FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Room for the notice appended when the limit is reached
 const NOTICE_ROOM: usize = 256;
 /// Spool reads and writes up to this size (a usual flush: a copy to or from
@@ -50,11 +58,10 @@ enum Spool {
     Failed(Option<Arc<File>>),
 }
 
-pub struct TraceWriter<'a> {
-    client: Option<&'a GitLabClient>,
+/// The trace and how much of it GitLab has, shared by the writer, which
+/// appends, and the sender task, which sends and spools
+struct Log {
     job_id: u64,
-    token: String,
-    scrubber: StreamScrubber<'a>,
     spool: Spool,
     /// Where the spool is created; the system's temporary directory if unset
     /// or unusable
@@ -66,8 +73,57 @@ pub struct TraceWriter<'a> {
     /// Bytes GitLab has acknowledged; below `spooled` only when GitLab asked
     /// for output again
     sent: usize,
+    /// When the last send started
     last_flush: Instant,
     update_interval: Duration,
+    /// Flushes the writer asked for; the sender reports the last one it did
+    flushes_asked: u64,
+    /// The last send failed: a pending batch waits for the update interval
+    /// instead of being retried at once
+    failing: bool,
+}
+
+impl Log {
+    /// Length of the whole trace
+    fn len(&self) -> usize {
+        self.spooled + self.tail.len()
+    }
+
+    fn pending(&self) -> usize {
+        self.len().saturating_sub(self.sent)
+    }
+
+    fn spool_file(&self) -> Option<&Arc<File>> {
+        match &self.spool {
+            Spool::Open(file) | Spool::Failed(Some(file)) => Some(file),
+            Spool::Unopened | Spool::Failed(None) => None,
+        }
+    }
+}
+
+/// The log, also when a panic poisoned its lock (the log itself stays valid:
+/// every change to it is complete before the lock is released)
+fn lock(log: &Mutex<Log>) -> MutexGuard<'_, Log> {
+    log.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sends the log to GitLab from a task of its own, started with the first output
+struct Sender {
+    /// Tells the task there is output, or a flush to do
+    wake: Arc<Notify>,
+    /// The last flush the task did
+    done: watch::Receiver<u64>,
+    /// The client, job token and flush reports, moved into the task when it starts
+    unstarted: Option<(GitLabClient, String, watch::Sender<u64>)>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+pub struct TraceWriter<'a> {
+    job_id: u64,
+    scrubber: StreamScrubber<'a>,
+    log: Arc<Mutex<Log>>,
+    /// `None` when output is only collected (no GitLab to stream to)
+    sender: Option<Sender>,
     limit: usize,
     truncated: bool,
     cancel: CancelSignal,
@@ -76,23 +132,36 @@ pub struct TraceWriter<'a> {
 impl<'a> TraceWriter<'a> {
     /// `client` is `None` when output is only collected (no GitLab to stream to)
     pub fn new(
-        client: Option<&'a GitLabClient>,
+        client: Option<&GitLabClient>,
         job_id: u64,
         token: &str,
         scrubber: &'a SecretScrubber,
     ) -> Self {
+        let sender = client.map(|client| {
+            let (report, done) = watch::channel(0);
+            Sender {
+                wake: Arc::default(),
+                done,
+                unstarted: Some((client.clone(), token.to_string(), report)),
+                task: None,
+            }
+        });
         Self {
-            client,
             job_id,
-            token: token.to_string(),
             scrubber: StreamScrubber::new(scrubber),
-            spool: Spool::Unopened,
-            spool_dir: None,
-            spooled: 0,
-            tail: Vec::new(),
-            sent: 0,
-            last_flush: Instant::now(),
-            update_interval: DEFAULT_UPDATE_INTERVAL,
+            log: Arc::new(Mutex::new(Log {
+                job_id,
+                spool: Spool::Unopened,
+                spool_dir: None,
+                spooled: 0,
+                tail: Vec::new(),
+                sent: 0,
+                last_flush: Instant::now(),
+                update_interval: DEFAULT_UPDATE_INTERVAL,
+                flushes_asked: 0,
+                failing: false,
+            })),
+            sender,
             limit: DEFAULT_LIMIT,
             truncated: false,
             cancel: CancelSignal::default(),
@@ -117,8 +186,8 @@ impl<'a> TraceWriter<'a> {
     }
 
     /// Create the spool in `dir`, a directory on disk
-    pub fn with_spool_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.spool_dir = Some(dir.into());
+    pub fn with_spool_dir(self, dir: impl Into<PathBuf>) -> Self {
+        lock(&self.log).spool_dir = Some(dir.into());
         self
     }
 
@@ -128,20 +197,16 @@ impl<'a> TraceWriter<'a> {
         self.truncated
     }
 
-    /// Append output; it is scrubbed and sent in batches
+    /// Append output; it is scrubbed here and sent in batches by the sender
+    /// task, without waiting for GitLab
     pub async fn write(&mut self, text: &str) {
         if self.is_truncated() {
-            // Dropped anyway: do not scrub it, but keep sending what is pending
+            // Dropped anyway: do not scrub it. What is pending is still sent.
             self.flush_if_due().await;
             return;
         }
         let safe = self.scrubber.push(text);
         self.append(&safe);
-        if self.len() - self.sent >= FLUSH_BYTES {
-            self.flush().await;
-        } else {
-            self.flush_if_due().await;
-        }
     }
 
     /// Open a collapsible section of the job log (`name` is [a-z0-9_]),
@@ -161,121 +226,358 @@ impl<'a> TraceWriter<'a> {
             .await;
     }
 
-    /// When pending output is due for sending: the update interval GitLab asked
-    /// for after the last flush. `None` while there is nothing to send, so a
-    /// quiet job is not woken; GitLab learns it is alive from the job heartbeat,
-    /// not from trace updates.
+    /// When an output loop should call `flush`. Never for a log streamed to
+    /// GitLab, whose sender task sends on time by itself; for a collected log,
+    /// the update interval after the last flush while output is pending.
     pub fn next_flush_at(&self) -> Option<Instant> {
-        (self.sent < self.len()).then(|| self.last_flush + self.update_interval)
+        if self.sender.is_some() {
+            return None;
+        }
+        let log = lock(&self.log);
+        (log.pending() > 0).then(|| log.last_flush + log.update_interval)
     }
 
-    /// Send pending output once the update interval has passed
+    /// Flush a collected log once the update interval has passed; a log
+    /// streamed to GitLab is sent by its sender task
     pub async fn flush_if_due(&mut self) {
-        if self.last_flush.elapsed() >= self.update_interval {
+        if self.sender.is_none() && self.next_flush_at().is_some_and(|at| at <= Instant::now()) {
             self.flush().await;
         }
     }
 
-    /// Send everything not yet acknowledged; returns true when GitLab has it all
+    /// Send everything not yet acknowledged, waiting for GitLab's answer;
+    /// returns true when GitLab has it all
     pub async fn flush(&mut self) -> bool {
-        self.last_flush = Instant::now();
-        let len = self.len();
-        let Some(client) = self.client else {
-            self.sent = len;
-            self.spool_acknowledged().await;
-            return true;
-        };
-        if self.sent >= len {
-            return true;
-        }
-        let Some(body) = self.unsent().await else {
-            return false;
-        };
-
-        match client
-            .patch_trace(self.job_id, &self.token, body, self.sent)
-            .await
-        {
-            // On success this is the end of what we sent; on 416 it is what GitLab has
-            Ok(patch) => {
-                self.sent = patch.offset.min(len);
-                self.cancel.update(patch.remote);
-                if let Some(interval) = patch.update_interval {
-                    self.update_interval = interval.min(MAX_UPDATE_INTERVAL);
-                }
-                if patch.remote == crate::gitlab::RemoteState::Aborted {
-                    // GitLab no longer accepts output for this job
-                    self.sent = len;
-                }
+        let Some(sender) = self.sender.as_mut() else {
+            {
+                let mut log = lock(&self.log);
+                log.last_flush = Instant::now();
+                log.sent = log.len();
             }
-            Err(e) => warn!("Failed to send trace for job #{}: {}", self.job_id, e),
-        }
-        self.spool_acknowledged().await;
-        self.sent >= len
+            spool_acknowledged(&self.log).await;
+            return true;
+        };
+        let asked = {
+            let mut log = lock(&self.log);
+            if log.pending() == 0 {
+                return true;
+            }
+            log.flushes_asked += 1;
+            log.flushes_asked
+        };
+        sender.start(&self.log, &self.cancel);
+        sender.wake.notify_one();
+        let mut done = sender.done.clone();
+        // Fails only when the task is gone (it panicked): then nothing is sent
+        let _ = done.wait_for(|done| *done >= asked).await;
+        let log = lock(&self.log);
+        log.sent >= log.len()
     }
 
-    /// Flush held-back output and make sure GitLab has the whole trace
+    /// Flush held-back output and make sure GitLab has the whole trace, for
+    /// `FINISH_TIMEOUT` at most. The sender task ends.
     pub async fn finish(&mut self) {
         if !self.truncated {
             let rest = self.scrubber.finish();
             self.append(&rest);
         }
-        for attempt in 0..FINISH_ATTEMPTS {
-            if self.flush().await {
-                return;
+        let complete = tokio::time::timeout(FINISH_TIMEOUT, async {
+            for attempt in 0..FINISH_ATTEMPTS {
+                if self.flush().await {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(200 * 2u64.pow(attempt))).await;
             }
-            tokio::time::sleep(Duration::from_millis(200 * 2u64.pow(attempt))).await;
+            false
+        })
+        .await
+        .unwrap_or(false);
+        if let Some(task) = self.sender.as_mut().and_then(|sender| sender.task.take()) {
+            task.abort();
         }
-        warn!(
-            "Job #{} trace incomplete: GitLab acknowledged {} of {} bytes",
-            self.job_id,
-            self.sent,
-            self.len()
-        );
+        if !complete {
+            let log = lock(&self.log);
+            warn!(
+                "Job #{} trace incomplete: GitLab acknowledged {} of {} bytes",
+                self.job_id,
+                log.sent,
+                log.len()
+            );
+        }
     }
 
     /// Scrubbed output written so far
     #[cfg(test)]
     pub fn text(&self) -> String {
-        let mut trace = vec![0; self.spooled];
-        if let Some(file) = self.spool_file() {
+        let log = self.log();
+        let mut trace = vec![0; log.spooled];
+        if let Some(file) = log.spool_file() {
             file.read_exact_at(&mut trace, 0).expect("read trace spool");
         }
-        trace.extend_from_slice(&self.tail);
+        trace.extend_from_slice(&log.tail);
         String::from_utf8_lossy(&trace).into_owned()
     }
 
-    /// Length of the whole trace
-    fn len(&self) -> usize {
-        self.spooled + self.tail.len()
-    }
-
-    fn spool_file(&self) -> Option<&Arc<File>> {
-        match &self.spool {
-            Spool::Open(file) | Spool::Failed(Some(file)) => Some(file),
-            Spool::Unopened | Spool::Failed(None) => None,
+    /// The shared log, for tests to look into. Panics rather than deadlocks
+    /// when a test still holds it (two guards in one statement).
+    #[cfg(test)]
+    fn log(&self) -> MutexGuard<'_, Log> {
+        let started = Instant::now();
+        loop {
+            match self.log.try_lock() {
+                Ok(log) => return log,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+                // Held by the sender task for a moment, or by the test itself
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "the trace log is still locked: does the test hold a guard?"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
         }
     }
 
-    /// The trace from `sent` on, read back from the spool when GitLab asked for
-    /// output it had acknowledged before
-    async fn unsent(&self) -> Option<bytes::Bytes> {
-        if self.sent >= self.spooled {
-            return Some(bytes::Bytes::copy_from_slice(
-                &self.tail[self.sent - self.spooled..],
-            ));
+    /// Append scrubbed output, up to the limit, and wake the sender when
+    /// there is something for it to do
+    fn append(&mut self, text: &str) {
+        if self.truncated || text.is_empty() {
+            return;
         }
-        let Some(file) = self.spool_file().map(Arc::clone) else {
+        let (before, after) = {
+            let mut log = lock(&self.log);
+            let before = log.pending();
+            self.truncated = append_to(&mut log, text, self.limit);
+            (before, log.pending())
+        };
+        if let Some(sender) = self.sender.as_mut() {
+            sender.start(&self.log, &self.cancel);
+            // Output to send once the interval passes, or a batch to send now
+            if before == 0 || (before < FLUSH_BYTES && after >= FLUSH_BYTES) {
+                sender.wake.notify_one();
+            }
+        }
+    }
+}
+
+impl Drop for TraceWriter<'_> {
+    /// A writer dropped without `finish` (the job panicked) stops sending
+    fn drop(&mut self) {
+        if let Some(task) = self.sender.as_mut().and_then(|sender| sender.task.take()) {
+            task.abort();
+        }
+    }
+}
+
+/// Append `text` to the log, keeping at most `limit` bytes plus a notice;
+/// returns true once the limit is reached
+fn append_to(log: &mut Log, text: &str, limit: usize) -> bool {
+    let room = limit.saturating_sub(log.len());
+    if text.len() <= room {
+        reserve(log, text.len(), limit);
+        log.tail.extend_from_slice(text.as_bytes());
+        return false;
+    }
+    let mut cut = room;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let notice = format!(
+        "\nJob's log exceeded limit of {} bytes.\nJob execution will continue but no more output will be collected.\n",
+        limit
+    );
+    reserve(log, cut + notice.len(), limit);
+    log.tail.extend_from_slice(&text.as_bytes()[..cut]);
+    log.tail.extend_from_slice(notice.as_bytes());
+    true
+}
+
+/// Grow like `Vec` does, but never past what is left of the limit plus the
+/// notice, so a full trace does not double the buffer
+fn reserve(log: &mut Log, additional: usize, limit: usize) {
+    let needed = log.tail.len() + additional;
+    if needed > log.tail.capacity() {
+        let target = (log.tail.capacity() * 2)
+            .min((limit + NOTICE_ROOM).saturating_sub(log.spooled))
+            .max(needed);
+        let len = log.tail.len();
+        log.tail.reserve_exact(target - len);
+    }
+}
+
+impl Sender {
+    /// Start the task, once: with the first output, after the writer's
+    /// options (cancel signal, spool directory) are set
+    fn start(&mut self, log: &Arc<Mutex<Log>>, cancel: &CancelSignal) {
+        let Some((client, token, report)) = self.unstarted.take() else {
+            return;
+        };
+        self.task = Some(tokio::spawn(send_log(
+            client,
+            token,
+            Arc::clone(log),
+            Arc::clone(&self.wake),
+            report,
+            cancel.clone(),
+        )));
+    }
+}
+
+/// What the sender task does next
+enum Step {
+    /// Send what is pending; the flush asked for last is done after it
+    Send(u64),
+    /// Nothing pending: report the flushes asked for as done
+    Done(u64),
+    /// Wait for output, or until the update interval has passed
+    Wait(Option<Instant>),
+}
+
+/// The sender task: sends pending output when a batch is pending, the update
+/// interval has passed or the writer asks for a flush, until it is aborted
+async fn send_log(
+    client: GitLabClient,
+    token: String,
+    log: Arc<Mutex<Log>>,
+    wake: Arc<Notify>,
+    report: watch::Sender<u64>,
+    cancel: CancelSignal,
+) {
+    loop {
+        let step = {
+            let log = lock(&log);
+            let asked = log.flushes_asked;
+            let flush_asked = asked > *report.borrow();
+            let pending = log.pending();
+            let due = log.last_flush + log.update_interval;
+            if pending == 0 {
+                if flush_asked {
+                    Step::Done(asked)
+                } else {
+                    Step::Wait(None)
+                }
+            } else if flush_asked
+                || (!log.failing && pending >= FLUSH_BYTES)
+                || Instant::now() >= due
+            {
+                Step::Send(asked)
+            } else {
+                Step::Wait(Some(due))
+            }
+        };
+        match step {
+            Step::Send(asked) => {
+                send_pending(&client, &token, &log, &cancel).await;
+                report.send_if_modified(|done| {
+                    let newer = asked > *done;
+                    *done = (*done).max(asked);
+                    newer
+                });
+            }
+            Step::Done(asked) => {
+                report.send_replace(asked);
+            }
+            Step::Wait(None) => wake.notified().await,
+            Step::Wait(Some(due)) => {
+                tokio::select! {
+                    _ = wake.notified() => {}
+                    _ = tokio::time::sleep_until(due.into()) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Send everything not yet acknowledged in one PATCH and record GitLab's answer
+async fn send_pending(
+    client: &GitLabClient,
+    token: &str,
+    shared: &Mutex<Log>,
+    cancel: &CancelSignal,
+) {
+    let (job_id, offset, len, unsent) = {
+        let mut log = lock(shared);
+        log.last_flush = Instant::now();
+        (log.job_id, log.sent, log.len(), unsent_of(&log))
+    };
+    let Some(body) = unsent.read(job_id, offset).await else {
+        lock(shared).failing = true;
+        return;
+    };
+    let patch = client.patch_trace(job_id, token, body, offset).await;
+    {
+        let mut log = lock(shared);
+        match patch {
+            // On success this is the end of what we sent; on 416 it is what GitLab has
+            Ok(patch) => {
+                log.sent = patch.offset.min(len);
+                cancel.update(patch.remote);
+                if let Some(interval) = patch.update_interval {
+                    log.update_interval = interval.min(MAX_UPDATE_INTERVAL);
+                }
+                if patch.remote == RemoteState::Aborted {
+                    // GitLab no longer accepts output for this job
+                    log.sent = len;
+                }
+                // GitLab took nothing (it asks for output again): resent at
+                // the interval, not over and over at once
+                log.failing = log.sent <= offset;
+            }
+            Err(e) => {
+                log.failing = true;
+                warn!("Failed to send trace for job #{}: {}", job_id, e);
+            }
+        }
+    }
+    spool_acknowledged(shared).await;
+}
+
+/// The trace from `sent` on, taken under the lock
+enum Unsent {
+    /// All of it is in memory
+    Tail(bytes::Bytes),
+    /// It starts in the spool: GitLab asked for output it had acknowledged
+    Spooled {
+        file: Option<Arc<File>>,
+        count: usize,
+        tail: Vec<u8>,
+    },
+}
+
+fn unsent_of(log: &Log) -> Unsent {
+    if log.sent >= log.spooled {
+        return Unsent::Tail(bytes::Bytes::copy_from_slice(
+            &log.tail[log.sent - log.spooled..],
+        ));
+    }
+    Unsent::Spooled {
+        file: log.spool_file().map(Arc::clone),
+        count: log.spooled - log.sent,
+        tail: log.tail.clone(),
+    }
+}
+
+impl Unsent {
+    /// The body to send from `offset`, read back from the spool when needed
+    async fn read(self, job_id: u64, offset: usize) -> Option<bytes::Bytes> {
+        let (file, count, tail) = match self {
+            Unsent::Tail(body) => return Some(body),
+            Unsent::Spooled { file, count, tail } => (file, count, tail),
+        };
+        let Some(file) = file else {
             // Not expected: everything below `spooled` was written to the spool
-            warn!("Job #{} trace from {} is gone", self.job_id, self.sent);
+            warn!("Job #{} trace from {} is gone", job_id, offset);
             return None;
         };
-        let (offset, count, tail) = (self.sent, self.spooled - self.sent, self.tail.len());
         // Read straight into the body, with room for the tail after it
         let read = move || {
             let mut body = vec![0; count];
-            body.reserve_exact(tail);
-            file.read_exact_at(&mut body, offset as u64).map(|()| body)
+            body.reserve_exact(tail.len());
+            file.read_exact_at(&mut body, offset as u64).map(|()| {
+                body.extend_from_slice(&tail);
+                body
+            })
         };
         let read = if count <= SPOOL_INLINE_BYTES {
             read()
@@ -285,96 +587,63 @@ impl<'a> TraceWriter<'a> {
                 .unwrap_or_else(|e| Err(std::io::Error::other(e)))
         };
         match read {
-            Ok(mut body) => {
-                body.extend_from_slice(&self.tail);
-                Some(body.into())
-            }
+            Ok(body) => Some(body.into()),
             Err(e) => {
                 warn!(
                     "Job #{} trace from {} could not be read back: {}",
-                    self.job_id, self.sent, e
+                    job_id, offset, e
                 );
                 None
             }
         }
     }
+}
 
-    /// Move acknowledged output from memory to the spool. Cancel safe: the
-    /// memory is released only once the spool has the output.
-    async fn spool_acknowledged(&mut self) {
-        let count = self.sent.saturating_sub(self.spooled).min(self.tail.len());
+/// Move acknowledged output from memory to the spool. Only one caller at a
+/// time (the sender task, or the writer of a collected log), so the output
+/// copied out is still at the front of the tail when it is released.
+async fn spool_acknowledged(shared: &Mutex<Log>) {
+    let (file, offset, acknowledged) = {
+        let mut log = lock(shared);
+        let count = log.sent.saturating_sub(log.spooled).min(log.tail.len());
         if count == 0 {
             return;
         }
-        if matches!(self.spool, Spool::Unopened) {
-            self.spool = match create_spool(self.spool_dir.as_deref(), self.job_id) {
+        if matches!(log.spool, Spool::Unopened) {
+            log.spool = match create_spool(log.spool_dir.as_deref(), log.job_id) {
                 Some((file, _)) => Spool::Open(Arc::new(file)),
                 None => Spool::Failed(None),
             };
         }
-        let file = match &self.spool {
+        let file = match &log.spool {
             Spool::Open(file) => Arc::clone(file),
             Spool::Unopened | Spool::Failed(_) => return,
         };
-        let offset = self.spooled as u64;
-        let written = if count <= SPOOL_INLINE_BYTES {
-            file.write_all_at(&self.tail[..count], offset)
-        } else {
-            // A copy, so the tail is untouched if this future is dropped
-            let (file, acknowledged) = (Arc::clone(&file), self.tail[..count].to_vec());
-            tokio::task::spawn_blocking(move || file.write_all_at(&acknowledged, offset))
-                .await
-                .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-        };
-        if let Err(e) = written {
-            warn!(
-                "Job #{} log kept in memory: writing it to a temporary file failed: {}",
-                self.job_id, e
-            );
-            self.spool = Spool::Failed(Some(file));
-            return;
-        }
-        self.tail.drain(..count);
-        self.spooled += count;
-        if self.tail.capacity() > TAIL_RETAIN {
-            self.tail.shrink_to(FLUSH_BYTES.max(self.tail.len()));
-        }
-    }
-
-    fn append(&mut self, text: &str) {
-        if self.truncated {
-            return;
-        }
-        let room = self.limit.saturating_sub(self.len());
-        if text.len() <= room {
-            self.reserve(text.len());
-            self.tail.extend_from_slice(text.as_bytes());
-            return;
-        }
-        let mut cut = room;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let notice = format!(
-            "\nJob's log exceeded limit of {} bytes.\nJob execution will continue but no more output will be collected.\n",
-            self.limit
+        (file, log.spooled as u64, log.tail[..count].to_vec())
+    };
+    let count = acknowledged.len();
+    let written = if count <= SPOOL_INLINE_BYTES {
+        file.write_all_at(&acknowledged, offset)
+    } else {
+        let file = Arc::clone(&file);
+        tokio::task::spawn_blocking(move || file.write_all_at(&acknowledged, offset))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    };
+    let mut log = lock(shared);
+    if let Err(e) = written {
+        warn!(
+            "Job #{} log kept in memory: writing it to a temporary file failed: {}",
+            log.job_id, e
         );
-        self.reserve(cut + notice.len());
-        self.tail.extend_from_slice(&text.as_bytes()[..cut]);
-        self.tail.extend_from_slice(notice.as_bytes());
-        self.truncated = true;
+        log.spool = Spool::Failed(Some(file));
+        return;
     }
-
-    /// Grow like `Vec` does, but never past what is left of the limit plus the
-    /// notice, so a full trace does not double the buffer
-    fn reserve(&mut self, additional: usize) {
-        let needed = self.tail.len() + additional;
-        if needed > self.tail.capacity() {
-            let target = (self.tail.capacity() * 2)
-                .min((self.limit + NOTICE_ROOM).saturating_sub(self.spooled))
-                .max(needed);
-            self.tail.reserve_exact(target - self.tail.len());
-        }
+    log.tail.drain(..count);
+    log.spooled += count;
+    if log.tail.capacity() > TAIL_RETAIN {
+        let keep = FLUSH_BYTES.max(log.tail.len());
+        log.tail.shrink_to(keep);
     }
 }
 
@@ -416,7 +685,8 @@ fn create_spool(dir: Option<&Path>, job_id: u64) -> Option<(File, SpoolPlace)> {
 
 /// Wakes an output loop when its trace has output due, instead of a ticker
 /// that also wakes a quiet one. A `select!` branch of the loop is
-/// `_ = flush.wait(trace.next_flush_at()) => trace.flush().await`.
+/// `_ = flush.wait(trace.next_flush_at()) => trace.flush().await`. Only a
+/// collected log is ever due: one streamed to GitLab is sent by its task.
 #[derive(Default)]
 pub struct FlushTimer {
     sleep: Option<Pin<Box<Sleep>>>,
@@ -452,6 +722,14 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// `work` (a flush or finish, which waits for the sender task), failing
+    /// the test instead of hanging it when the task never answers
+    async fn within<T>(work: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(60), work)
+            .await
+            .expect("the trace sender did not answer within 60 s")
+    }
 
     async fn patches(server: &MockServer) -> Vec<(String, String)> {
         server
@@ -499,9 +777,9 @@ mod tests {
         let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
 
         trace.write("Preparing...\n").await;
-        trace.flush().await;
+        within(trace.flush()).await;
         trace.write("step output\n").await;
-        trace.finish().await;
+        within(trace.finish()).await;
 
         let sent = patches(&server).await;
         let body: String = sent.iter().map(|(_, b)| b.as_str()).collect();
@@ -525,7 +803,7 @@ mod tests {
         let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
 
         trace.write("0123456789").await;
-        trace.finish().await;
+        within(trace.finish()).await;
 
         let sent = patches(&server).await;
         assert_eq!(sent[0], ("0-9".to_string(), "0123456789".to_string()));
@@ -545,16 +823,21 @@ mod tests {
             let line = format!("{:05} {}\n", i, "build output ".repeat(79));
             trace.write(&line).await;
             written.push_str(&line);
-            // Memory holds at most what is waiting for GitLab, not the whole log
-            assert!(trace.tail.len() < FLUSH_BYTES);
-            assert!(trace.tail.capacity() <= TAIL_RETAIN);
+            if i % 64 == 63 {
+                // Memory holds at most what is waiting for GitLab, not the whole log
+                assert!(within(trace.flush()).await);
+                let log = trace.log();
+                assert!(log.tail.is_empty());
+                assert!(log.tail.capacity() <= TAIL_RETAIN);
+            }
+            assert!(trace.log().tail.len() < 2 * TAIL_RETAIN);
         }
         assert!(written.len() > 3 * 1024 * 1024);
-        assert!(trace.spooled > 2 * 1024 * 1024);
-        trace.finish().await;
+        assert!(trace.log().spooled > 2 * 1024 * 1024);
+        within(trace.finish()).await;
 
-        assert_eq!(trace.spooled, written.len());
-        assert!(trace.tail.is_empty());
+        assert_eq!(trace.log().spooled, written.len());
+        assert!(trace.log().tail.is_empty());
         assert_eq!(trace.text(), written);
         assert_eq!(trace_on_gitlab(&server).await, written);
     }
@@ -580,12 +863,13 @@ mod tests {
 
         // Lines: the scrubber holds back a trailing token until it ends
         trace.write("0123456789\n").await;
-        assert!(trace.flush().await);
-        assert_eq!((trace.spooled, trace.tail.len()), (11, 0));
+        assert!(within(trace.flush()).await);
+        let spooled = trace.log().spooled;
+        assert_eq!((spooled, trace.log().tail.len()), (11, 0));
         trace.write("abc\n").await;
-        assert!(!trace.flush().await);
-        assert_eq!(trace.sent, 4);
-        trace.finish().await;
+        assert!(!within(trace.flush()).await);
+        assert_eq!(trace.log().sent, 4);
+        within(trace.finish()).await;
 
         let sent = patches(&server).await;
         assert_eq!(sent[1], ("11-14".to_string(), "abc\n".to_string()));
@@ -618,11 +902,12 @@ mod tests {
             .chain(std::iter::once('\n'))
             .collect();
         trace.write(&big).await;
-        assert_eq!(trace.spooled, big.len());
+        assert!(within(trace.flush()).await);
+        assert_eq!(trace.log().spooled, big.len());
         trace.write("end\n").await;
-        assert!(!trace.flush().await);
-        assert_eq!(trace.sent, 0);
-        trace.finish().await;
+        assert!(!within(trace.flush()).await);
+        assert_eq!(trace.log().sent, 0);
+        within(trace.finish()).await;
 
         let sent = patches(&server).await;
         let whole = format!("{}end\n", big);
@@ -639,14 +924,15 @@ mod tests {
         let client = GitLabClient::new(server.uri(), "t".to_string());
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
-        trace.spool = Spool::Failed(None);
+        trace.log().spool = Spool::Failed(None);
 
         trace.write("first\n").await;
-        assert!(trace.flush().await);
+        assert!(within(trace.flush()).await);
         trace.write("second\n").await;
-        trace.finish().await;
+        within(trace.finish()).await;
 
-        assert_eq!((trace.spooled, trace.sent), (0, 13));
+        let spooled = trace.log().spooled;
+        assert_eq!((spooled, trace.log().sent), (0, 13));
         assert_eq!(trace.text(), "first\nsecond\n");
         assert_eq!(trace_on_gitlab(&server).await, "first\nsecond\n");
     }
@@ -690,12 +976,13 @@ mod tests {
             TraceWriter::new(None, 7, "job-token", &scrubber).with_spool_dir(dir.path());
 
         trace.write("first\n").await;
-        assert!(trace.flush().await);
-        assert!(matches!(trace.spool, Spool::Open(_)));
-        assert_eq!((trace.spooled, trace.text().as_str()), (6, "first\n"));
+        assert!(within(trace.flush()).await);
+        assert!(matches!(trace.log().spool, Spool::Open(_)));
+        let spooled = trace.log().spooled;
+        assert_eq!((spooled, trace.text().as_str()), (6, "first\n"));
         #[cfg(target_os = "linux")]
         {
-            let path = spool_path(trace.spool_file().unwrap());
+            let path = spool_path(trace.log().spool_file().unwrap());
             assert!(
                 path.starts_with(dir.path().canonicalize().unwrap()),
                 "{path:?}"
@@ -708,108 +995,99 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .respond_with(
-                ResponseTemplate::new(202).insert_header("X-GitLab-Trace-Update-Interval", "30"),
+                ResponseTemplate::new(202).insert_header("X-GitLab-Trace-Update-Interval", "1"),
             )
             .mount(&server)
             .await;
         let client = GitLabClient::new(server.uri(), "t".to_string());
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
-        assert_eq!(trace.update_interval, DEFAULT_UPDATE_INTERVAL);
+        assert_eq!(trace.log().update_interval, DEFAULT_UPDATE_INTERVAL);
 
         trace.write("first\n").await;
-        trace.flush().await;
-        assert_eq!(trace.update_interval, Duration::from_secs(30));
+        assert!(within(trace.flush()).await);
+        assert_eq!(trace.log().update_interval, Duration::from_secs(1));
 
-        // Not due yet: nothing more is sent until the interval passes
+        // Sent by the task once the interval GitLab asked for passed, not before
         trace.write("second\n").await;
-        trace.flush_if_due().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(patches(&server).await.len(), 1);
-
-        trace.last_flush -= Duration::from_secs(31);
-        trace.flush_if_due().await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         assert_eq!(patches(&server).await.len(), 2);
+        assert_eq!(trace_on_gitlab(&server).await, "first\nsecond\n");
     }
 
     #[tokio::test]
-    async fn flush_is_due_only_with_output_to_send() {
+    async fn a_requested_interval_is_capped() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .respond_with(
-                ResponseTemplate::new(202).insert_header("X-GitLab-Trace-Update-Interval", "30"),
+                ResponseTemplate::new(202).insert_header("X-GitLab-Trace-Update-Interval", "86400"),
             )
             .mount(&server)
             .await;
         let client = GitLabClient::new(server.uri(), "t".to_string());
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
-        assert_eq!(trace.next_flush_at(), None);
 
         trace.write("first\n").await;
-        assert_eq!(
-            trace.next_flush_at(),
-            Some(trace.last_flush + DEFAULT_UPDATE_INTERVAL)
-        );
-        assert!(trace.flush().await);
-        assert_eq!(trace.next_flush_at(), None);
-
-        // The interval GitLab asked for
-        trace.write("second\n").await;
-        assert_eq!(
-            trace.next_flush_at(),
-            Some(trace.last_flush + Duration::from_secs(30))
-        );
-    }
-
-    /// An executor's output loop: output arrives on `output` until it closes
-    async fn output_loop(
-        trace: &mut TraceWriter<'_>,
-        mut output: tokio::sync::mpsc::Receiver<&'static str>,
-    ) -> Vec<Duration> {
-        let started = Instant::now();
-        let mut flush = FlushTimer::default();
-        let mut flushes = Vec::new();
-        loop {
-            tokio::select! {
-                text = output.recv() => match text {
-                    Some(text) => trace.write(text).await,
-                    None => return flushes,
-                },
-                _ = flush.wait(trace.next_flush_at()) => {
-                    flushes.push(started.elapsed());
-                    trace.flush().await;
-                }
-            }
-        }
+        assert!(within(trace.flush()).await);
+        assert_eq!(trace.log().update_interval, MAX_UPDATE_INTERVAL);
     }
 
     #[tokio::test]
-    async fn quiet_job_is_not_flushed_and_pending_output_is_sent_on_time() {
+    async fn a_streamed_log_is_never_due_for_an_output_loop() {
         let server = MockServer::start().await;
         accept_all(&server).await;
         let client = GitLabClient::new(server.uri(), "t".to_string());
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
-        trace.update_interval = Duration::from_millis(300);
 
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let script = tokio::spawn(async move {
-            tx.send("one line\n").await.unwrap();
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            tx.send("last line\n").await.unwrap();
-            // Quiet for several update intervals
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-        });
-        let flushes = output_loop(&mut trace, rx).await;
-        script.await.unwrap();
+        trace.write("first\n").await;
+        // Its task sends it: an executor's flush timer never fires
+        assert_eq!(trace.next_flush_at(), None);
+    }
 
-        // Each line once the interval since the last flush passed, then nothing
-        // while the job is quiet
-        assert_eq!(flushes.len(), 2, "{:?}", flushes);
-        assert!(flushes[0] >= Duration::from_millis(250), "{:?}", flushes);
-        assert!(flushes[0] < Duration::from_millis(400), "{:?}", flushes);
-        assert!(flushes[1] >= Duration::from_millis(550), "{:?}", flushes);
-        assert!(flushes[1] < Duration::from_millis(1000), "{:?}", flushes);
+    #[tokio::test]
+    async fn a_collected_log_is_due_only_with_output_to_flush() {
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, 7, "job-token", &scrubber);
+        assert_eq!(trace.next_flush_at(), None);
+
+        trace.write("first\n").await;
+        let last_flush = trace.log().last_flush;
+        assert_eq!(
+            trace.next_flush_at(),
+            Some(last_flush + DEFAULT_UPDATE_INTERVAL)
+        );
+        assert!(within(trace.flush()).await);
+        assert_eq!(trace.next_flush_at(), None);
+        assert_eq!(trace.log().spooled, 6);
+    }
+
+    #[tokio::test]
+    async fn quiet_job_is_not_sent_and_pending_output_is_sent_on_time() {
+        let server = MockServer::start().await;
+        accept_all(&server).await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
+        trace.log().update_interval = Duration::from_millis(500);
+        let started = Instant::now();
+        let at = |ms: u64| tokio::time::sleep_until((started + Duration::from_millis(ms)).into());
+
+        trace.write("one line\n").await;
+        at(250).await;
+        assert_eq!(patches(&server).await.len(), 0, "sent before the interval");
+        at(800).await;
+        assert_eq!(patches(&server).await.len(), 1);
+        // Due one interval after the last send (at about 500 ms)
+        trace.write("last line\n").await;
+        at(900).await;
+        assert_eq!(patches(&server).await.len(), 1, "sent before the interval");
+        at(1400).await;
+        // Then nothing while the job is quiet
+        at(3000).await;
         assert_eq!(
             patches(&server).await,
             vec![
@@ -820,22 +1098,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_timer_follows_the_update_interval() {
+    async fn a_batch_is_sent_at_once_without_holding_up_the_writer() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
-            .respond_with(
-                ResponseTemplate::new(202).insert_header("X-GitLab-Trace-Update-Interval", "1"),
-            )
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_millis(300)))
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace =
+            TraceWriter::new(Some(&client), 7, "job-token", &scrubber).with_limit(64 * 1024 * 1024);
+
+        let line = format!("{}\n", "x".repeat(1023));
+        let started = Instant::now();
+        for _ in 0..1024 {
+            trace.write(&line).await;
+        }
+        // 1 MiB (four batches) written while GitLab takes 300 ms per PATCH:
+        // not held up by it
+        assert!(started.elapsed() < Duration::from_millis(300));
+        // A full batch went out at once, without waiting for the interval
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(!patches(&server).await.is_empty());
+        within(trace.finish()).await;
+        assert_eq!(trace_on_gitlab(&server).await, line.repeat(1024));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_gitlab_is_retried_at_the_interval() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
         let client = GitLabClient::new(server.uri(), "t".to_string());
         let scrubber = SecretScrubber::new(vec![]);
         let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
+        trace.log().update_interval = Duration::from_millis(500);
+
+        let line = format!("{}\n", "x".repeat(1023));
+        for _ in 0..512 {
+            trace.write(&line).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        // A failed batch waits for the interval: one PATCH (3 tries) for the
+        // batch, then one per interval, not one after another
+        let tries = patches(&server).await.len();
+        assert!((3..=9).contains(&tries), "{}", tries);
+        assert!(trace.log().pending() > 0);
+    }
+
+    #[tokio::test]
+    async fn remote_cancellation_reaches_the_job_from_the_sender_task() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(202).insert_header("Job-Status", "canceling"))
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let cancel = CancelSignal::default();
+        let mut trace =
+            TraceWriter::new(Some(&client), 7, "job-token", &scrubber).with_cancel(cancel.clone());
+
+        trace.write("output\n").await;
+        assert!(within(trace.flush()).await);
+        assert_eq!(cancel.state(), RemoteState::Canceling);
+    }
+
+    #[tokio::test]
+    async fn a_log_gitlab_no_longer_accepts_counts_as_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let cancel = CancelSignal::default();
+        let mut trace =
+            TraceWriter::new(Some(&client), 7, "job-token", &scrubber).with_cancel(cancel.clone());
+
+        trace.write("output\n").await;
+        let started = Instant::now();
+        within(trace.finish()).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(cancel.state(), RemoteState::Aborted);
+        assert_eq!(patches(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn finish_gives_up_on_a_gitlab_that_never_answers() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new(server.uri(), "t".to_string());
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
+
+        trace.write("output\n").await;
+        let started = Instant::now();
+        within(trace.finish()).await;
+        // Five flushes of three tries each with backoffs in between (and the
+        // task's own tries once the interval passes), not FINISH_TIMEOUT
+        assert!(started.elapsed() < Duration::from_secs(15));
+        let tries = patches(&server).await.len();
+        assert!(tries >= 15, "{}", tries);
+        // The task is gone: nothing is sent after finish
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert_eq!(patches(&server).await.len(), tries);
+    }
+
+    #[tokio::test]
+    async fn flush_timer_follows_the_update_interval() {
+        let scrubber = SecretScrubber::new(vec![]);
+        let mut trace = TraceWriter::new(None, 7, "job-token", &scrubber);
+        trace.log().update_interval = Duration::from_secs(1);
         let mut flush = FlushTimer::default();
 
         trace.write("first\n").await;
-        trace.flush().await;
-        assert_eq!(trace.update_interval, Duration::from_secs(1));
+        within(trace.flush()).await;
         // Nothing pending: the timer never fires
         let quiet = tokio::time::timeout(
             Duration::from_millis(1500),
@@ -843,7 +1227,7 @@ mod tests {
         );
         assert!(quiet.await.is_err());
 
-        trace.last_flush = Instant::now();
+        trace.log().last_flush = Instant::now();
         trace.write("second\n").await;
         let started = Instant::now();
         tokio::time::timeout(Duration::from_secs(3), flush.wait(trace.next_flush_at()))
@@ -852,8 +1236,8 @@ mod tests {
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(950), "{:?}", waited);
         assert!(waited < Duration::from_millis(1500), "{:?}", waited);
-        trace.flush().await;
-        assert_eq!(patches(&server).await.len(), 2);
+        within(trace.flush()).await;
+        assert_eq!(trace.next_flush_at(), None);
     }
 
     #[tokio::test]
@@ -864,7 +1248,7 @@ mod tests {
         trace.section_start("get_sources", "Getting source").await;
         trace.write("fetched\n").await;
         trace.section_end("get_sources").await;
-        trace.finish().await;
+        within(trace.finish()).await;
 
         let text = trace.text();
         let (start, rest) = text.split_once('\r').unwrap();
@@ -886,9 +1270,9 @@ mod tests {
         let mut trace = TraceWriter::new(Some(&client), 7, "job-token", &scrubber);
 
         trace.write("pass=hunter2-").await;
-        trace.flush().await;
+        within(trace.flush()).await;
         trace.write("password ok\n").await;
-        trace.finish().await;
+        within(trace.finish()).await;
 
         let body: String = patches(&server).await.into_iter().map(|(_, b)| b).collect();
         assert_eq!(body, "pass=[MASKED] ok\n");
@@ -901,7 +1285,7 @@ mod tests {
 
         trace.write(&"x".repeat(150)).await;
         trace.write(" tail").await;
-        trace.finish().await;
+        within(trace.finish()).await;
 
         let text = trace.text();
         let (kept, notice) = text.split_at(100);
@@ -916,10 +1300,10 @@ mod tests {
         let mut trace = TraceWriter::new(None, 7, "job-token", &scrubber).with_limit(100);
 
         trace.write(&"x\n".repeat(30)).await;
-        trace.flush().await;
-        assert_eq!(trace.spooled, 60);
+        within(trace.flush()).await;
+        assert_eq!(trace.log().spooled, 60);
         trace.write(&"y\n".repeat(30)).await;
-        trace.finish().await;
+        within(trace.finish()).await;
 
         let text = trace.text();
         let (kept, notice) = text.split_at(100);
@@ -939,7 +1323,7 @@ mod tests {
         // Not scrubbed (a token at the end would be held back) and not kept
         trace.write("more output some-masked").await;
         assert_eq!(trace.scrubber.held_back(), "");
-        trace.finish().await;
+        within(trace.finish()).await;
         assert_eq!(trace.text(), kept);
     }
 
@@ -956,8 +1340,10 @@ mod tests {
 
         trace.write("0123456789abc\n").await;
         assert!(trace.is_truncated());
-        trace.last_flush -= DEFAULT_UPDATE_INTERVAL;
+        trace.log().update_interval = Duration::from_millis(100);
         trace.write("dropped\n").await;
+        // Sent by the task once due, although the writer drops new output
+        tokio::time::sleep(Duration::from_millis(600)).await;
 
         let body: String = patches(&server).await.into_iter().map(|(_, b)| b).collect();
         assert!(body.starts_with("0123456789\nJob's log exceeded limit of 10 bytes."));
@@ -974,10 +1360,52 @@ mod tests {
         while !trace.is_truncated() {
             trace.write(line).await;
         }
-        assert!(trace.len() > limit);
-        assert!(trace.tail.capacity() <= limit + NOTICE_ROOM);
-        trace.finish().await;
-        assert!(trace.tail.capacity() <= limit + NOTICE_ROOM);
+        assert!(trace.log().len() > limit);
+        assert!(trace.log().tail.capacity() <= limit + NOTICE_ROOM);
+        within(trace.finish()).await;
+        assert!(trace.log().tail.capacity() <= limit + NOTICE_ROOM);
+    }
+
+    /// A chatty job (50 MB of output) against a GitLab that takes 100 ms per
+    /// PATCH: how long the output loop is held up, and how long the final flush takes
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark: cargo test --release -- --ignored bench_trace_slow_gitlab --nocapture"]
+    async fn bench_trace_slow_gitlab() {
+        let line = "2026-11-20T10:15:42Z compiling crate foo v1.2.3 (/builds/group/project) ok\n";
+        let chunk = line.repeat(8192 / line.len());
+        for limit in [DEFAULT_LIMIT, 64 * 1024 * 1024] {
+            let server = MockServer::start().await;
+            Mock::given(method("PATCH"))
+                .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_millis(100)))
+                .mount(&server)
+                .await;
+            let client = GitLabClient::new(server.uri(), "t".to_string());
+            let scrubber = SecretScrubber::new(vec!["some-masked-value".to_string()]);
+            let mut trace =
+                TraceWriter::new(Some(&client), 7, "job-token", &scrubber).with_limit(limit);
+            let total = 50 * 1024 * 1024;
+            let started = Instant::now();
+            let mut written = 0;
+            while written < total {
+                trace.write(&chunk).await;
+                written += chunk.len();
+            }
+            let output = started.elapsed().as_secs_f64();
+            within(trace.finish()).await;
+            let all = started.elapsed().as_secs_f64();
+            let patches = patches(&server).await;
+            let on_gitlab = trace_on_gitlab(&server).await;
+            assert_eq!(on_gitlab.len(), trace.text().len());
+            println!(
+                "BENCH trace limit={}MiB output={:.3}s finish={:.3}s total={:.3}s patches={} sent={}",
+                limit >> 20,
+                output,
+                all - output,
+                all,
+                patches.len(),
+                on_gitlab.len()
+            );
+        }
     }
 
     /// cargo test --release bench_trace_past_limit -- --ignored --nocapture
@@ -995,17 +1423,18 @@ mod tests {
         while written < total {
             trace.write(&chunk).await;
             written += chunk.len();
-            peak = peak.max(trace.tail.capacity());
+            peak = peak.max(trace.log().tail.capacity());
         }
-        trace.finish().await;
+        within(trace.finish()).await;
         let secs = started.elapsed().as_secs_f64();
+        let log = trace.log();
         println!(
             "trace: {:.1} MB/s for {} bytes, kept {} (in memory: peak capacity {}, now {})",
             written as f64 / secs / 1e6,
             written,
-            trace.len(),
+            log.len(),
             peak,
-            trace.tail.capacity()
+            log.tail.capacity()
         );
     }
 }

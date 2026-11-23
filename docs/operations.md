@@ -200,7 +200,12 @@ finished before the runner exits.
 ## Job logs
 
 - Output is sent to GitLab every 3 seconds, or at the interval GitLab asks for
-  (it asks for less frequent updates while nobody is watching the log).
+  (it asks for less frequent updates while nobody is watching the log), and
+  at once when 256 KiB are pending. A task of its own sends it, so a slow or
+  unreachable GitLab never holds up the job's output. A failed update is
+  tried again at the next interval; at the end of the job the runner waits
+  at most 2 minutes for GitLab to have the whole log before it reports the
+  job's state.
 - Logs are limited to `output_limit` (default 4 MiB, as in gitlab-runner); the
   job keeps running, and the log says that output was cut at that limit.
 - Output GitLab has received leaves memory: it is kept in an unlinked file in
