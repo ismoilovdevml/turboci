@@ -3891,13 +3891,16 @@ mod tests {
     }
 
     /// Runs the audit's Docker jobs (a noop job, a job next to a redis
-    /// service, a job writing 2000 small files to its cache) BENCH_RUNS
-    /// times each (default 10, after one warm-up) through the whole daemon
-    /// against a mock GitLab, and prints the median and 90th percentile of
-    /// every phase. Run it as a user other than root, as the runner runs in
+    /// service, a job writing 2000 small files to its cache, a job saving a
+    /// cache and uploading artifacts, a job uploading its untracked files)
+    /// BENCH_RUNS times each (default 10, after one warm-up) through the
+    /// whole daemon against a mock GitLab, and prints the median and 90th
+    /// percentile of every phase. Run it as a user other than root, as the runner runs in
     /// production, so jobs leave files of another user behind:
     /// `cargo test --release bench_docker_job_phases -- --ignored --nocapture`.
-    /// BENCH_PULL_POLICY sets the pull policy (default if-not-present).
+    /// BENCH_PULL_POLICY sets the pull policy (default if-not-present),
+    /// BENCH_WORKLOADS which workloads run (names, comma-separated; default
+    /// all).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "benchmark: needs a Docker daemon, run on its own with --nocapture"]
     async fn bench_docker_job_phases() {
@@ -3948,23 +3951,58 @@ mod tests {
         let base = 990_000_000 + u64::from(std::process::id()) * 1000;
         let cache_script = "rm -rf cache && mkdir cache && i=0; \
             while [ $i -lt 2000 ]; do echo \"$CI_JOB_ID $i\" > cache/f$i; i=$((i+1)); done";
-        let workloads: [(&str, serde_json::Value, &str, serde_json::Value); 3] = [
-            ("noop", serde_json::json!([]), "true", serde_json::json!([])),
+        let uploads_script = "rm -rf cache out && mkdir cache out && i=0; \
+            while [ $i -lt 500 ]; do echo \"$CI_JOB_ID $i\" > cache/f$i; \
+            echo $i > out/a$i; i=$((i+1)); done";
+        let untracked_script = "rm -rf out && mkdir out && echo a > out/a && echo b > b.log";
+        let none = || serde_json::json!([]);
+        let workloads: [(
+            &str,
+            serde_json::Value,
+            &str,
+            serde_json::Value,
+            serde_json::Value,
+        ); 5] = [
+            ("noop", none(), "true", none(), none()),
             (
                 "service",
                 serde_json::json!([{"name": "redis:7-alpine", "alias": "redis"}]),
                 "true",
-                serde_json::json!([]),
+                none(),
+                none(),
             ),
             (
                 "cache",
-                serde_json::json!([]),
+                none(),
                 cache_script,
                 serde_json::json!([{"key": "bench", "paths": ["cache/"], "policy": "pull-push"}]),
+                none(),
+            ),
+            (
+                "uploads",
+                none(),
+                uploads_script,
+                serde_json::json!([{"key": "bench-uploads", "paths": ["cache/"], "policy": "push"}]),
+                serde_json::json!([{"name": "out", "paths": ["out/"]}]),
+            ),
+            (
+                "untracked",
+                none(),
+                untracked_script,
+                none(),
+                serde_json::json!([{"name": "untracked", "untracked": true}]),
             ),
         ];
         let mut report = String::new();
-        for (index, (name, services, script, cache)) in workloads.into_iter().enumerate() {
+        let selected = std::env::var("BENCH_WORKLOADS").ok();
+        for (index, (name, services, script, cache, artifacts)) in workloads.into_iter().enumerate()
+        {
+            if selected
+                .as_deref()
+                .is_some_and(|selected| !selected.split(',').any(|wanted| wanted == name))
+            {
+                continue;
+            }
             let project = base + index as u64 * 100;
             let job = |id: u64, sha: &str| -> Job {
                 serde_json::from_value(serde_json::json!({
@@ -3982,6 +4020,7 @@ mod tests {
                     ],
                     "services": services,
                     "cache": cache,
+                    "artifacts": artifacts,
                     "steps": [{"name": "script", "when": "on_success", "timeout": 600, "script": [script]}]
                 }))
                 .unwrap()
