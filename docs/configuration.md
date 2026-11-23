@@ -440,6 +440,7 @@ instead of quietly using the default socket.
 | `insecure_registries` | `[]` | Registries (`host[:port]`) reached over HTTP or without certificate checks; docker:dind services get `--insecure-registry` for each |
 | `registry_ca` | `{}` | Registry → PEM CA file; mounted into docker:dind services as `/etc/docker/certs.d/<registry>/ca.crt` |
 | `services` | `[]` | Services started for every job (see below) |
+| `wait_for_services_timeout` | `30` | Seconds the scripts wait for the services' TCP ports to accept connections (then a warning, and the scripts start anyway), as in gitlab-runner: `0` means 30, `-1` does not wait (the services still start; the scripts must wait for them themselves). At most 86400 |
 | `extra_hosts` | `[]` | `host:ip` entries of `/etc/hosts` in job, service and checkout containers; `host-gateway` is the Docker host |
 | `dns` | `[]` | DNS servers (IP addresses) of job, service and checkout containers |
 | `dns_search` | `[]` | DNS search domains of job, service and checkout containers |

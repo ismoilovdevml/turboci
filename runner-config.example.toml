@@ -170,6 +170,11 @@ helper_image = "alpine/git:latest"
 # allowed_images = ["ruby:*", "registry.corp.local/**"]
 # allowed_services = ["postgres:*", "redis:*"]
 
+# Seconds the scripts wait for the services' ports to accept connections, as
+# in gitlab-runner (0: 30). -1 starts the scripts without waiting: services
+# still start, scripts then retry on their own until a service is up
+# wait_for_services_timeout = 30
+
 # Remove images no container uses, at start and every hour: those no job
 # used for this many days (0: all of them), then the least recently used
 # beyond a total size. Covers every image of the Docker host: only for a

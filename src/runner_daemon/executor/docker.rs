@@ -461,7 +461,9 @@ fn service_ports(config: Option<&docker_api::ContainerConfig>) -> Vec<u16> {
     ports
 }
 
-/// How long a service may take to accept connections, like gitlab-runner
+/// How long a service may take to accept connections by default (see
+/// `DockerConfig::service_wait`)
+#[cfg(test)]
 const SERVICE_WAIT: Duration = Duration::from_secs(30);
 /// Longest pause between connection attempts: a service that is ready after
 /// 1.1s must not hold the job until the next full second
@@ -482,8 +484,8 @@ struct ServiceCheck {
     address: Option<std::net::IpAddr>,
 }
 
-/// The warning for a service that did not accept connections in time
-fn service_timeout_warning(check: &ServiceCheck) -> String {
+/// The warning for a service that did not accept connections within `wait`
+fn service_timeout_warning(check: &ServiceCheck, wait: Duration) -> String {
     format!(
         "WARNING: service {} (port {}) did not respond within {}s",
         check.host,
@@ -493,7 +495,7 @@ fn service_timeout_warning(check: &ServiceCheck) -> String {
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(", "),
-        SERVICE_WAIT.as_secs()
+        wait.as_secs()
     )
 }
 
@@ -2265,11 +2267,12 @@ impl DockerExecutor {
     }
 
     /// Wait until the services' exposed TCP ports accept connections, like
-    /// gitlab-runner (up to 30s each, then a warning), so scripts do not start
-    /// against a database that is still booting. Services are checked in
-    /// parallel, from the runner's host when it reaches the job network,
-    /// otherwise from a container on that network. Returns how many services
-    /// were checked from a container.
+    /// gitlab-runner (up to `wait_for_services_timeout`, 30s by default, then
+    /// a warning; not at all when it is -1), so scripts do not start against
+    /// a database that is still booting. Services are checked in parallel,
+    /// from the runner's host when it reaches the job network, otherwise from
+    /// a container on that network. Returns how many services were checked
+    /// from a container.
     async fn wait_for_services(
         &self,
         job_id: u64,
@@ -2278,6 +2281,9 @@ impl DockerExecutor {
         log: &mut SetupLog<'_, '_>,
         limits: &Limits<'_>,
     ) -> usize {
+        let Some(wait) = self.config.service_wait() else {
+            return 0;
+        };
         let inspected = futures_util::future::join_all(
             services.iter().map(|id| self.docker.inspect_container(id)),
         )
@@ -2302,11 +2308,14 @@ impl DockerExecutor {
         if checks.is_empty() {
             return 0;
         }
-        log.write("Waiting for services to be up and running (timeout 30 seconds)...\n")
-            .await;
+        log.write(&format!(
+            "Waiting for services to be up and running (timeout {} seconds)...\n",
+            wait.as_secs()
+        ))
+        .await;
         let from_host = futures_util::future::join_all(checks.iter().map(|check| async move {
             match check.address {
-                Some(ip) => wait_from_host(ip, &check.ports, SERVICE_WAIT).await,
+                Some(ip) => wait_from_host(ip, &check.ports, wait).await,
                 None => HostWait::Unreachable,
             }
         }));
@@ -2319,30 +2328,31 @@ impl DockerExecutor {
             match waited {
                 HostWait::Ready => {}
                 HostWait::TimedOut => {
-                    log.write(&format!("{}\n", service_timeout_warning(check)))
+                    log.write(&format!("{}\n", service_timeout_warning(check, wait)))
                         .await
                 }
                 HostWait::Unreachable => unreachable.push(check),
             }
         }
         if !unreachable.is_empty() {
-            self.wait_in_container(job_id, network, &unreachable, log, limits)
+            self.wait_in_container(job_id, network, &unreachable, wait, log, limits)
                 .await;
         }
         unreachable.len()
     }
 
     /// `wait_for_services` for `checks`, from a short-lived helper container
-    /// on the job network
+    /// on the job network, for up to `wait`
     async fn wait_in_container(
         &self,
         job_id: u64,
         network: &str,
         checks: &[&ServiceCheck],
+        wait: Duration,
         log: &mut SetupLog<'_, '_>,
         limits: &Limits<'_>,
     ) {
-        let tries = SERVICE_WAIT.as_millis() / SERVICE_POLL.as_millis();
+        let tries = (wait.as_millis() / SERVICE_POLL.as_millis()).max(1);
         let mut script: Vec<String> = checks
             .iter()
             .map(|check| {
@@ -2357,7 +2367,7 @@ impl DockerExecutor {
                     "( i=0; until {any_port}; do i=$((i+1)); \
                      if [ $i -ge {tries} ]; then echo {warning}; break; fi; \
                      sleep {poll}; done ) &",
-                    warning = script::quote(&service_timeout_warning(check)),
+                    warning = script::quote(&service_timeout_warning(check, wait)),
                     poll = SERVICE_POLL.as_secs_f64(),
                 )
             })
@@ -4096,6 +4106,7 @@ mod tests {
                 job_id,
                 &network,
                 &[&check],
+                SERVICE_WAIT,
                 &mut SetupLog::Trace(&mut trace),
                 &limits,
             )
@@ -4805,6 +4816,59 @@ mod tests {
         assert!(leftovers(job_id).await.is_empty());
         assert!(leftover_networks(job_id).await.is_empty());
         executor.cleanup(&j, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon: cargo test -- --ignored"]
+    async fn docker_wait_for_services_timeout_bounds_or_skips_the_wait() {
+        let job_id = 969_000_000 + u64::from(std::process::id());
+        let mut logs = Vec::new();
+        for (index, timeout) in [-1, 1].into_iter().enumerate() {
+            let executor = DockerExecutor::new(DockerConfig {
+                pull_policy: "if-not-present".to_string(),
+                wait_for_services_timeout: timeout,
+                ..DockerConfig::default()
+            })
+            .unwrap();
+            executor.pull_if_missing("redis:7-alpine").await.unwrap();
+            let executor = ExecutorType::Docker(executor);
+            let id = job_id + index as u64;
+            let j = job(serde_json::json!({
+                "id": id, "token": "t",
+                "image": {"name": "redis:7-alpine"},
+                "services": [{
+                    "name": "redis:7-alpine", "alias": "cache",
+                    "command": ["sh", "-c", "sleep 6; exec redis-server"]
+                }],
+                "steps": steps(&["nc -z cache 6379 && echo service-up || echo service-not-up"], &[])
+            }));
+            let scrubber = SecretScrubber::new(vec![]);
+            let mut trace = TraceWriter::new(None, id, "t", &scrubber);
+            let started = Instant::now();
+            let outcome = executor.execute(&j, &mut trace, &NoRestore).await;
+            let took = started.elapsed();
+            trace.finish().await;
+            let log = trace.text();
+            assert!(outcome.is_ok(), "{:?}\n{}", outcome, log);
+            // Not held until the service is up
+            assert!(took < Duration::from_secs(5), "took {:?}\n{}", took, log);
+            assert!(log.contains("Starting service redis:7-alpine"), "{}", log);
+            assert!(log.contains("service-not-up"), "{}", log);
+            assert!(leftovers(id).await.is_empty());
+            assert!(leftover_networks(id).await.is_empty());
+            executor.cleanup(&j, false).await;
+            logs.push(log);
+        }
+        // -1: no wait at all
+        assert!(!logs[0].contains("Waiting for services"), "{}", logs[0]);
+        assert!(!logs[0].contains("WARNING"), "{}", logs[0]);
+        // 1: a wait of a second, then the warning
+        assert!(
+            logs[1].contains("Waiting for services to be up and running (timeout 1 seconds)..."),
+            "{}",
+            logs[1]
+        );
+        assert!(logs[1].contains("did not respond within 1s"), "{}", logs[1]);
     }
 
     #[tokio::test]
@@ -6204,7 +6268,7 @@ mod tests {
             address: None,
         };
         assert_eq!(
-            service_timeout_warning(&check),
+            service_timeout_warning(&check, SERVICE_WAIT),
             "WARNING: service turboci-job-1-svc-0 (port 2375, 2376) did not respond within 30s"
         );
     }

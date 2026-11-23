@@ -188,6 +188,9 @@ pub struct DockerConfig {
     pub oom_score_adjust: Option<i64>,
     /// Most processes a job or service container may run (fork bomb guard)
     pub pids_limit: Option<i64>,
+    /// Seconds the scripts wait for the services' ports to accept
+    /// connections, like gitlab-runner's: 0 means 30, -1 does not wait
+    pub wait_for_services_timeout: i64,
     /// Services started for every job, before the job's own `services:`
     pub services: Vec<ServiceConfig>,
     /// Docker client config (`auths`) with registry logins used for pulls,
@@ -256,6 +259,11 @@ pub struct DockerConfig {
     /// least recently used are removed (unset or "0": no limit)
     pub image_max_size: Option<String>,
 }
+
+/// gitlab-runner's default `wait_for_services_timeout`, in seconds
+const DEFAULT_WAIT_FOR_SERVICES_TIMEOUT: i64 = 30;
+/// Longest `wait_for_services_timeout` (a day), far beyond any job's need
+const MAX_WAIT_FOR_SERVICES_TIMEOUT: i64 = 86_400;
 
 /// Docker's `--ulimit` names
 const ULIMIT_NAMES: &[&str] = &[
@@ -566,6 +574,19 @@ pub fn parse_size(field: &str, value: &str) -> Result<i64> {
 }
 
 impl DockerConfig {
+    /// How long the scripts wait for services to accept connections; `None`
+    /// when they do not wait (`wait_for_services_timeout` -1). Like
+    /// gitlab-runner, 0 means the default of 30 seconds.
+    pub fn service_wait(&self) -> Option<std::time::Duration> {
+        match self.wait_for_services_timeout {
+            seconds if seconds < 0 => None,
+            0 => Some(std::time::Duration::from_secs(
+                DEFAULT_WAIT_FOR_SERVICES_TIMEOUT as u64,
+            )),
+            seconds => Some(std::time::Duration::from_secs(seconds as u64)),
+        }
+    }
+
     /// Memory limit in bytes
     pub fn memory_bytes(&self) -> Result<Option<i64>> {
         self.size("memory", &self.memory)
@@ -627,6 +648,13 @@ impl DockerConfig {
         }
         if self.pids_limit.is_some_and(|limit| limit < 1) {
             anyhow::bail!("executor.docker.pids_limit must be at least 1 (unset for no limit)");
+        }
+        if !(-1..=MAX_WAIT_FOR_SERVICES_TIMEOUT).contains(&self.wait_for_services_timeout) {
+            anyhow::bail!(
+                "executor.docker.wait_for_services_timeout must be -1 (no wait), 0 (30) or \
+                 seconds up to {}",
+                MAX_WAIT_FOR_SERVICES_TIMEOUT
+            );
         }
         // dockerd silently clamps weights outside this range
         if self
@@ -1023,6 +1051,7 @@ impl Default for DockerConfig {
             shm_size: None,
             oom_score_adjust: None,
             pids_limit: None,
+            wait_for_services_timeout: DEFAULT_WAIT_FOR_SERVICES_TIMEOUT,
             services: Vec::new(),
             auth_config_file: None,
             insecure_registries: Vec::new(),
@@ -1681,6 +1710,37 @@ mod tests {
         ] {
             let config = RunnerConfig::parse(bad).unwrap();
             assert!(config.validate().is_err(), "accepted: {}", bad);
+        }
+    }
+
+    #[test]
+    fn wait_for_services_timeout_follows_gitlab_runner() {
+        let wait = |line: &str| {
+            let config = RunnerConfig::parse(&format!(
+                "runner_token = \"t\"\n[executor.docker]\n{}",
+                line
+            ))
+            .unwrap();
+            config
+                .validate()
+                .map(|_| config.executor.docker.service_wait())
+        };
+        assert_eq!(wait("").unwrap(), Some(std::time::Duration::from_secs(30)));
+        assert_eq!(
+            wait("wait_for_services_timeout = 0").unwrap(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            wait("wait_for_services_timeout = 120").unwrap(),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(wait("wait_for_services_timeout = -1").unwrap(), None);
+        for bad in ["-2", "86401"] {
+            assert!(
+                wait(&format!("wait_for_services_timeout = {}", bad)).is_err(),
+                "accepted {}",
+                bad
+            );
         }
     }
 
