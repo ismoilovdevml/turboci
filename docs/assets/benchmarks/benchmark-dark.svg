@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="434" viewBox="0 0 860 434" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<title>Median job time, gitlab-runner 18.5.0 vs TurboCI 0.13.0 on the same host. Lower is better.</title>
+<text x="24" y="34" font-size="20" font-weight="600" fill="#e6edf3">Median time on the same host (seconds, lower is better)</text>
+<rect x="24" y="52" width="14" height="14" rx="3" fill="#6e7681"/><text x="44" y="64" font-size="14" fill="#9198a1">gitlab-runner 18.5.0</text>
+<rect x="214" y="52" width="14" height="14" rx="3" fill="#ff7a33"/><text x="234" y="64" font-size="14" fill="#9198a1">TurboCI 0.13.0</text>
+<text x="24" y="120" font-size="15" fill="#e6edf3">Pipeline (5 jobs)</text>
+<rect x="230" y="92" width="482.9" height="22" rx="4" fill="#6e7681"/>
+<text x="720.9" y="108" font-size="14" fill="#9198a1">13.0 s</text>
+<rect x="230" y="118" width="271.1" height="22" rx="4" fill="#ff7a33"/>
+<text x="509.1" y="134" font-size="14" font-weight="600" fill="#e6edf3">7.3 s  <tspan fill="#ff7a33">−44%</tspan></text>
+<text x="24" y="194" font-size="15" fill="#e6edf3">Upload 50 MB artifact</text>
+<rect x="230" y="166" width="248.9" height="22" rx="4" fill="#6e7681"/>
+<text x="486.9" y="182" font-size="14" fill="#9198a1">6.7 s</text>
+<rect x="230" y="192" width="115.1" height="22" rx="4" fill="#ff7a33"/>
+<text x="353.1" y="208" font-size="14" font-weight="600" fill="#e6edf3">3.1 s  <tspan fill="#ff7a33">−54%</tspan></text>
+<text x="24" y="268" font-size="15" fill="#e6edf3">Job with a service</text>
+<rect x="230" y="240" width="144.9" height="22" rx="4" fill="#6e7681"/>
+<text x="382.9" y="256" font-size="14" fill="#9198a1">3.9 s</text>
+<rect x="230" y="266" width="89.1" height="22" rx="4" fill="#ff7a33"/>
+<text x="327.1" y="282" font-size="14" font-weight="600" fill="#e6edf3">2.4 s  <tspan fill="#ff7a33">−38%</tspan></text>
+<text x="24" y="342" font-size="15" fill="#e6edf3">Empty job</text>
+<rect x="230" y="314" width="133.7" height="22" rx="4" fill="#6e7681"/>
+<text x="371.7" y="330" font-size="14" fill="#9198a1">3.6 s</text>
+<rect x="230" y="340" width="89.1" height="22" rx="4" fill="#ff7a33"/>
+<text x="327.1" y="356" font-size="14" font-weight="600" fill="#e6edf3">2.4 s  <tspan fill="#ff7a33">−33%</tspan></text>
+<text x="24" y="418" font-size="12" fill="#9198a1">Docker executor, docker:dind on every job, 5 rounds per runner. Rocky Linux 9, 32 vCPU, Docker 29.5. See docs: Benchmarks.</text>
+</svg>

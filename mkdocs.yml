@@ -1,12 +1,15 @@
 site_name: TurboCI
-site_description: A GitLab CI/CD runner written in Rust
-site_url: https://ismoilovdevml.github.io/turboci/
+site_description: A GitLab CI runner in Rust. Drop-in for gitlab-runner, in one 8.6 MB binary.
+site_url: https://turboci.bristleconelab.org/
 repo_url: https://github.com/ismoilovdevml/turboci
 repo_name: ismoilovdevml/turboci
 edit_uri: edit/main/docs/
 
 theme:
   name: material
+  custom_dir: overrides
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
   features:
     - navigation.sections
     - navigation.top
@@ -37,6 +40,7 @@ nav:
       - Configuration: configuration.md
       - Pipeline support: pipelines.md
       - Operations: operations.md
+  - Benchmarks: benchmarks.md
 
 markdown_extensions:
   - admonition

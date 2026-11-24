@@ -8,6 +8,18 @@ container (default) or directly on the host (shell executor).
 It is one binary (Linux x86_64 and aarch64, macOS on Apple Silicon) with no external services: no
 Redis, no database, no helper daemon.
 
+|  | TurboCI | gitlab-runner 18.5.0 |
+|---|---|---|
+| Pipeline of 5 Docker jobs, same host | **7.3 s** | 13.0 s |
+| Runner time per shell job, production | **1.1 s** | 4.1 s |
+| Binary, Linux x86_64 | **8.6 MB** | 92.0 MB |
+| Memory when idle | **~8 MB** | 88 MB |
+
+How these were measured: [Benchmarks](benchmarks.md).
+
+[Install with one command](installation.md){ .md-button .md-button--primary }
+[See the benchmarks](benchmarks.md){ .md-button }
+
 <div class="grid cards" markdown>
 
 - **Install with one command**
@@ -22,13 +34,14 @@ Redis, no database, no helper daemon.
 
 - **One small binary**
 
-    A static binary with no external services that idles at a few MB of
-    memory. It runs next to gitlab-runner on the same host and Docker daemon
+    An 8.6 MB static binary with no external services that idles at about
+    8 MB of memory. It runs next to gitlab-runner on the same host and Docker daemon
     without touching its containers. [Operations →](operations.md)
 
 - **Fast jobs and caches**
 
-    Checkout, image pulls and services start together; caches are solid
+    Checkout, image pulls, services and the job container start together,
+    and the cache is restored while they do; caches are solid
     `tar.zst` archives extracted while they download, and skipped when a job
     left them unchanged. [Configuration →](configuration.md)
 
@@ -67,8 +80,8 @@ Redis, no database, no helper daemon.
 
 ## Status
 
-TurboCI runs in production on a self-hosted GitLab 19 instance, next to
-gitlab-runner on the same host.
+TurboCI runs a team's CI in production on a self-hosted GitLab 19
+instance, Docker and shell jobs, next to gitlab-runner on the same host.
 Things it does not do yet are listed under
 [not supported](pipelines.md#not-supported); GitLab never sends such jobs to a
 runner that does not advertise the feature.
