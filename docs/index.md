@@ -10,8 +10,9 @@ Redis, no database, no helper daemon.
 
 |  | TurboCI | gitlab-runner 18.5.0 |
 |---|---|---|
-| Pipeline of 5 Docker jobs, same host | **7.3 s** | 13.0 s |
-| Runner time per shell job, production | **1.1 s** | 4.1 s |
+| Pipeline of 5 Docker jobs, same host | **6.0 s** | 13.5 s |
+| Runner time per Docker job, production | **2.4 s** | 4.9 s |
+| Runner time per shell job, production | **1.1 s** | 2.9 s |
 | Binary, Linux x86_64 | **8.6 MB** | 92.0 MB |
 | Memory when idle | **~8 MB** | 88 MB |
 

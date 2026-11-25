@@ -30,14 +30,15 @@ helper daemon.
 
 |  | TurboCI | gitlab-runner 18.5.0 |
 |---|---|---|
-| Pipeline of 5 Docker jobs, same host | **7.3 s** | 13.0 s |
-| Runner time per shell job, production | **1.1 s** | 4.1 s |
+| Pipeline of 5 Docker jobs, same host | **6.0 s** | 13.5 s |
+| Runner time per Docker job, production | **2.4 s** | 4.9 s |
+| Runner time per shell job, production | **1.1 s** | 2.9 s |
 | Binary, Linux x86_64 | **8.6 MB** | 92.0 MB |
 | Memory when idle | **~8 MB** | 88 MB |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmarks/benchmark-dark.svg">
-  <img src="docs/assets/benchmarks/benchmark-light.svg" alt="Median job time on the same host: pipeline 13.0 s on gitlab-runner vs 7.3 s on TurboCI, 50 MB upload 6.7 s vs 3.1 s, job with a service 3.9 s vs 2.4 s, empty job 3.6 s vs 2.4 s">
+  <img src="docs/assets/benchmarks/benchmark-light.svg" alt="Median job time on the same host, gitlab-runner vs TurboCI: pipeline 13.5 s vs 6.0 s, 50 MB upload 6.7 s vs 3.0 s, cache 4.9 s vs 2.6 s, artifact download 4.5 s vs 2.1 s, job with a service 4.4 s vs 2.4 s, empty job 3.8 s vs 1.7 s">
 </picture>
 
 Measured on one production host (Rocky Linux 9, 32 vCPU, Docker 29.5) with both runners side by
